@@ -406,3 +406,22 @@ B 两轮的平均阶段中点组成为：
 - `loadtest-rate-3000-presence-capacity-control-r1.json`
 - `loadtest-rate-3000-presence-pool24-control-r2.json`
 - `loadtest-rate-3000-presence-postrestart-control-r1.json`
+
+## 按 workload 拆分连接获取后的 3000 复核
+
+2026-08-31 使用新的隔离数据库和空 Redis DB，固定 Pool 24、Batch 64、publish 并发 16、pipeline + bulk + recipients + 批内 Presence 快照、10 个热点用户、20 条 WebSocket、60000 条消息、3000 req/s 和并发 1000。该轮 HTTP `60000/60000`、Realtime `240000/240000`、Sync `120000/120000` 全部完整，dropped、failed、missing、duplicate、unexpected、dead 均为 0，因此可作为有效基线。
+
+| acquisition workload | 次数 | 平均耗时 | P50 桶上界 | P95 桶上界 | P99 桶上界 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| API | 121800 | 0.111 ms | 0.01 ms | 0.10 ms | 5.00 ms |
+| Outbox | 2818 | 0.044 ms | 0.01 ms | 0.01 ms | 2.50 ms |
+
+Pool 整体发生 6442 次空池获取，所有 goroutine 的空池累计等待为 `13.58s`；同期共有 124788 次连接获取，所以不能只凭“空池次数不为 0”判断连接池已饱和。分组 Histogram 显示绝大多数 API/Outbox acquisition 都在亚毫秒内完成，且没有 canceled acquire。因此在这轮有效的 3000 req/s 稳态中，共享 Pool 不是当前瓶颈，也没有证据支持立即做 API 18 + Worker 6 的分池改造。
+
+端到端和 Worker 阶段为：HTTP P95 `8.01ms`、Realtime P95 `0.784s`、pending/oldest 峰值 `2441/0.816s`；`claim=4.06ms`、`prepare=14.41ms`、`publish=1.82ms`、`mark=4.47ms`。准备 Lane 约 `18.47ms`，低于 3000 req/s 下每 64 条约 `21.33ms` 的到达预算；准备内部仍以 `prepare_store=6.71ms` 和 `prepare_project_users=5.71ms` 最大，但当前结果只说明它们是下一次升档应重点观察的阶段，不说明已经形成稳态瓶颈。
+
+此前四轮未复现基线的诊断仍保留为异常环境证据，不能据此证明共享 Pool 持续争用。下一轮应在新鲜隔离状态升到 3200 req/s，同时观察 acquisition 和 SQL 阶段；只有 acquisition 明显放大时才进入固定总连接数的分池 A/B。
+
+报告：
+
+- `loadtest-rate-3000-db-acquire-r1.json`

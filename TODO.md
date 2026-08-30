@@ -1,22 +1,27 @@
 # TODO
 
-## 当前阻塞实验：PostgreSQL Pool 争用分离 A/B
+## 下一容量升档：区分 Pool 等待与事务执行
 
-- [ ] 先恢复可重复的 3000 req/s 完整基线，再判断 Presence 优化后的新容量上限。
+- [x] 恢复 3000 req/s 完整基线，并确认该档共享 Pool 没有形成显著连接等待。
 
-  最新的 3200 和三轮 3000 对照都出现 dropped starts，不能作为容量结果；但四轮都显示 `publish` 保持在 `1.80～2.73ms`，HTTP、`prepare_begin`、`claim`、`mark_published` 与 PostgreSQL 空池等待同时放大。当前需要先分清“拿不到连接”和“拿到连接后 SQL 慢”各占多少。
+  2026-08-31 的新鲜隔离库复核完成 60000/60000 HTTP、240000/240000 Realtime、120000/120000 Sync，dropped、missing、duplicate、unexpected、dead 均为 0。API/Outbox acquisition P95 分别不高于 `0.10ms/0.01ms`，因此不在 3000 档直接做分池。
 
   实验前置：
 
   - [x] 用 `im_backend_database_pool_acquire_duration_seconds{workload="api|outbox",result="success|error"}` 分别记录两侧 acquisition 耗时；压测报告的 `databaseAcquireDurations` 保存测试前后差值。未标记的启动探活和监控查询不混入这两组。
-  - [ ] 事务内各 SQL 阶段继续单独计时；分池实现后再分别记录两个 Pool 的 acquired、idle、empty acquire 和累计等待。共享 Pool 的现有整体指标继续保留。
+  - [x] 保留事务内各 SQL 阶段计时，并把 acquisition 与拿到连接后的阶段墙钟时间分开观察。共享 Pool 的整体指标继续保留。
   - 排除宿主机残留计算任务，并在每轮前用同一健康检查确认 PostgreSQL、Redis、API 和指标端点就绪。
 
-  A/B 矩阵：
+  下一步：
+
+  - [ ] 使用新鲜隔离状态运行 3200 req/s；若完整通过则继续逐档升压，直到出现第一个可重复的正确性、延迟或积压边界。
+  - [ ] 同时比较 API/Outbox acquisition、`prepare_store`、`prepare_project_users`、HTTP、Realtime 和 pending/oldest，不能从一个平均阶段直接猜原因。
+
+  仅当 acquisition 在边界负载下明显放大时，执行分池 A/B：
 
   - A：API 与 Worker 共用 Pool，总连接数固定为 24。
   - B：API 与 Worker 分池，但总连接数仍固定为 24；初始候选为 API 18 + Worker 6，后续只根据 acquisition 指标校准。
-  - 两组使用新鲜隔离库、相同 Redis 状态、相同 Batch/并发/消息分布，按 `A1 → B1 → B2 → A2` 运行。
+  - 两组使用新鲜隔离库、相同 Redis 状态、相同 Batch/并发/消息分布，按 `A1 → B1 → B2 → A2` 运行；若 acquisition 没有放大，则跳过分池，改为针对实测最慢 SQL 阶段设计 A/B。
 
   正确性和结束标准：
 
