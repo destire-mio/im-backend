@@ -9,7 +9,7 @@
 → POST /messages
 → PostgreSQL message + pending Outbox（HTTP 在这里即可返回）
 → Outbox Worker 按用户批量分配连续 seq
-→ user_message_events + 可推送 Outbox payload 原子提交
+→ user_message_events + outbox_recipients + Outbox ready 原子提交
 → Hub / Channel / WebSocket
 → Sync API 持久性核验
 ```
@@ -120,7 +120,7 @@ go run ./cmd/im-loadtest \
 
 ## Outbox 并发 A/B
 
-服务端支持通过 `DATABASE_MAX_CONNECTIONS`、`OUTBOX_CONCURRENCY`、`OUTBOX_BATCH_SIZE` 和 `OUTBOX_PROJECTION_MODE` 设置连接池、推送并发、单次投影批量与投影实现。A/B 时一次只改一个参数：
+服务端支持通过 `DATABASE_MAX_CONNECTIONS`、`OUTBOX_CONCURRENCY`、`OUTBOX_BATCH_SIZE`、`OUTBOX_PROJECTION_MODE` 和 `OUTBOX_PROJECTION_STORAGE` 设置连接池、推送并发、单次投影批量、投影 SQL 与投影结果存储。A/B 时一次只改一个参数：
 
 ```text
 对照组：DATABASE_MAX_CONNECTIONS=24 OUTBOX_CONCURRENCY=8
@@ -220,3 +220,51 @@ Channel 最高水位             5 / 256
 - `loadtest-rate-3000-bulk-default.json`
 - `loadtest-rate-3500-bulk-default-p24.json`
 - `loadtest-rate-3500-bulk-default-p32.json`
+
+## 结构化 recipients 拆分 A/B
+
+为去掉带 recipients/cursor 的完整 JSONB 二次回写，新增两种可切换存储：
+
+```text
+A：OUTBOX_PROJECTION_STORAGE=jsonb（旧实现，回退开关）
+B：OUTBOX_PROJECTION_STORAGE=recipients（当前默认）
+```
+
+B 将 `user_message_events`、`outbox_recipients` 和 `outbox_events.ready_at` 放在同一事务提交；Publisher 只在事务提交后运行。若事务提交后、publish 前崩溃，重启 Worker 从结构化 recipients 重建内存 payload；若 Lease 已丢失，带 `lock_token` 的 ready 更新影响 0 行，整个事务回滚。网络发送仍在事务外，发送后、标记前崩溃仍可能产生重复通知，客户端继续按 event/message/cursor 去重。
+
+3500 req/s 的 A/B 使用同一空库模板克隆四个隔离库，固定 Pool 32、Batch 64、publish 并发 16、10 个热点用户、20 条 WebSocket、70000 条消息、并发 1000 和 30 秒实时等待，顺序为 `A1 → B1 → B2 → A2`。每轮使用独立 Redis DB，避免 Login 限流互相污染。四轮 HTTP、Realtime、Sync 全部完整，dropped、missing、duplicate、unexpected、dead 均为 0。
+
+| 两轮中位数 | A：JSONB | B：recipients | 变化 |
+| --- | ---: | ---: | ---: |
+| `prepare_store` | 11.31 ms | 7.88 ms | -30.3% |
+| `prepare` 总计 | 16.34 ms | 12.71 ms | -22.2% |
+| Realtime P95 | 16.427 s | 11.159 s | -32.1% |
+| oldest age 峰值 | 16.641 s | 11.177 s | -32.8% |
+| pending 峰值 | 36071 | 34790 | -3.6% |
+| Pool 空池累计等待 | 328.49 s | 53.36 s | -83.8% |
+| `mark_published` | 5.46 ms | 6.39 ms | +16.9% |
+
+A 两轮本身波动明显：`prepare_store` 分别为 `17.03ms` 和 `5.59ms`，因此不能把两轮中位数当成稳定容量数字；但 B 两轮为 `8.01ms` 和 `7.76ms`，且端到端 Realtime P95 两轮都低于 A。准确结论是：移除 JSONB payload 回写降低了平均 prepare 与积压年龄，并改善了本次边界负载的稳定性，但 3500 req/s 仍超过实时稳态吞吐。
+
+采用 B 后，Pool 24 的新空库 3000 req/s 默认复核完整通过：HTTP 60000/60000、Realtime 240000/240000、Sync 120000/120000；HTTP P95 `3.89ms`、Realtime P95 `0.584s`、pending / oldest 峰值 `1818 / 0.607s`，结束时 pending/dead 为 `0/0`。因此新默认没有让原有稳定档退化。
+
+### 拆分后的下一瓶颈
+
+3500 req/s 下 B 两轮平均阶段的中位数约为：
+
+```text
+claim 2.18ms + prepare 12.71ms + publish 6.27ms + mark 6.39ms
+= 27.55ms / 64 条
+```
+
+3500 req/s 要求每 64 条的串行批次关键路径不高于约 `18.29ms`，当前 Worker 主循环仍跟不上。prepare 内最大子阶段仍是 `prepare_store`（约 `7.88ms`），只是成本已从 JSONB 回写转成“插入两份结构化 recipient + 更新 ready”。每轮 70000 条消息会写入 140000 条 `user_message_events` 和 140000 条 `outbox_recipients`，同时 `outbox_events` 仍有 claim、ready、published 共 210000 次更新；`outbox_recipients` 约占 20MB，而 user/cursor 映射已存在于约 25MB 的 `user_message_events`。
+
+因此下一步不是继续扩 Channel，而是验证能否直接以 `user_message_events` 作为重启后的 recipient/cursor 权威来源，只保留轻量 ready 状态，去掉重复的 `outbox_recipients` 写入；之后再单独复测已上升到约 `6.39ms` 的 `mark_published` 状态更新。
+
+报告：
+
+- `loadtest-rate-3500-storage-ab-a1-jsonb.json`
+- `loadtest-rate-3500-storage-ab-b1-recipients.json`
+- `loadtest-rate-3500-storage-ab-b2-recipients.json`
+- `loadtest-rate-3500-storage-ab-a2-jsonb.json`
+- `loadtest-rate-3000-recipients-default.json`

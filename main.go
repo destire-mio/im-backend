@@ -165,6 +165,7 @@ func main() {
 	workerConfig.BatchSize = environmentInt("OUTBOX_BATCH_SIZE", workerConfig.BatchSize)
 	workerConfig.Concurrency = environmentInt("OUTBOX_CONCURRENCY", workerConfig.Concurrency)
 	workerConfig.ProjectionMode = syncProjectionMode(environmentString("OUTBOX_PROJECTION_MODE", string(workerConfig.ProjectionMode)))
+	workerConfig.ProjectionStorage = syncProjectionStorage(environmentString("OUTBOX_PROJECTION_STORAGE", string(workerConfig.ProjectionStorage)))
 	worker, err := newMessageOutboxWorker(db, &webSocketOutboxPublisher{router: router}, workerConfig, app.metrics)
 	if err != nil {
 		cancelRouter()
@@ -173,10 +174,11 @@ func main() {
 	}
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
 	log.Printf(
-		"outbox worker batch size %d concurrency %d projection mode %s",
+		"outbox worker batch size %d concurrency %d projection mode %s storage %s",
 		workerConfig.BatchSize,
 		workerConfig.Concurrency,
 		workerConfig.ProjectionMode,
+		workerConfig.ProjectionStorage,
 	)
 	workerContext, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan struct{})

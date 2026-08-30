@@ -14,30 +14,31 @@ import (
 )
 
 type applicationMetrics struct {
-	registry                *prometheus.Registry
-	httpRequests            *prometheus.CounterVec
-	httpDuration            *prometheus.HistogramVec
-	outboxPublish           *prometheus.CounterVec
-	outboxPublishDuration   *prometheus.HistogramVec
-	outboxStageDuration     *prometheus.HistogramVec
-	realtimeRouting         *prometheus.CounterVec
-	webSocketConnections    prometheus.Gauge
-	webSocketDeliveries     *prometheus.CounterVec
-	webSocketDisconnects    *prometheus.CounterVec
-	webSocketIO             *prometheus.CounterVec
-	webSocketWriteDuration  *prometheus.HistogramVec
-	webSocketQueueDepth     prometheus.Histogram
-	webSocketQueueHighWater prometheus.Gauge
-	webSocketQueueMaximum   atomic.Int64
-	syncPages               *prometheus.CounterVec
-	syncEvents              prometheus.Counter
-	ackRequests             *prometheus.CounterVec
-	outboxWorkerConcurrency prometheus.Gauge
-	outboxWorkerBatchSize   prometheus.Gauge
-	outboxProjectionBulk    prometheus.Gauge
-	outboxProjectionBatches prometheus.Counter
-	outboxProjectionUsers   prometheus.Counter
-	outboxProjectionQueries prometheus.Histogram
+	registry                   *prometheus.Registry
+	httpRequests               *prometheus.CounterVec
+	httpDuration               *prometheus.HistogramVec
+	outboxPublish              *prometheus.CounterVec
+	outboxPublishDuration      *prometheus.HistogramVec
+	outboxStageDuration        *prometheus.HistogramVec
+	realtimeRouting            *prometheus.CounterVec
+	webSocketConnections       prometheus.Gauge
+	webSocketDeliveries        *prometheus.CounterVec
+	webSocketDisconnects       *prometheus.CounterVec
+	webSocketIO                *prometheus.CounterVec
+	webSocketWriteDuration     *prometheus.HistogramVec
+	webSocketQueueDepth        prometheus.Histogram
+	webSocketQueueHighWater    prometheus.Gauge
+	webSocketQueueMaximum      atomic.Int64
+	syncPages                  *prometheus.CounterVec
+	syncEvents                 prometheus.Counter
+	ackRequests                *prometheus.CounterVec
+	outboxWorkerConcurrency    prometheus.Gauge
+	outboxWorkerBatchSize      prometheus.Gauge
+	outboxProjectionBulk       prometheus.Gauge
+	outboxProjectionRecipients prometheus.Gauge
+	outboxProjectionBatches    prometheus.Counter
+	outboxProjectionUsers      prometheus.Counter
+	outboxProjectionQueries    prometheus.Histogram
 }
 
 func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
@@ -144,6 +145,11 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Name:      "outbox_projection_bulk_enabled",
 			Help:      "Whether the set-based bulk sync projection implementation is enabled.",
 		}),
+		outboxProjectionRecipients: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_projection_recipients_enabled",
+			Help:      "Whether structured Outbox recipients replace the projected JSONB payload rewrite.",
+		}),
 		outboxProjectionBatches: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_projection_batches_total",
@@ -184,6 +190,7 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.outboxWorkerConcurrency,
 		metrics.outboxWorkerBatchSize,
 		metrics.outboxProjectionBulk,
+		metrics.outboxProjectionRecipients,
 		metrics.outboxProjectionBatches,
 		metrics.outboxProjectionUsers,
 		metrics.outboxProjectionQueries,
@@ -248,6 +255,11 @@ func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConf
 		metrics.outboxProjectionBulk.Set(1)
 	} else {
 		metrics.outboxProjectionBulk.Set(0)
+	}
+	if config.ProjectionStorage == syncProjectionStorageRecipients {
+		metrics.outboxProjectionRecipients.Set(1)
+	} else {
+		metrics.outboxProjectionRecipients.Set(0)
 	}
 }
 

@@ -563,20 +563,32 @@ func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("async_r"), "Async Receiver")
 
 	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "project later")
-	var syncEvents int
+	var syncEvents, recipients int
 	var payloadVersion int
+	var ready bool
 	if err := db.QueryRow(
 		context.Background(),
 		`SELECT count(*),
-		        (SELECT payload_version FROM outbox_events WHERE message_id = $1)
+		        (SELECT payload_version FROM outbox_events WHERE message_id = $1),
+		        (SELECT ready_at IS NOT NULL FROM outbox_events WHERE message_id = $1),
+		        (SELECT count(*)
+		         FROM outbox_recipients AS recipient
+		         JOIN outbox_events AS event USING (event_id)
+		         WHERE event.message_id = $1)
 		 FROM user_message_events
 		 WHERE message_id = $1`,
 		created.ID,
-	).Scan(&syncEvents, &payloadVersion); err != nil {
+	).Scan(&syncEvents, &payloadVersion, &ready, &recipients); err != nil {
 		t.Fatalf("read pending projection: %v", err)
 	}
-	if syncEvents != 0 || payloadVersion != 3 {
-		t.Fatalf("before projection: sync events=%d payload version=%d, want 0 and 3", syncEvents, payloadVersion)
+	if syncEvents != 0 || payloadVersion != 3 || ready || recipients != 0 {
+		t.Fatalf(
+			"before projection: sync events=%d payload version=%d ready=%v recipients=%d",
+			syncEvents,
+			payloadVersion,
+			ready,
+			recipients,
+		)
 	}
 
 	projectPendingMessageEvents(t, db)
@@ -585,15 +597,239 @@ func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
 		context.Background(),
 		`SELECT count(*),
 		        (SELECT payload_version FROM outbox_events WHERE message_id = $1),
-		        (SELECT published_at IS NOT NULL FROM outbox_events WHERE message_id = $1)
+		        (SELECT ready_at IS NOT NULL FROM outbox_events WHERE message_id = $1),
+		        (SELECT published_at IS NOT NULL FROM outbox_events WHERE message_id = $1),
+		        (SELECT count(*)
+		         FROM outbox_recipients AS recipient
+		         JOIN outbox_events AS event USING (event_id)
+		         WHERE event.message_id = $1)
 		 FROM user_message_events
 		 WHERE message_id = $1`,
 		created.ID,
-	).Scan(&syncEvents, &payloadVersion, &published); err != nil {
+	).Scan(&syncEvents, &payloadVersion, &ready, &published, &recipients); err != nil {
 		t.Fatalf("read completed projection: %v", err)
 	}
-	if syncEvents != 2 || payloadVersion != 2 || !published {
-		t.Fatalf("after projection: sync events=%d payload version=%d published=%v, want 2, 2 and true", syncEvents, payloadVersion, published)
+	if syncEvents != 2 || payloadVersion != 3 || !ready || !published || recipients != 2 {
+		t.Fatalf(
+			"after projection: sync events=%d payload version=%d ready=%v published=%v recipients=%d",
+			syncEvents,
+			payloadVersion,
+			ready,
+			published,
+			recipients,
+		)
+	}
+}
+
+func TestStructuredRecipientsRecoverAfterProjectionCommitBeforePublish(t *testing.T) {
+	db := openTestDatabase(t)
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	sender := registerTestAccount(t, db, server.URL, uniqueUsername("recover_s"), "Recover Sender")
+	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("recover_r"), "Recover Receiver")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "recover projection")
+
+	config := defaultOutboxWorkerConfig()
+	config.BatchSize = 1
+	first := mustMessageTestWorker(t, db, &testPublisher{}, config)
+	claimed, err := first.claim(context.Background())
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim event = %+v, err %v", claimed, err)
+	}
+	prepared, err := first.preparer.PrepareBatch(context.Background(), claimed)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepare event = %+v, err %v", prepared, err)
+	}
+	firstPayload, err := decodeMessageCreatedEvent(prepared[0])
+	if err != nil {
+		t.Fatalf("decode first prepared event: %v", err)
+	}
+
+	var storedPayloadVersion, syncEvents, recipients int
+	var ready, published bool
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT event.payload_version,
+		        event.ready_at IS NOT NULL,
+		        event.published_at IS NOT NULL,
+		        (SELECT count(*) FROM user_message_events WHERE message_id = event.message_id),
+		        (SELECT count(*) FROM outbox_recipients WHERE event_id = event.event_id)
+		 FROM outbox_events AS event
+		 WHERE event.message_id = $1`,
+		created.ID,
+	).Scan(&storedPayloadVersion, &ready, &published, &syncEvents, &recipients); err != nil {
+		t.Fatalf("read committed projection: %v", err)
+	}
+	if storedPayloadVersion != 3 || !ready || published || syncEvents != 2 || recipients != 2 {
+		t.Fatalf(
+			"committed projection = payload %d ready %v published %v sync %d recipients %d",
+			storedPayloadVersion,
+			ready,
+			published,
+			syncEvents,
+			recipients,
+		)
+	}
+
+	if _, err := db.Exec(
+		context.Background(),
+		`UPDATE outbox_events
+		 SET locked_until = CURRENT_TIMESTAMP - INTERVAL '1 second'
+		 WHERE message_id = $1`,
+		created.ID,
+	); err != nil {
+		t.Fatalf("expire projected event lease: %v", err)
+	}
+	publisher := &testPublisher{}
+	restarted := mustMessageTestWorker(t, db, publisher, config)
+	processed, err := restarted.RunOnce(context.Background())
+	if err != nil || processed != 1 {
+		t.Fatalf("restart worker processed %d, err %v", processed, err)
+	}
+	received := publisher.received()
+	if len(received) != 1 {
+		t.Fatalf("restart published %d events, want 1", len(received))
+	}
+	retriedPayload, err := decodeMessageCreatedEvent(received[0])
+	if err != nil {
+		t.Fatalf("decode retried event: %v", err)
+	}
+	if fmt.Sprint(retriedPayload.Recipients) != fmt.Sprint(firstPayload.Recipients) {
+		t.Fatalf("retried recipients = %+v, want %+v", retriedPayload.Recipients, firstPayload.Recipients)
+	}
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT published_at IS NOT NULL,
+		        (SELECT count(*) FROM user_message_events WHERE message_id = outbox_events.message_id),
+		        (SELECT count(*) FROM outbox_recipients WHERE event_id = outbox_events.event_id)
+		 FROM outbox_events
+		 WHERE message_id = $1`,
+		created.ID,
+	).Scan(&published, &syncEvents, &recipients); err != nil {
+		t.Fatalf("read restarted projection: %v", err)
+	}
+	if !published || syncEvents != 2 || recipients != 2 {
+		t.Fatalf("restart state = published %v sync %d recipients %d", published, syncEvents, recipients)
+	}
+}
+
+func TestJSONBProjectionStorageRemainsAvailableForRollback(t *testing.T) {
+	db := openTestDatabase(t)
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	sender := registerTestAccount(t, db, server.URL, uniqueUsername("jsonb_s"), "JSONB Sender")
+	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("jsonb_r"), "JSONB Receiver")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "jsonb rollback")
+
+	config := defaultOutboxWorkerConfig()
+	config.BatchSize = 1
+	config.ProjectionStorage = syncProjectionStorageJSONB
+	worker := mustMessageTestWorker(t, db, &testPublisher{}, config)
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || processed != 1 {
+		t.Fatalf("JSONB worker processed %d, err %v", processed, err)
+	}
+
+	var payloadVersion, syncEvents, recipients int
+	var ready, published bool
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT event.payload_version,
+		        event.ready_at IS NOT NULL,
+		        event.published_at IS NOT NULL,
+		        (SELECT count(*) FROM user_message_events WHERE message_id = event.message_id),
+		        (SELECT count(*) FROM outbox_recipients WHERE event_id = event.event_id)
+		 FROM outbox_events AS event
+		 WHERE event.message_id = $1`,
+		created.ID,
+	).Scan(&payloadVersion, &ready, &published, &syncEvents, &recipients); err != nil {
+		t.Fatalf("read JSONB rollback state: %v", err)
+	}
+	if payloadVersion != 2 || !ready || !published || syncEvents != 2 || recipients != 0 {
+		t.Fatalf(
+			"JSONB rollback state = payload %d ready %v published %v sync %d recipients %d",
+			payloadVersion,
+			ready,
+			published,
+			syncEvents,
+			recipients,
+		)
+	}
+}
+
+func TestStructuredProjectionStoresOneRecipientForSelfMessage(t *testing.T) {
+	db := openTestDatabase(t)
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	account := registerTestAccount(t, db, server.URL, uniqueUsername("self"), "Self Sender")
+	created := createMessageThroughAPI(t, server.URL, account.Auth.AccessToken, account.User.ID, "note to self")
+	projectPendingMessageEvents(t, db)
+
+	var syncEvents, recipients int
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT (SELECT count(*) FROM user_message_events WHERE message_id = $1),
+		        (SELECT count(*)
+		         FROM outbox_recipients AS recipient
+		         JOIN outbox_events AS event USING (event_id)
+		         WHERE event.message_id = $1)`,
+		created.ID,
+	).Scan(&syncEvents, &recipients); err != nil {
+		t.Fatalf("read self-message projection: %v", err)
+	}
+	if syncEvents != 1 || recipients != 1 {
+		t.Fatalf("self-message projection = sync %d recipients %d, want 1 and 1", syncEvents, recipients)
+	}
+}
+
+func TestStructuredProjectionRollsBackWhenLeaseIsLost(t *testing.T) {
+	db := openTestDatabase(t)
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	sender := registerTestAccount(t, db, server.URL, uniqueUsername("lease_s"), "Lease Sender")
+	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("lease_r"), "Lease Receiver")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "lose lease")
+
+	config := defaultOutboxWorkerConfig()
+	config.BatchSize = 1
+	worker := mustMessageTestWorker(t, db, &testPublisher{}, config)
+	claimed, err := worker.claim(context.Background())
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim event = %+v, err %v", claimed, err)
+	}
+	if _, err := db.Exec(
+		context.Background(),
+		`UPDATE outbox_events
+		 SET lock_token = gen_random_uuid()
+		 WHERE message_id = $1`,
+		created.ID,
+	); err != nil {
+		t.Fatalf("replace event lease: %v", err)
+	}
+	if _, err := worker.preparer.PrepareBatch(context.Background(), claimed); !errors.Is(err, errOutboxLeaseLost) {
+		t.Fatalf("prepare after lease loss = %v, want lease lost", err)
+	}
+
+	var syncEvents, recipients, counters int
+	var ready bool
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT (SELECT count(*) FROM user_message_events WHERE message_id = $1),
+		        (SELECT count(*)
+		         FROM outbox_recipients AS recipient
+		         JOIN outbox_events AS event USING (event_id)
+		         WHERE event.message_id = $1),
+		        (SELECT count(*) FROM user_sync_counters WHERE user_id = ANY($2::bigint[])),
+		        ready_at IS NOT NULL
+		 FROM outbox_events
+		 WHERE message_id = $1`,
+		created.ID,
+		[]int64{sender.User.ID, receiver.User.ID},
+	).Scan(&syncEvents, &recipients, &counters, &ready); err != nil {
+		t.Fatalf("read rolled-back projection: %v", err)
+	}
+	if syncEvents != 0 || recipients != 0 || counters != 0 || ready {
+		t.Fatalf("lease-lost projection persisted sync=%d recipients=%d counters=%d ready=%v", syncEvents, recipients, counters, ready)
 	}
 }
 

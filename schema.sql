@@ -143,6 +143,7 @@ CREATE TABLE outbox_events (
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     locked_until TIMESTAMPTZ,
     lock_token UUID,
+    ready_at TIMESTAMPTZ,
     published_at TIMESTAMPTZ,
     dead_at TIMESTAMPTZ,
     last_error TEXT,
@@ -152,9 +153,13 @@ CREATE TABLE outbox_events (
     CONSTRAINT outbox_attempt_count_valid CHECK (attempt_count >= 0),
     CONSTRAINT outbox_next_attempt_valid CHECK (next_attempt_at >= created_at),
     CONSTRAINT outbox_lock_pair_valid CHECK ((locked_until IS NULL) = (lock_token IS NULL)),
+    CONSTRAINT outbox_ready_time_valid CHECK (ready_at IS NULL OR ready_at >= created_at),
     CONSTRAINT outbox_published_time_valid CHECK (published_at IS NULL OR published_at >= created_at),
     CONSTRAINT outbox_dead_time_valid CHECK (dead_at IS NULL OR dead_at >= created_at),
     CONSTRAINT outbox_single_terminal_state CHECK (published_at IS NULL OR dead_at IS NULL),
+    CONSTRAINT outbox_message_publish_requires_ready CHECK (
+        event_type <> 'message.created' OR published_at IS NULL OR ready_at IS NOT NULL
+    ),
     CONSTRAINT outbox_last_error_valid CHECK (last_error IS NULL OR char_length(last_error) <= 2000),
     CONSTRAINT outbox_message_event_unique UNIQUE (message_id, event_type)
 );
@@ -162,3 +167,16 @@ CREATE TABLE outbox_events (
 CREATE INDEX outbox_pending_idx
     ON outbox_events (next_attempt_at, created_at, event_id)
     WHERE published_at IS NULL AND dead_at IS NULL;
+
+CREATE TABLE outbox_recipients (
+    event_id UUID NOT NULL REFERENCES outbox_events(event_id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    cursor BIGINT NOT NULL,
+    PRIMARY KEY (event_id, user_id),
+    CONSTRAINT outbox_recipients_cursor_valid CHECK (cursor > 0),
+    CONSTRAINT outbox_recipients_user_cursor_unique UNIQUE (user_id, cursor),
+    CONSTRAINT outbox_recipients_sync_event_fk
+        FOREIGN KEY (user_id, cursor)
+        REFERENCES user_message_events(user_id, seq)
+        ON DELETE CASCADE
+);

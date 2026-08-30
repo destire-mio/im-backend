@@ -31,6 +31,7 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 | `im_backend_outbox_stage_duration_seconds` | 非空批次的 claim、prepare、publish、mark_published 关键路径耗时；prepare 另分 decode、begin、project_users、encode、store、commit 子阶段 | Outbox Worker |
 | `im_backend_outbox_worker_concurrency` / `batch_size` | 当前 Worker 并发槽位与单次 claim 批量 | Outbox 配置 |
 | `im_backend_outbox_projection_bulk_enabled` | `0` 为逐用户 SQL，`1` 为批量投影实验实现 | Outbox 配置 |
+| `im_backend_outbox_projection_recipients_enabled` | `0` 为 JSONB payload 回写，`1` 为结构化 recipients + ready | Outbox 配置 |
 | `im_backend_outbox_projection_batches_total` / `users_total` | 投影批次数与每批涉及的唯一用户总数；二者相除得到平均用户数/批 | Sync 投影 |
 | `im_backend_outbox_projection_query_duration_seconds` | `project_users` 内单次 SQL 的客户端观测耗时；`count / batches` 得到 SQL 次数/批 | PostgreSQL 往返、执行与结果读取 |
 | `im_backend_realtime_routing_total` | 本地 Hub、Presence、Redis 发布/订阅各阶段结果 | Redis/跨实例路由 |
@@ -51,12 +52,13 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 2. 检查 Outbox 待处理数和最老事件年龄；持续增长说明异步发布跟不上。
 3. 用 `outbox_stage_duration_seconds` 区分 claim、Sync 投影、实时 publish 和状态收尾；批次阶段快但 pending age 持续增长，表示总处理能力仍低于到达速率。
 4. 若 `prepare_project_users` 最大，用 projection 的 batches、users 和 query count 判断是否仍在按用户执行 SQL；该 Histogram 包含服务端执行、锁等待、数据库往返和结果读取，不能单独解释为纯网络 RTT。
-5. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。
-6. 检查 Presence 查询和 Redis publish/receive 的 error、no_subscriber。
-7. 检查 Hub 是否没有连接，以及 slow_client 是否增加。
-8. 检查 WebSocket write/ping 错误；实时链路允许失败，客户端随后应走 Sync。
-9. 检查 Sync 返回量和 ACK lag；实时层正常但 ACK 落后通常表示客户端没有完成落盘或补拉。
-10. 单条事件使用日志中的 `message_id`、`event_id` 查询对应 Outbox 状态和失败记录。
+5. 若 `prepare_store` 最大，先看 `outbox_projection_recipients_enabled`：JSONB 模式表示 payload 回写成本，recipients 模式表示结构化 recipient 插入与 ready 更新成本，二者不能混为同一种写入。
+6. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。
+7. 检查 Presence 查询和 Redis publish/receive 的 error、no_subscriber。
+8. 检查 Hub 是否没有连接，以及 slow_client 是否增加。
+9. 检查 WebSocket write/ping 错误；实时链路允许失败，客户端随后应走 Sync。
+10. 检查 Sync 返回量和 ACK lag；实时层正常但 ACK 落后通常表示客户端没有完成落盘或补拉。
+11. 单条事件使用日志中的 `message_id`、`event_id` 查询对应 Outbox 状态和失败记录。
 
 ## PromQL 示例
 
@@ -67,7 +69,7 @@ im_backend_outbox_oldest_pending_age_seconds > 30
 # 五分钟内 Outbox 重试速率
 sum(rate(im_backend_outbox_publish_total{result="retry_scheduled"}[5m])) by (event_type)
 
-# 各 Outbox 批次阶段的 P95；stage 只有四个固定值
+# Outbox 关键阶段和 prepare 子阶段的 P95
 histogram_quantile(
   0.95,
   sum(rate(im_backend_outbox_stage_duration_seconds_bucket[5m])) by (le, stage)

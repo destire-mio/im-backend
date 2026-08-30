@@ -23,6 +23,7 @@ type outboxEvent struct {
 	Payload        json.RawMessage
 	AttemptCount   int
 	LockToken      string
+	ReadyAt        *time.Time
 }
 
 type outboxPublisher interface {
@@ -34,17 +35,18 @@ type outboxBatchPreparer interface {
 }
 
 type outboxWorkerConfig struct {
-	EventTypes     []string
-	BatchSize      int
-	Concurrency    int
-	ProjectionMode syncProjectionMode
-	LeaseDuration  time.Duration
-	AttemptTimeout time.Duration
-	PollInterval   time.Duration
-	MaxAttempts    int
-	BaseBackoff    time.Duration
-	MaxBackoff     time.Duration
-	jitter         func(time.Duration) time.Duration
+	EventTypes        []string
+	BatchSize         int
+	Concurrency       int
+	ProjectionMode    syncProjectionMode
+	ProjectionStorage syncProjectionStorage
+	LeaseDuration     time.Duration
+	AttemptTimeout    time.Duration
+	PollInterval      time.Duration
+	MaxAttempts       int
+	BaseBackoff       time.Duration
+	MaxBackoff        time.Duration
+	jitter            func(time.Duration) time.Duration
 }
 
 type outboxWorker struct {
@@ -92,17 +94,18 @@ func retryablePublishError(err error, retryAfter time.Duration) error {
 
 func defaultOutboxWorkerConfig() outboxWorkerConfig {
 	return outboxWorkerConfig{
-		EventTypes:     []string{"message.created"},
-		BatchSize:      64,
-		Concurrency:    16,
-		ProjectionMode: syncProjectionModeBulk,
-		LeaseDuration:  30 * time.Second,
-		AttemptTimeout: 10 * time.Second,
-		PollInterval:   500 * time.Millisecond,
-		MaxAttempts:    10,
-		BaseBackoff:    time.Second,
-		MaxBackoff:     5 * time.Minute,
-		jitter:         equalJitter,
+		EventTypes:        []string{"message.created"},
+		BatchSize:         64,
+		Concurrency:       16,
+		ProjectionMode:    syncProjectionModeBulk,
+		ProjectionStorage: syncProjectionStorageRecipients,
+		LeaseDuration:     30 * time.Second,
+		AttemptTimeout:    10 * time.Second,
+		PollInterval:      500 * time.Millisecond,
+		MaxAttempts:       10,
+		BaseBackoff:       time.Second,
+		MaxBackoff:        5 * time.Minute,
+		jitter:            equalJitter,
 	}
 }
 
@@ -151,11 +154,21 @@ func newMessageOutboxWorker(
 		return nil, err
 	}
 	config.ProjectionMode = projectionMode
+	projectionStorage, err := normalizeSyncProjectionStorage(config.ProjectionStorage)
+	if err != nil {
+		return nil, err
+	}
+	config.ProjectionStorage = projectionStorage
 	worker, err := newOutboxWorker(db, publisher, config, metricObservers...)
 	if err != nil {
 		return nil, err
 	}
-	worker.preparer = &messageSyncProjector{db: db, metrics: worker.metrics, mode: projectionMode}
+	worker.preparer = &messageSyncProjector{
+		db:      db,
+		metrics: worker.metrics,
+		mode:    projectionMode,
+		storage: projectionStorage,
+	}
 	return worker, nil
 }
 
@@ -326,7 +339,8 @@ func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 		           event.message_id,
 		           event.payload,
 		           event.attempt_count,
-		           event.lock_token::text`,
+		           event.lock_token::text,
+		           event.ready_at`,
 		worker.config.BatchSize,
 		worker.config.LeaseDuration.Milliseconds(),
 		worker.config.EventTypes,
@@ -347,6 +361,7 @@ func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 			&event.Payload,
 			&event.AttemptCount,
 			&event.LockToken,
+			&event.ReadyAt,
 		); err != nil {
 			return nil, err
 		}

@@ -259,6 +259,14 @@ func TestMessageOutboxWorkerRejectsUnsupportedProjectionMode(t *testing.T) {
 	}
 }
 
+func TestMessageOutboxWorkerRejectsUnsupportedProjectionStorage(t *testing.T) {
+	config := defaultOutboxWorkerConfig()
+	config.ProjectionStorage = "unsupported"
+	if _, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
+		t.Fatal("unsupported projection storage was accepted")
+	}
+}
+
 func createPendingOutboxEvent(t *testing.T, db *pgxpool.Pool) string {
 	t.Helper()
 	server := httptest.NewServer(newTestApplication(t, db).routes())

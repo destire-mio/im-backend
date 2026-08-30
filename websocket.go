@@ -33,8 +33,9 @@ type messageCreatedEventPayload struct {
 }
 
 // messageCreatedPendingPayload is payload version 3. It is durable, but it is
-// not publishable until the sync projector allocates recipient cursors and
-// atomically rewrites it to messageCreatedEventPayload (version 2).
+// not publishable until the sync projector commits recipient cursors. The
+// default structured-recipient path leaves this JSONB immutable and builds a
+// version-2 payload in memory; the jsonb rollback path persists that payload.
 type messageCreatedPendingPayload struct {
 	Message message `json:"message"`
 }

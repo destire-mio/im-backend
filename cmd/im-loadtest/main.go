@@ -1146,6 +1146,7 @@ var endMetricNames = []string{
 	"im_backend_outbox_worker_concurrency",
 	"im_backend_outbox_worker_batch_size",
 	"im_backend_outbox_projection_bulk_enabled",
+	"im_backend_outbox_projection_recipients_enabled",
 	"im_backend_websocket_send_queue_high_watermark",
 	"go_goroutines",
 	"process_resident_memory_bytes",
