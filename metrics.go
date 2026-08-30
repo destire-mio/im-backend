@@ -17,6 +17,7 @@ type applicationMetrics struct {
 	registry                   *prometheus.Registry
 	httpRequests               *prometheus.CounterVec
 	httpDuration               *prometheus.HistogramVec
+	databaseAcquireDuration    *prometheus.HistogramVec
 	outboxPublish              *prometheus.CounterVec
 	outboxPublishDuration      *prometheus.HistogramVec
 	outboxStageDuration        *prometheus.HistogramVec
@@ -60,6 +61,12 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Help:      "HTTP request duration by stable route and method.",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"route", "method"}),
+		databaseAcquireDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "im_backend",
+			Name:      "database_pool_acquire_duration_seconds",
+			Help:      "Client-observed duration of acquiring a shared database pool connection by bounded workload and result.",
+			Buckets:   []float64{0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		}, []string{"workload", "result"}),
 		outboxPublish: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_publish_total",
@@ -197,6 +204,7 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		metrics.httpRequests,
 		metrics.httpDuration,
+		metrics.databaseAcquireDuration,
 		metrics.outboxPublish,
 		metrics.outboxPublishDuration,
 		metrics.outboxStageDuration,
@@ -224,9 +232,16 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.outboxProjectionQueries,
 	)
 	if db != nil {
-		registry.MustRegister(newDatabaseStateCollector(db), newDatabasePoolCollector(db))
+		metrics.registerDatabaseCollectors(db)
 	}
 	return metrics
+}
+
+func (metrics *applicationMetrics) registerDatabaseCollectors(db *pgxpool.Pool) {
+	if metrics == nil || db == nil {
+		return
+	}
+	metrics.registry.MustRegister(newDatabaseStateCollector(db), newDatabasePoolCollector(db))
 }
 
 func (metrics *applicationMetrics) ObserveWebSocketQueueDepth(depth int) {
@@ -251,6 +266,23 @@ func (metrics *applicationMetrics) ObserveWebSocketWrite(duration time.Duration,
 	if metrics != nil {
 		metrics.webSocketWriteDuration.WithLabelValues(result).Observe(duration.Seconds())
 	}
+}
+
+func (metrics *applicationMetrics) ObserveDatabaseAcquire(workload, result string, duration time.Duration) {
+	if metrics == nil || duration < 0 {
+		return
+	}
+	switch workload {
+	case databaseWorkloadAPI, databaseWorkloadOutbox:
+	default:
+		return
+	}
+	switch result {
+	case databaseAcquireSuccess, databaseAcquireError:
+	default:
+		return
+	}
+	metrics.databaseAcquireDuration.WithLabelValues(workload, result).Observe(duration.Seconds())
 }
 
 func (metrics *applicationMetrics) ObserveOutboxStage(stage string, duration time.Duration) {

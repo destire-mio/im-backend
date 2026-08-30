@@ -9,12 +9,55 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type testBatchPreparerFunc func(context.Context, []outboxEvent) ([]outboxEvent, error)
 
 func (prepare testBatchPreparerFunc) PrepareBatch(ctx context.Context, events []outboxEvent) ([]outboxEvent, error) {
 	return prepare(ctx, events)
+}
+
+func TestDatabaseAcquireTracerPartitionsAPIAndOutboxWait(t *testing.T) {
+	metrics := newApplicationMetrics(nil)
+	now := time.Unix(100, 0)
+	tracer := &databaseAcquireTracer{metrics: metrics, now: func() time.Time { return now }}
+
+	apiContext := tracer.TraceAcquireStart(
+		withDatabaseWorkload(context.Background(), databaseWorkloadAPI),
+		nil,
+		pgxpool.TraceAcquireStartData{},
+	)
+	now = now.Add(7 * time.Millisecond)
+	tracer.TraceAcquireEnd(apiContext, nil, pgxpool.TraceAcquireEndData{})
+
+	outboxContext := tracer.TraceAcquireStart(
+		withDatabaseWorkload(context.Background(), databaseWorkloadOutbox),
+		nil,
+		pgxpool.TraceAcquireStartData{},
+	)
+	now = now.Add(11 * time.Millisecond)
+	tracer.TraceAcquireEnd(outboxContext, nil, pgxpool.TraceAcquireEndData{Err: errors.New("pool timeout")})
+
+	untagged := tracer.TraceAcquireStart(context.Background(), nil, pgxpool.TraceAcquireStartData{})
+	now = now.Add(time.Second)
+	tracer.TraceAcquireEnd(untagged, nil, pgxpool.TraceAcquireEndData{})
+
+	exposition := scrapeMetrics(t, metrics)
+	for _, expected := range []string{
+		`im_backend_database_pool_acquire_duration_seconds_count{result="success",workload="api"} 1`,
+		`im_backend_database_pool_acquire_duration_seconds_sum{result="success",workload="api"} 0.007`,
+		`im_backend_database_pool_acquire_duration_seconds_count{result="error",workload="outbox"} 1`,
+		`im_backend_database_pool_acquire_duration_seconds_sum{result="error",workload="outbox"} 0.011`,
+	} {
+		if !strings.Contains(exposition, expected) {
+			t.Fatalf("metrics exposition missing %q\n%s", expected, exposition)
+		}
+	}
+	if strings.Contains(exposition, `workload="unknown"`) {
+		t.Fatalf("metrics exposition contains an unbounded workload label\n%s", exposition)
+	}
 }
 
 func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {

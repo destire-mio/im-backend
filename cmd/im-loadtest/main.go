@@ -160,8 +160,9 @@ type histogramSnapshot struct {
 }
 
 type metricsSnapshot struct {
-	Values               map[string]float64
-	OutboxStageDurations map[string]histogramSnapshot
+	Values                   map[string]float64
+	OutboxStageDurations     map[string]histogramSnapshot
+	DatabaseAcquireDurations map[string]map[string]histogramSnapshot
 }
 
 type histogramDeltaReport struct {
@@ -180,37 +181,38 @@ type metricSamplingReport struct {
 }
 
 type report struct {
-	RunID                string                          `json:"runId"`
-	StartedAt            time.Time                       `json:"startedAt"`
-	FinishedAt           time.Time                       `json:"finishedAt"`
-	Database             string                          `json:"database"`
-	Users                int                             `json:"users"`
-	DevicesPerUser       int                             `json:"devicesPerUser"`
-	WebSocketCount       int                             `json:"webSocketCount"`
-	Concurrency          int                             `json:"concurrency"`
-	LoadModel            string                          `json:"loadModel"`
-	TargetRateRPS        int                             `json:"targetRateRps,omitempty"`
-	RequestTimeout       string                          `json:"requestTimeout"`
-	DeliveryWait         string                          `json:"deliveryWait"`
-	LoadDurationMS       float64                         `json:"loadDurationMs"`
-	MessagesAttempted    int                             `json:"messagesAttempted"`
-	MessagesSucceeded    int                             `json:"messagesSucceeded"`
-	MessagesFailed       int                             `json:"messagesFailed"`
-	DroppedStarts        int                             `json:"droppedStarts"`
-	IdempotentRecovered  int                             `json:"idempotentRecovered"`
-	HTTPThroughputRPS    float64                         `json:"httpThroughputRps"`
-	HTTPLatency          durationStats                   `json:"httpLatency"`
-	RealtimeLatency      durationStats                   `json:"realtimeLatency"`
-	Realtime             verificationReport              `json:"realtime"`
-	Sync                 verificationReport              `json:"sync"`
-	DuplicateRealtime    int                             `json:"duplicateRealtime"`
-	UnexpectedRealtime   int                             `json:"unexpectedRealtime"`
-	RequestErrors        []string                        `json:"requestErrors,omitempty"`
-	ReaderErrors         []string                        `json:"readerErrors,omitempty"`
-	MetricDeltas         map[string]float64              `json:"metricDeltas,omitempty"`
-	MetricEnd            map[string]float64              `json:"metricEnd,omitempty"`
-	OutboxStageDurations map[string]histogramDeltaReport `json:"outboxStageDurations,omitempty"`
-	MetricSampling       metricSamplingReport            `json:"metricSampling"`
+	RunID                    string                                     `json:"runId"`
+	StartedAt                time.Time                                  `json:"startedAt"`
+	FinishedAt               time.Time                                  `json:"finishedAt"`
+	Database                 string                                     `json:"database"`
+	Users                    int                                        `json:"users"`
+	DevicesPerUser           int                                        `json:"devicesPerUser"`
+	WebSocketCount           int                                        `json:"webSocketCount"`
+	Concurrency              int                                        `json:"concurrency"`
+	LoadModel                string                                     `json:"loadModel"`
+	TargetRateRPS            int                                        `json:"targetRateRps,omitempty"`
+	RequestTimeout           string                                     `json:"requestTimeout"`
+	DeliveryWait             string                                     `json:"deliveryWait"`
+	LoadDurationMS           float64                                    `json:"loadDurationMs"`
+	MessagesAttempted        int                                        `json:"messagesAttempted"`
+	MessagesSucceeded        int                                        `json:"messagesSucceeded"`
+	MessagesFailed           int                                        `json:"messagesFailed"`
+	DroppedStarts            int                                        `json:"droppedStarts"`
+	IdempotentRecovered      int                                        `json:"idempotentRecovered"`
+	HTTPThroughputRPS        float64                                    `json:"httpThroughputRps"`
+	HTTPLatency              durationStats                              `json:"httpLatency"`
+	RealtimeLatency          durationStats                              `json:"realtimeLatency"`
+	Realtime                 verificationReport                         `json:"realtime"`
+	Sync                     verificationReport                         `json:"sync"`
+	DuplicateRealtime        int                                        `json:"duplicateRealtime"`
+	UnexpectedRealtime       int                                        `json:"unexpectedRealtime"`
+	RequestErrors            []string                                   `json:"requestErrors,omitempty"`
+	ReaderErrors             []string                                   `json:"readerErrors,omitempty"`
+	MetricDeltas             map[string]float64                         `json:"metricDeltas,omitempty"`
+	MetricEnd                map[string]float64                         `json:"metricEnd,omitempty"`
+	OutboxStageDurations     map[string]histogramDeltaReport            `json:"outboxStageDurations,omitempty"`
+	DatabaseAcquireDurations map[string]map[string]histogramDeltaReport `json:"databaseAcquireDurations,omitempty"`
+	MetricSampling           metricSamplingReport                       `json:"metricSampling"`
 }
 
 func main() {
@@ -302,37 +304,38 @@ func main() {
 	metricSampling := metricSampler.Stop(metricsAfter.Values)
 
 	result := report{
-		RunID:                runID,
-		StartedAt:            startedAt,
-		FinishedAt:           time.Now().UTC(),
-		Database:             databaseName,
-		Users:                len(users),
-		DevicesPerUser:       cfg.devicesPerUser,
-		WebSocketCount:       len(connections),
-		Concurrency:          cfg.concurrency,
-		LoadModel:            loadModel,
-		TargetRateRPS:        cfg.targetRate,
-		RequestTimeout:       cfg.requestTimeout.String(),
-		DeliveryWait:         cfg.deliveryWait.String(),
-		LoadDurationMS:       durationMilliseconds(loadDuration),
-		MessagesAttempted:    cfg.messages,
-		MessagesSucceeded:    successful,
-		MessagesFailed:       cfg.messages - successful,
-		DroppedStarts:        droppedStarts,
-		IdempotentRecovered:  recovered,
-		HTTPThroughputRPS:    float64(successful) / loadDuration.Seconds(),
-		HTTPLatency:          calculateDurationStats(httpLatencies),
-		RealtimeLatency:      calculateDurationStats(realtimeLatencies),
-		Realtime:             verificationReport{Expected: realtimeExpected, Observed: realtimeObserved, Missing: capStrings(realtimeMissing, 100), Passed: realtimeExpected == realtimeObserved},
-		Sync:                 verificationReport{Expected: syncExpected, Observed: syncObserved, Missing: capStrings(syncMissing, 100), Passed: syncErr == nil && syncExpected == syncObserved},
-		DuplicateRealtime:    duplicateRealtime,
-		UnexpectedRealtime:   unexpectedRealtime,
-		RequestErrors:        capStrings(requestErrors, 100),
-		ReaderErrors:         capStrings(readerErrors, 100),
-		MetricDeltas:         metricDelta(metricsBefore.Values, metricsAfter.Values),
-		MetricEnd:            selectedMetricEnd(metricsAfter.Values),
-		OutboxStageDurations: outboxStageDurationDelta(metricsBefore.OutboxStageDurations, metricsAfter.OutboxStageDurations),
-		MetricSampling:       metricSampling,
+		RunID:                    runID,
+		StartedAt:                startedAt,
+		FinishedAt:               time.Now().UTC(),
+		Database:                 databaseName,
+		Users:                    len(users),
+		DevicesPerUser:           cfg.devicesPerUser,
+		WebSocketCount:           len(connections),
+		Concurrency:              cfg.concurrency,
+		LoadModel:                loadModel,
+		TargetRateRPS:            cfg.targetRate,
+		RequestTimeout:           cfg.requestTimeout.String(),
+		DeliveryWait:             cfg.deliveryWait.String(),
+		LoadDurationMS:           durationMilliseconds(loadDuration),
+		MessagesAttempted:        cfg.messages,
+		MessagesSucceeded:        successful,
+		MessagesFailed:           cfg.messages - successful,
+		DroppedStarts:            droppedStarts,
+		IdempotentRecovered:      recovered,
+		HTTPThroughputRPS:        float64(successful) / loadDuration.Seconds(),
+		HTTPLatency:              calculateDurationStats(httpLatencies),
+		RealtimeLatency:          calculateDurationStats(realtimeLatencies),
+		Realtime:                 verificationReport{Expected: realtimeExpected, Observed: realtimeObserved, Missing: capStrings(realtimeMissing, 100), Passed: realtimeExpected == realtimeObserved},
+		Sync:                     verificationReport{Expected: syncExpected, Observed: syncObserved, Missing: capStrings(syncMissing, 100), Passed: syncErr == nil && syncExpected == syncObserved},
+		DuplicateRealtime:        duplicateRealtime,
+		UnexpectedRealtime:       unexpectedRealtime,
+		RequestErrors:            capStrings(requestErrors, 100),
+		ReaderErrors:             capStrings(readerErrors, 100),
+		MetricDeltas:             metricDelta(metricsBefore.Values, metricsAfter.Values),
+		MetricEnd:                selectedMetricEnd(metricsAfter.Values),
+		OutboxStageDurations:     outboxStageDurationDelta(metricsBefore.OutboxStageDurations, metricsAfter.OutboxStageDurations),
+		DatabaseAcquireDurations: databaseAcquireDurationDelta(metricsBefore.DatabaseAcquireDurations, metricsAfter.DatabaseAcquireDurations),
+		MetricSampling:           metricSampling,
 	}
 
 	printReport(result)
@@ -979,7 +982,15 @@ func fetchMetrics(ctx context.Context, client *http.Client, endpoint string) (me
 	if err != nil {
 		return metricsSnapshot{}, err
 	}
-	return metricsSnapshot{Values: values, OutboxStageDurations: stageDurations}, nil
+	databaseAcquireDurations, err := parseDatabaseAcquireDurations(payload)
+	if err != nil {
+		return metricsSnapshot{}, err
+	}
+	return metricsSnapshot{
+		Values:                   values,
+		OutboxStageDurations:     stageDurations,
+		DatabaseAcquireDurations: databaseAcquireDurations,
+	}, nil
 }
 
 func parseOutboxStageDurations(payload []byte) (map[string]histogramSnapshot, error) {
@@ -1010,6 +1021,48 @@ func parseOutboxStageDurations(payload []byte) (map[string]histogramSnapshot, er
 			buckets[bucket.GetUpperBound()] = bucket.GetCumulativeCount()
 		}
 		result[stage] = histogramSnapshot{
+			Count:   histogram.GetSampleCount(),
+			Sum:     histogram.GetSampleSum(),
+			Buckets: buckets,
+		}
+	}
+	return result, nil
+}
+
+func parseDatabaseAcquireDurations(payload []byte) (map[string]map[string]histogramSnapshot, error) {
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("parse Prometheus metrics: %w", err)
+	}
+	family := families["im_backend_database_pool_acquire_duration_seconds"]
+	if family == nil {
+		return map[string]map[string]histogramSnapshot{}, nil
+	}
+	result := make(map[string]map[string]histogramSnapshot)
+	for _, metric := range family.GetMetric() {
+		workload := ""
+		acquireResult := ""
+		for _, label := range metric.GetLabel() {
+			switch label.GetName() {
+			case "workload":
+				workload = label.GetValue()
+			case "result":
+				acquireResult = label.GetValue()
+			}
+		}
+		histogram := metric.GetHistogram()
+		if workload == "" || acquireResult == "" || histogram == nil {
+			continue
+		}
+		buckets := make(map[float64]uint64, len(histogram.GetBucket()))
+		for _, bucket := range histogram.GetBucket() {
+			buckets[bucket.GetUpperBound()] = bucket.GetCumulativeCount()
+		}
+		if result[workload] == nil {
+			result[workload] = make(map[string]histogramSnapshot)
+		}
+		result[workload][acquireResult] = histogramSnapshot{
 			Count:   histogram.GetSampleCount(),
 			Sum:     histogram.GetSampleSum(),
 			Buckets: buckets,
@@ -1195,6 +1248,40 @@ func outboxStageDurationDelta(
 	return result
 }
 
+func databaseAcquireDurationDelta(
+	before map[string]map[string]histogramSnapshot,
+	after map[string]map[string]histogramSnapshot,
+) map[string]map[string]histogramDeltaReport {
+	result := make(map[string]map[string]histogramDeltaReport)
+	for workload, currentByResult := range after {
+		for acquireResult, current := range currentByResult {
+			previous := before[workload][acquireResult]
+			if current.Count < previous.Count {
+				continue
+			}
+			count := current.Count - previous.Count
+			if count == 0 {
+				continue
+			}
+			sum := current.Sum - previous.Sum
+			if sum < 0 {
+				continue
+			}
+			if result[workload] == nil {
+				result[workload] = make(map[string]histogramDeltaReport)
+			}
+			result[workload][acquireResult] = histogramDeltaReport{
+				Count:       count,
+				AverageMS:   sum * 1000 / float64(count),
+				P50BucketMS: histogramQuantileBucketMS(previous, current, count, 0.50),
+				P95BucketMS: histogramQuantileBucketMS(previous, current, count, 0.95),
+				P99BucketMS: histogramQuantileBucketMS(previous, current, count, 0.99),
+			}
+		}
+	}
+	return result
+}
+
 func histogramQuantileBucketMS(before, after histogramSnapshot, count uint64, quantile float64) float64 {
 	if count == 0 {
 		return 0
@@ -1274,6 +1361,16 @@ func printReport(result report) {
 		if value, exists := result.OutboxStageDurations[stage]; exists {
 			fmt.Printf("Outbox stage %-14s batches=%d avg=%.2fms p50<=%.2fms p95<=%.2fms p99<=%.2fms\n",
 				stage, value.Count, value.AverageMS, value.P50BucketMS, value.P95BucketMS, value.P99BucketMS)
+		}
+	}
+	for _, workload := range []string{"api", "outbox"} {
+		for _, acquireResult := range []string{"success", "error"} {
+			value, exists := result.DatabaseAcquireDurations[workload][acquireResult]
+			if !exists {
+				continue
+			}
+			fmt.Printf("DB acquire %-6s %-7s count=%d avg=%.2fms p50<=%.2fms p95<=%.2fms p99<=%.2fms\n",
+				workload, acquireResult, value.Count, value.AverageMS, value.P50BucketMS, value.P95BucketMS, value.P99BucketMS)
 		}
 	}
 	fmt.Printf("Outbox metric sampling: interval=%s samples=%d errors=%d peak_pending=%.0f peak_oldest_age=%.3fs\n",

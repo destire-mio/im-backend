@@ -109,6 +109,13 @@ im_backend_outbox_stage_duration_seconds_bucket{stage="claim",le="0.5"} 2
 im_backend_outbox_stage_duration_seconds_bucket{stage="claim",le="+Inf"} 2
 im_backend_outbox_stage_duration_seconds_sum{stage="claim"} 0.3
 im_backend_outbox_stage_duration_seconds_count{stage="claim"} 2
+# HELP im_backend_database_pool_acquire_duration_seconds acquire duration
+# TYPE im_backend_database_pool_acquire_duration_seconds histogram
+im_backend_database_pool_acquire_duration_seconds_bucket{result="success",workload="api",le="0.001"} 1
+im_backend_database_pool_acquire_duration_seconds_bucket{result="success",workload="api",le="0.01"} 2
+im_backend_database_pool_acquire_duration_seconds_bucket{result="success",workload="api",le="+Inf"} 2
+im_backend_database_pool_acquire_duration_seconds_sum{result="success",workload="api"} 0.006
+im_backend_database_pool_acquire_duration_seconds_count{result="success",workload="api"} 2
 `
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(exposition))
@@ -125,6 +132,10 @@ im_backend_outbox_stage_duration_seconds_count{stage="claim"} 2
 	claim := snapshot.OutboxStageDurations["claim"]
 	if claim.Count != 2 || claim.Sum != 0.3 || claim.Buckets[0.1] != 1 || claim.Buckets[0.5] != 2 {
 		t.Fatalf("claim histogram = %#v", claim)
+	}
+	apiAcquire := snapshot.DatabaseAcquireDurations["api"]["success"]
+	if apiAcquire.Count != 2 || apiAcquire.Sum != 0.006 || apiAcquire.Buckets[0.001] != 1 || apiAcquire.Buckets[0.01] != 2 {
+		t.Fatalf("API acquire histogram = %#v", apiAcquire)
 	}
 }
 
@@ -143,6 +154,25 @@ func TestOutboxStageDurationDelta(t *testing.T) {
 	report := outboxStageDurationDelta(nil, after)["prepare"]
 	if report.Count != 4 || report.AverageMS != 177.5 || report.P50BucketMS != 100 || report.P95BucketMS != 1000 || report.P99BucketMS != 1000 {
 		t.Fatalf("stage report = %#v", report)
+	}
+}
+
+func TestDatabaseAcquireDurationDeltaKeepsWorkloadAndResult(t *testing.T) {
+	after := map[string]map[string]histogramSnapshot{
+		"outbox": {
+			"success": {
+				Count: 3,
+				Sum:   0.021,
+				Buckets: map[float64]uint64{
+					0.005: 1,
+					0.010: 3,
+				},
+			},
+		},
+	}
+	report := databaseAcquireDurationDelta(nil, after)["outbox"]["success"]
+	if report.Count != 3 || report.AverageMS != 7 || report.P50BucketMS != 10 || report.P95BucketMS != 10 || report.P99BucketMS != 10 {
+		t.Fatalf("database acquire report = %#v", report)
 	}
 }
 

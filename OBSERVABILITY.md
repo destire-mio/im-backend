@@ -47,21 +47,23 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 | `im_backend_ack_requests_total` | accepted、ahead、invalid、error | 客户端 ACK |
 | `im_backend_device_sync_max_ack_lag` | 已记录设备中最大的同步流与 ACK 差值 | 客户端落盘/补拉 |
 | `im_backend_database_metrics_collection_success` | 数据库聚合指标是否抓取成功 | 监控自身 |
+| `im_backend_database_pool_acquire_duration_seconds` | `workload=api/outbox`、`result=success/error` 维度的共享 Pool 连接获取耗时；包含等待空闲连接、创建/检查连接等调用方实际等待时间 | PostgreSQL 连接池争用 |
 | `im_backend_database_pool_*` | 应用连接池上限、占用/空闲数、空池等待次数与累计等待时间 | PostgreSQL 连接池 |
 
 ## 排障顺序
 
 1. 用 HTTP 状态码和耗时确认请求是否进入并完成服务端持久化。
-2. 检查 Outbox 待处理数和最老事件年龄；持续增长说明异步发布跟不上。
-3. 用 `outbox_stage_duration_seconds` 区分 claim、Sync 投影、实时 publish 和状态收尾。`outbox_pipeline_enabled=0` 时四阶段串行相加；为 `1` 时分别比较准备 Lane（claim + prepare）和投递 Lane（publish + mark），不能再把四项之和当成批次完成间隔。任一 Lane 超过到达预算，pending age 都会持续增长。
-4. 若 `prepare_project_users` 最大，用 projection 的 batches、users 和 query count 判断是否仍在按用户执行 SQL；该 Histogram 包含服务端执行、锁等待、数据库往返和结果读取，不能单独解释为纯网络 RTT。
-5. 若 `prepare_store` 最大，先看 `outbox_projection_recipients_enabled`：JSONB 模式表示 payload 回写成本，recipients 模式表示结构化 recipient 插入与 ready 更新成本，二者不能混为同一种写入。
-6. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。
-7. 检查 `batch_presence_enabled`、`publish_prepare` 和平均唯一用户数/批，再检查 Presence 查询与 Redis publish/receive 的 error、no_subscriber。
-8. 检查 Hub 是否没有连接，以及 slow_client 是否增加。
-9. 检查 WebSocket write/ping 错误；实时链路允许失败，客户端随后应走 Sync。
-10. 检查 Sync 返回量和 ACK lag；实时层正常但 ACK 落后通常表示客户端没有完成落盘或补拉。
-11. 单条事件使用日志中的 `message_id`、`event_id` 查询对应 Outbox 状态和失败记录。
+2. 对比 `database_pool_acquire_duration_seconds` 的 API 与 Outbox P95。两者同时升高且 Pool 空池等待增长，说明共享连接池正在争用；只有某一侧升高时，先检查该侧并发和事务占用。这个 Histogram 测的是调用方取得连接前的总等待，不是 SQL 执行时间。
+3. 检查 Outbox 待处理数和最老事件年龄；持续增长说明异步发布跟不上。
+4. 用 `outbox_stage_duration_seconds` 区分 claim、Sync 投影、实时 publish 和状态收尾。`outbox_pipeline_enabled=0` 时四阶段串行相加；为 `1` 时分别比较准备 Lane（claim + prepare）和投递 Lane（publish + mark），不能再把四项之和当成批次完成间隔。任一 Lane 超过到达预算，pending age 都会持续增长。
+5. 若 `prepare_project_users` 最大，用 projection 的 batches、users 和 query count 判断是否仍在按用户执行 SQL；该 Histogram 包含服务端执行、锁等待、数据库往返和结果读取，不能单独解释为纯网络 RTT。
+6. 若 `prepare_store` 最大，先看 `outbox_projection_recipients_enabled`：JSONB 模式表示 payload 回写成本，recipients 模式表示结构化 recipient 插入与 ready 更新成本，二者不能混为同一种写入。
+7. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。
+8. 检查 `batch_presence_enabled`、`publish_prepare` 和平均唯一用户数/批，再检查 Presence 查询与 Redis publish/receive 的 error、no_subscriber。
+9. 检查 Hub 是否没有连接，以及 slow_client 是否增加。
+10. 检查 WebSocket write/ping 错误；实时链路允许失败，客户端随后应走 Sync。
+11. 检查 Sync 返回量和 ACK lag；实时层正常但 ACK 落后通常表示客户端没有完成落盘或补拉。
+12. 单条事件使用日志中的 `message_id`、`event_id` 查询对应 Outbox 状态和失败记录。
 
 ## PromQL 示例
 
@@ -88,6 +90,12 @@ rate(im_backend_websocket_disconnects_total{reason="slow_client"}[5m])
 histogram_quantile(
   0.95,
   sum(rate(im_backend_http_request_duration_seconds_bucket[5m])) by (le, route, method)
+)
+
+# API 与 Outbox 获取共享数据库连接的 P95
+histogram_quantile(
+  0.95,
+  sum(rate(im_backend_database_pool_acquire_duration_seconds_bucket{result="success"}[5m])) by (le, workload)
 )
 ```
 

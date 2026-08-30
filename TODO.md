@@ -8,8 +8,8 @@
 
   实验前置：
 
-  - 为 API 和 Outbox 分别记录 Pool acquisition wait；事务内各 SQL 阶段继续单独计时，避免把连接等待误记成 SQL 执行时间。
-  - 记录 API/Worker 各自的 acquired、idle、empty acquire、累计等待和事务耗时；压测报告必须保存这些差值。
+  - [x] 用 `im_backend_database_pool_acquire_duration_seconds{workload="api|outbox",result="success|error"}` 分别记录两侧 acquisition 耗时；压测报告的 `databaseAcquireDurations` 保存测试前后差值。未标记的启动探活和监控查询不混入这两组。
+  - [ ] 事务内各 SQL 阶段继续单独计时；分池实现后再分别记录两个 Pool 的 acquired、idle、empty acquire 和累计等待。共享 Pool 的现有整体指标继续保留。
   - 排除宿主机残留计算任务，并在每轮前用同一健康检查确认 PostgreSQL、Redis、API 和指标端点就绪。
 
   A/B 矩阵：

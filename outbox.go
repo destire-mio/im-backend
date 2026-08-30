@@ -203,6 +203,7 @@ func newMessageOutboxWorker(
 }
 
 func (worker *outboxWorker) Run(ctx context.Context) error {
+	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
 	switch worker.config.ExecutionMode {
 	case outboxExecutionModeSerial:
 		return worker.runSerial(ctx)
@@ -282,6 +283,7 @@ func (worker *outboxWorker) continueAfterBatch(ctx context.Context, processed in
 // Run can pipeline consecutive batches, while tests and maintenance callers can
 // still execute one deterministic claim -> prepare -> publish -> mark cycle.
 func (worker *outboxWorker) RunOnce(ctx context.Context) (int, error) {
+	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
 	processed, events, err := worker.claimAndPrepare(ctx)
 	if err != nil || len(events) == 0 {
 		return processed, err

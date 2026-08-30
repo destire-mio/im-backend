@@ -37,6 +37,10 @@ func TestDatabasePoolConfigAppliesExplicitMaximum(t *testing.T) {
 	if config.MaxConns != 24 {
 		t.Fatalf("MaxConns = %d, want 24", config.MaxConns)
 	}
+	attachDatabaseAcquireTracer(config, newApplicationMetrics(nil))
+	if _, ok := config.ConnConfig.Tracer.(pgxpool.AcquireTracer); !ok {
+		t.Fatal("database pool acquire tracer was not attached")
+	}
 	if _, err := databasePoolConfig(defaultDatabaseURL, "0"); err == nil {
 		t.Fatal("zero DATABASE_MAX_CONNECTIONS was accepted")
 	}

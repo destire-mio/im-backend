@@ -77,9 +77,9 @@ HTTP PASS + Sync FAIL
 
 如果首次请求遇到网络错误或 5xx，工具会使用原来的 `clientMessageId` 重试一次。第二次返回 200 表示首次已经写入，并由幂等机制找回原消息；这会计入 `idempotent_recovered`，不会被误判为第二条消息。
 
-报告同时保存用户数、设备数、并发数、请求超时、实时等待上限和实际负载时长，并记录测试前后的关键 Prometheus 计数器差值、四个 Outbox 批次阶段的耗时分布，以及压测期间 Outbox pending 和最老事件年龄的采样峰值。结束时的 pending、dead、goroutine 和常驻内存仍单独保留，不能用“最后 pending 为 0”替代过程峰值。
+报告同时保存用户数、设备数、并发数、请求超时、实时等待上限和实际负载时长，并记录测试前后的关键 Prometheus 计数器差值、四个 Outbox 批次阶段的耗时分布、`databaseAcquireDurations` 中 API/Outbox 各自获取共享 Pool 连接的 success/error 耗时分布，以及压测期间 Outbox pending 和最老事件年龄的采样峰值。结束时的 pending、dead、goroutine 和常驻内存仍单独保留，不能用“最后 pending 为 0”替代过程峰值。
 
-峰值默认每 `250ms` 抓取一次，可用 `-metrics-sample-interval` 调整。报告同时记录采样次数和错误数；阶段 P50/P95/P99 是 Prometheus Histogram 桶的上界近似值，不是原始逐批精确分位数。
+峰值默认每 `250ms` 抓取一次，可用 `-metrics-sample-interval` 调整。报告同时记录采样次数和错误数；Outbox 阶段与数据库连接获取的 P50/P95/P99 都是 Prometheus Histogram 桶的上界近似值，不是原始逐次精确分位数。数据库 acquisition Histogram 从调用 Pool 到成功或失败为止，覆盖等待空闲连接、创建/检查连接等耗时，但不包含拿到连接之后的 SQL 执行。
 
 ## 固定速率压测
 

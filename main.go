@@ -91,6 +91,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure database pool: %v", err)
 	}
+	appMetrics := newApplicationMetrics(nil)
+	attachDatabaseAcquireTracer(databaseConfig, appMetrics)
 	db, err := pgxpool.NewWithConfig(ctx, databaseConfig)
 	if err != nil {
 		log.Fatalf("create database pool: %v", err)
@@ -101,6 +103,7 @@ func main() {
 	if err := db.Ping(ctx); err != nil {
 		log.Fatalf("connect to database: %v", err)
 	}
+	appMetrics.registerDatabaseCollectors(db)
 
 	cipher, err := newResponseCipher(os.Getenv("IDEMPOTENCY_KEY"), environmentInt("IDEMPOTENCY_KEY_VERSION", 1))
 	if err != nil {
@@ -129,7 +132,7 @@ func main() {
 		rateLimitFailOpen:    environmentBool("AUTH_RATE_LIMIT_FAIL_OPEN", false),
 		trustedProxyNetworks: trustedProxyNetworks,
 	}
-	app.metrics = newApplicationMetrics(db)
+	app.metrics = appMetrics
 
 	hub := newWebSocketHub(app.metrics)
 	hubContext, cancelHub := context.WithCancel(context.Background())
@@ -274,10 +277,11 @@ func (app *application) routes() http.Handler {
 	mux.Handle("GET /messages/sync", app.requireAuthentication(http.HandlerFunc(app.syncMessages)))
 	mux.Handle("POST /messages/ack", app.requireAuthentication(http.HandlerFunc(app.acknowledgeMessages)))
 	mux.Handle("GET /ws", app.requireAuthentication(http.HandlerFunc(app.serveWebSocket)))
+	var handler http.Handler = mux
 	if app.metrics != nil {
-		return app.metrics.InstrumentHTTP(mux)
+		handler = app.metrics.InstrumentHTTP(handler)
 	}
-	return mux
+	return databaseWorkloadHandler(databaseWorkloadAPI, handler)
 }
 
 func decodeSingleJSON(w http.ResponseWriter, r *http.Request, destination any) error {
