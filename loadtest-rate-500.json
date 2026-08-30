@@ -1,0 +1,77 @@
+{
+  "runId": "260829165743394249",
+  "startedAt": "2026-08-29T16:57:43.690982Z",
+  "finishedAt": "2026-08-29T16:58:05.49073Z",
+  "database": "im",
+  "users": 10,
+  "devicesPerUser": 2,
+  "webSocketCount": 20,
+  "concurrency": 100,
+  "loadModel": "fixed-rate",
+  "targetRateRps": 500,
+  "requestTimeout": "10s",
+  "deliveryWait": "30s",
+  "loadDurationMs": 20002.212,
+  "messagesAttempted": 10000,
+  "messagesSucceeded": 10000,
+  "messagesFailed": 0,
+  "droppedStarts": 0,
+  "idempotentRecovered": 0,
+  "httpThroughputRps": 499.9446915437275,
+  "httpLatency": {
+    "count": 10000,
+    "p50Ms": 2.231,
+    "p95Ms": 19.027,
+    "p99Ms": 120.749,
+    "maxMs": 422.257
+  },
+  "realtimeLatency": {
+    "count": 40000,
+    "p50Ms": 264.004,
+    "p95Ms": 495.329,
+    "p99Ms": 566.63,
+    "maxMs": 664.85
+  },
+  "realtime": {
+    "expected": 40000,
+    "observed": 40000,
+    "passed": true
+  },
+  "sync": {
+    "expected": 20000,
+    "observed": 20000,
+    "passed": true
+  },
+  "duplicateRealtime": 0,
+  "unexpectedRealtime": 0,
+  "metricDeltas": {
+    "im_backend_database_pool_acquire_duration_seconds_total": 19.647621948,
+    "im_backend_database_pool_acquires_total": 30631,
+    "im_backend_database_pool_canceled_acquires_total": 0,
+    "im_backend_database_pool_empty_acquire_wait_seconds_total": 19.641225345,
+    "im_backend_database_pool_empty_acquires_total": 813,
+    "im_backend_outbox_publish_duration_seconds_count": 10000,
+    "im_backend_outbox_publish_duration_seconds_sum": 24.21990331299991,
+    "im_backend_outbox_publish_total": 10000,
+    "im_backend_realtime_routing_total": 40000,
+    "im_backend_sync_events_total": 20000,
+    "im_backend_websocket_deliveries_total": 40000,
+    "im_backend_websocket_io_total": 40000
+  },
+  "metricEnd": {
+    "go_goroutines": 100,
+    "im_backend_database_metrics_collection_success": 1,
+    "im_backend_database_pool_acquired_connections": 0,
+    "im_backend_database_pool_constructing_connections": 0,
+    "im_backend_database_pool_idle_connections": 24,
+    "im_backend_database_pool_max_connections": 24,
+    "im_backend_database_pool_total_connections": 24,
+    "im_backend_outbox_dead_events": 0,
+    "im_backend_outbox_oldest_pending_age_seconds": 0,
+    "im_backend_outbox_pending_events": 0,
+    "im_backend_outbox_worker_batch_size": 32,
+    "im_backend_outbox_worker_concurrency": 8,
+    "im_backend_websocket_connections": 20,
+    "process_resident_memory_bytes": 36356096
+  }
+}

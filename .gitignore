@@ -1,0 +1,12 @@
+.env
+.DS_Store
+*.log
+
+# Local build and coverage outputs.
+/im-backend
+/im-loadtest
+/coverage.out
+/coverage.html
+
+# Ad-hoc load-test output. Named benchmark evidence files are tracked.
+loadtest-report*.json

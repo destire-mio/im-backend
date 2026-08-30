@@ -1,0 +1,82 @@
+{
+  "runId": "260830061122db361a",
+  "startedAt": "2026-08-30T06:11:22.140805Z",
+  "finishedAt": "2026-08-30T06:11:59.804651Z",
+  "database": "im_bench_async",
+  "users": 10,
+  "devicesPerUser": 2,
+  "webSocketCount": 20,
+  "concurrency": 1000,
+  "loadModel": "fixed-rate",
+  "targetRateRps": 3000,
+  "requestTimeout": "10s",
+  "deliveryWait": "30s",
+  "loadDurationMs": 20012.722,
+  "messagesAttempted": 60000,
+  "messagesSucceeded": 60000,
+  "messagesFailed": 0,
+  "droppedStarts": 0,
+  "idempotentRecovered": 0,
+  "httpThroughputRps": 2998.092800740969,
+  "httpLatency": {
+    "count": 60000,
+    "p50Ms": 2.303,
+    "p95Ms": 14.155,
+    "p99Ms": 43.741,
+    "maxMs": 113.436
+  },
+  "realtimeLatency": {
+    "count": 240000,
+    "p50Ms": 14016.861,
+    "p95Ms": 16901.548,
+    "p99Ms": 16917.548,
+    "maxMs": 16925.49
+  },
+  "realtime": {
+    "expected": 240000,
+    "observed": 240000,
+    "passed": true
+  },
+  "sync": {
+    "expected": 120000,
+    "observed": 120000,
+    "passed": true
+  },
+  "duplicateRealtime": 0,
+  "unexpectedRealtime": 0,
+  "metricDeltas": {
+    "im_backend_database_pool_acquire_duration_seconds_total": 79.046736333,
+    "im_backend_database_pool_acquires_total": 127430,
+    "im_backend_database_pool_canceled_acquires_total": 0,
+    "im_backend_database_pool_empty_acquire_wait_seconds_total": 79.028956824,
+    "im_backend_database_pool_empty_acquires_total": 9802,
+    "im_backend_outbox_publish_duration_seconds_count": 60000,
+    "im_backend_outbox_publish_duration_seconds_sum": 463.89231741599764,
+    "im_backend_outbox_publish_total": 60000,
+    "im_backend_realtime_routing_total": 240000,
+    "im_backend_sync_events_total": 120000,
+    "im_backend_websocket_deliveries_total": 240000,
+    "im_backend_websocket_io_total": 240020,
+    "im_backend_websocket_send_queue_depth_count": 240000,
+    "im_backend_websocket_send_queue_depth_sum": 8453,
+    "im_backend_websocket_write_duration_seconds_count": 240000,
+    "im_backend_websocket_write_duration_seconds_sum": 1.4354449099999544
+  },
+  "metricEnd": {
+    "go_goroutines": 99,
+    "im_backend_database_metrics_collection_success": 1,
+    "im_backend_database_pool_acquired_connections": 1,
+    "im_backend_database_pool_constructing_connections": 0,
+    "im_backend_database_pool_idle_connections": 23,
+    "im_backend_database_pool_max_connections": 24,
+    "im_backend_database_pool_total_connections": 24,
+    "im_backend_outbox_dead_events": 0,
+    "im_backend_outbox_oldest_pending_age_seconds": 0,
+    "im_backend_outbox_pending_events": 0,
+    "im_backend_outbox_worker_batch_size": 32,
+    "im_backend_outbox_worker_concurrency": 8,
+    "im_backend_websocket_connections": 20,
+    "im_backend_websocket_send_queue_high_watermark": 5,
+    "process_resident_memory_bytes": 67518464
+  }
+}

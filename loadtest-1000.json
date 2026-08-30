@@ -1,0 +1,57 @@
+{
+  "runId": "260829162616447e65",
+  "startedAt": "2026-08-29T16:26:16.208379Z",
+  "finishedAt": "2026-08-29T16:26:17.814293Z",
+  "database": "im",
+  "users": 10,
+  "devicesPerUser": 2,
+  "webSocketCount": 20,
+  "messagesAttempted": 1000,
+  "messagesSucceeded": 1000,
+  "messagesFailed": 0,
+  "idempotentRecovered": 0,
+  "httpThroughputRps": 1298.1444587927485,
+  "httpLatency": {
+    "count": 1000,
+    "p50Ms": 14.176,
+    "p95Ms": 24.799,
+    "p99Ms": 33.574,
+    "maxMs": 41.915
+  },
+  "realtimeLatency": {
+    "count": 4000,
+    "p50Ms": 174.336,
+    "p95Ms": 277.995,
+    "p99Ms": 290.337,
+    "maxMs": 291.816
+  },
+  "realtime": {
+    "expected": 4000,
+    "observed": 4000,
+    "passed": true
+  },
+  "sync": {
+    "expected": 2000,
+    "observed": 2000,
+    "passed": true
+  },
+  "duplicateRealtime": 0,
+  "unexpectedRealtime": 0,
+  "metricDeltas": {
+    "im_backend_outbox_publish_total": 1000,
+    "im_backend_realtime_routing_total": 4000,
+    "im_backend_sync_events_total": 2000,
+    "im_backend_websocket_deliveries_total": 4000,
+    "im_backend_websocket_disconnects_total": 0,
+    "im_backend_websocket_io_total": 4000
+  },
+  "metricEnd": {
+    "go_goroutines": 99,
+    "im_backend_database_metrics_collection_success": 1,
+    "im_backend_outbox_dead_events": 0,
+    "im_backend_outbox_oldest_pending_age_seconds": 0,
+    "im_backend_outbox_pending_events": 0,
+    "im_backend_websocket_connections": 20,
+    "process_resident_memory_bytes": 92930048
+  }
+}
