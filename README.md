@@ -107,7 +107,7 @@ go run ./cmd/im-loadtest \
 
 压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)；待验证实验见 [TODO.md](./TODO.md)。仓库中命名为 `loadtest-*.json` 的文件是文档所引用的脱敏实验报告，默认临时输出 `loadtest-report*.json` 不进入 Git。
 
-当前本机隔离库证据显示：在 Pool 24、Batch 64、3000 req/s、60000 条消息、10 个热点用户的四轮顺序平衡 A/B 中，HTTP、Realtime、Sync 均完整；批内 Presence 快照将每轮解析次数从 120000 降到约 9389，整批 `publish` 两轮中点从 16.54ms 降到 1.68ms，Realtime P95 中点从 7.528s 降到 1.195s。优化后准备 Lane 约 18.90ms，大于投递 Lane 的 6.48ms，下一个已观测瓶颈转为 `claim + prepare`，其中 `prepare_store` 最大。这仍是单机热点用户结果，不代表多用户或生产容量；原始报告与完整边界见 [LOAD_TEST.md](./LOAD_TEST.md)。
+当前本机隔离库证据显示：在 Pool 24、Batch 64、3000 req/s、60000 条消息、10 个热点用户的四轮顺序平衡 A/B 中，HTTP、Realtime、Sync 均完整；批内 Presence 快照将每轮解析次数从 120000 降到约 9389，整批 `publish` 两轮中点从 16.54ms 降到 1.68ms，Realtime P95 中点从 7.528s 降到 1.195s。优化后准备 Lane 约 18.90ms，大于投递 Lane 的 6.48ms。随后升档诊断未能重现已知 3000 req/s 基线，不能作为新容量结果，但四轮过载数据都显示共享 PostgreSQL Pool 的连接等待与事务占用先放大；`prepare_store` 仍是准备事务内部的后续候选。这些都是单机热点用户结果，不代表多用户或生产容量；原始报告与完整边界见 [LOAD_TEST.md](./LOAD_TEST.md)。
 
 ## 许可证
 

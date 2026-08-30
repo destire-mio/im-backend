@@ -380,3 +380,29 @@ B 两轮的平均阶段中点组成为：
 - `loadtest-rate-3000-presence-ab-b1-batch.json`
 - `loadtest-rate-3000-presence-ab-b2-batch.json`
 - `loadtest-rate-3000-presence-ab-a2-per-recipient.json`
+
+## Presence 优化后的升档诊断
+
+为了继续寻找下一个瓶颈，先尝试 3200 req/s，再用 3000 req/s、Pool 32/24 和重启 PostgreSQL/Redis 后的 Pool 24 做三轮对照。四轮都使用当前默认的 pipeline + bulk + recipients + 批内 Presence 快照、Batch 64、10 个热点用户和 30 秒投递等待。
+
+这四轮都不能作为新容量证据：每轮都出现大量 `not started: max in-flight requests reached`，即压测器因为 1000 个并发槽已占满而未发出部分目标请求。报告中的 Realtime/Sync `passed` 只证明“已经成功写入的消息”最终完整交付，不代表目标消息总数全部完成。
+
+| 轮次 | Pool | HTTP 成功 / 目标 | dropped starts | 实际吞吐 | HTTP P95 | `publish` | `prepare_begin` | `claim` | `mark` | 空池获取次数 | 空池累计等待 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3200 | 32 | 47817 / 64000 | 16183 | 2346.8 req/s | 555.80 ms | 1.80 ms | 11.07 ms | 14.77 ms | 19.25 ms | 92528 | 17959.03 s |
+| 3000 对照 | 32 | 51215 / 60000 | 8785 | 2504.2 req/s | 489.51 ms | 2.06 ms | 8.17 ms | 12.83 ms | 18.47 ms | 75136 | 13187.34 s |
+| 3000 对照 | 24 | 43476 / 60000 | 16524 | 2113.8 req/s | 725.74 ms | 2.13 ms | 11.35 ms | 14.56 ms | 20.50 ms | 67943 | 14822.99 s |
+| 3000，重启依赖后 | 24 | 32368 / 60000 | 27632 | 1563.5 req/s | 1230.69 ms | 2.73 ms | 15.43 ms | 21.79 ms | 25.26 ms | 49786 | 16450.36 s |
+
+“空池累计等待”是所有并发 goroutine 等待数据库连接的时长之和，不是单轮墙钟时长，所以会远大于压测实际持续时间。重启依赖后没有恢复此前 3000 req/s 的稳定基线，因此本轮没有继续跑 3500 req/s；在更低档已经不满足请求完整性时，3500 的结果无法用于判定后端容量。
+
+四轮仍提供了同方向的过载诊断：批内 Presence 优化后的 `publish` 一直只有 `1.80～2.73ms`，没有重新成为首要限制；与此同时 HTTP P95、`prepare_begin`、`claim`、`mark_published` 和空池等待一起放大。这说明当前环境进入过载时，先暴露的是 HTTP 与 Outbox Worker 共用 PostgreSQL Pool 后的连接获取等待和事务占用，而不是 Redis Presence 或 Channel。
+
+`prepare_store` 四轮仍为 `10.77～12.38ms`，它依然是准备事务内部值得减少的写入成本，但仅凭这四轮不能说它是第一个把系统压垮的因素。下一步应先把“等待连接”和“拿到连接后的 SQL/事务执行”分开计时，再在数据库总连接数保持不变的前提下，对比共享 Pool 与 API/Worker 分池；只有重新获得可重复的 3000 req/s 基线后，才继续升档并判定新容量边界。
+
+报告：
+
+- `loadtest-rate-3200-presence-default-r1.json`
+- `loadtest-rate-3000-presence-capacity-control-r1.json`
+- `loadtest-rate-3000-presence-pool24-control-r2.json`
+- `loadtest-rate-3000-presence-postrestart-control-r1.json`
