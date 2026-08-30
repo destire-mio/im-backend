@@ -164,6 +164,7 @@ func main() {
 	workerConfig := defaultOutboxWorkerConfig()
 	workerConfig.BatchSize = environmentInt("OUTBOX_BATCH_SIZE", workerConfig.BatchSize)
 	workerConfig.Concurrency = environmentInt("OUTBOX_CONCURRENCY", workerConfig.Concurrency)
+	workerConfig.ExecutionMode = outboxExecutionMode(environmentString("OUTBOX_EXECUTION_MODE", string(workerConfig.ExecutionMode)))
 	workerConfig.ProjectionMode = syncProjectionMode(environmentString("OUTBOX_PROJECTION_MODE", string(workerConfig.ProjectionMode)))
 	workerConfig.ProjectionStorage = syncProjectionStorage(environmentString("OUTBOX_PROJECTION_STORAGE", string(workerConfig.ProjectionStorage)))
 	worker, err := newMessageOutboxWorker(db, &webSocketOutboxPublisher{router: router}, workerConfig, app.metrics)
@@ -174,9 +175,10 @@ func main() {
 	}
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
 	log.Printf(
-		"outbox worker batch size %d concurrency %d projection mode %s storage %s",
+		"outbox worker batch size %d concurrency %d execution mode %s projection mode %s storage %s",
 		workerConfig.BatchSize,
 		workerConfig.Concurrency,
+		workerConfig.ExecutionMode,
 		workerConfig.ProjectionMode,
 		workerConfig.ProjectionStorage,
 	)

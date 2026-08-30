@@ -34,6 +34,7 @@ type applicationMetrics struct {
 	ackRequests                *prometheus.CounterVec
 	outboxWorkerConcurrency    prometheus.Gauge
 	outboxWorkerBatchSize      prometheus.Gauge
+	outboxPipelineEnabled      prometheus.Gauge
 	outboxProjectionBulk       prometheus.Gauge
 	outboxProjectionRecipients prometheus.Gauge
 	outboxProjectionBatches    prometheus.Counter
@@ -140,6 +141,11 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Name:      "outbox_worker_batch_size",
 			Help:      "Configured maximum number of Outbox events claimed per batch.",
 		}),
+		outboxPipelineEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_pipeline_enabled",
+			Help:      "Whether preparation of the next Outbox batch overlaps delivery of the current batch.",
+		}),
 		outboxProjectionBulk: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_projection_bulk_enabled",
@@ -189,6 +195,7 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.ackRequests,
 		metrics.outboxWorkerConcurrency,
 		metrics.outboxWorkerBatchSize,
+		metrics.outboxPipelineEnabled,
 		metrics.outboxProjectionBulk,
 		metrics.outboxProjectionRecipients,
 		metrics.outboxProjectionBatches,
@@ -251,6 +258,11 @@ func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConf
 	}
 	metrics.outboxWorkerConcurrency.Set(float64(config.Concurrency))
 	metrics.outboxWorkerBatchSize.Set(float64(config.BatchSize))
+	if config.ExecutionMode == outboxExecutionModePipeline {
+		metrics.outboxPipelineEnabled.Set(1)
+	} else {
+		metrics.outboxPipelineEnabled.Set(0)
+	}
 	if config.ProjectionMode == syncProjectionModeBulk {
 		metrics.outboxProjectionBulk.Set(1)
 	} else {

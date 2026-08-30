@@ -30,6 +30,7 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 | `im_backend_outbox_publish_duration_seconds` | 单事件纯 Publisher 耗时，不含数据库状态收尾 | Hub / Redis Publisher |
 | `im_backend_outbox_stage_duration_seconds` | 非空批次的 claim、prepare、publish、mark_published 关键路径耗时；prepare 另分 decode、begin、project_users、encode、store、commit 子阶段 | Outbox Worker |
 | `im_backend_outbox_worker_concurrency` / `batch_size` | 当前 Worker 并发槽位与单次 claim 批量 | Outbox 配置 |
+| `im_backend_outbox_pipeline_enabled` | `0` 为整批串行执行，`1` 为 prepare 与上一批 deliver 重叠 | Outbox 配置 |
 | `im_backend_outbox_projection_bulk_enabled` | `0` 为逐用户 SQL，`1` 为批量投影实验实现 | Outbox 配置 |
 | `im_backend_outbox_projection_recipients_enabled` | `0` 为 JSONB payload 回写，`1` 为结构化 recipients + ready | Outbox 配置 |
 | `im_backend_outbox_projection_batches_total` / `users_total` | 投影批次数与每批涉及的唯一用户总数；二者相除得到平均用户数/批 | Sync 投影 |
@@ -50,7 +51,7 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 
 1. 用 HTTP 状态码和耗时确认请求是否进入并完成服务端持久化。
 2. 检查 Outbox 待处理数和最老事件年龄；持续增长说明异步发布跟不上。
-3. 用 `outbox_stage_duration_seconds` 区分 claim、Sync 投影、实时 publish 和状态收尾；批次阶段快但 pending age 持续增长，表示总处理能力仍低于到达速率。
+3. 用 `outbox_stage_duration_seconds` 区分 claim、Sync 投影、实时 publish 和状态收尾。`outbox_pipeline_enabled=0` 时四阶段串行相加；为 `1` 时分别比较准备 Lane（claim + prepare）和投递 Lane（publish + mark），不能再把四项之和当成批次完成间隔。任一 Lane 超过到达预算，pending age 都会持续增长。
 4. 若 `prepare_project_users` 最大，用 projection 的 batches、users 和 query count 判断是否仍在按用户执行 SQL；该 Histogram 包含服务端执行、锁等待、数据库往返和结果读取，不能单独解释为纯网络 RTT。
 5. 若 `prepare_store` 最大，先看 `outbox_projection_recipients_enabled`：JSONB 模式表示 payload 回写成本，recipients 模式表示结构化 recipient 插入与 ready 更新成本，二者不能混为同一种写入。
 6. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。

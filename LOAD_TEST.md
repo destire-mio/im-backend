@@ -259,7 +259,7 @@ claim 2.18ms + prepare 12.71ms + publish 6.27ms + mark 6.39ms
 
 3500 req/s 要求每 64 条的串行批次关键路径不高于约 `18.29ms`，当前 Worker 主循环仍跟不上。prepare 内最大子阶段仍是 `prepare_store`（约 `7.88ms`），只是成本已从 JSONB 回写转成“插入两份结构化 recipient + 更新 ready”。每轮 70000 条消息会写入 140000 条 `user_message_events` 和 140000 条 `outbox_recipients`，同时 `outbox_events` 仍有 claim、ready、published 共 210000 次更新；`outbox_recipients` 约占 20MB，而 user/cursor 映射已存在于约 25MB 的 `user_message_events`。
 
-因此下一步不是继续扩 Channel，而是验证能否直接以 `user_message_events` 作为重启后的 recipient/cursor 权威来源，只保留轻量 ready 状态，去掉重复的 `outbox_recipients` 写入；之后再单独复测已上升到约 `6.39ms` 的 `mark_published` 状态更新。
+这说明去掉重复的 `outbox_recipients` 写入仍是减少 prepare 写放大的候选方向，但在继续改变数据模型前，先用执行模式 A/B 验证四个阶段的串行调度本身是否限制批次吞吐。
 
 报告：
 
@@ -268,3 +268,56 @@ claim 2.18ms + prepare 12.71ms + publish 6.27ms + mark 6.39ms
 - `loadtest-rate-3500-storage-ab-b2-recipients.json`
 - `loadtest-rate-3500-storage-ab-a2-jsonb.json`
 - `loadtest-rate-3000-recipients-default.json`
+
+## Outbox 两段流水线 A/B
+
+连续运行的 Worker 保留两种可切换执行模式：
+
+```text
+A：OUTBOX_EXECUTION_MODE=serial
+   claim → prepare → publish → mark，完成整批后才领取下一批
+
+B：OUTBOX_EXECUTION_MODE=pipeline（当前默认）
+   准备阶段：claim → prepare
+   投递阶段：publish → mark
+```
+
+B 使用无缓冲 Channel 交接已准备批次。投递第 N 批时，准备协程可以处理第 N+1 批；Channel 不承担持久化，SQL 中的 pending/ready/published 状态仍是恢复依据。无缓冲交接使系统最多同时持有一批正在准备和一批正在投递的 Lease，Publisher 变慢时不会继续预领任意多批。`RunOnce` 仍执行一个完整串行批次，供测试和维护调用。
+
+故障边界没有放松：prepare 事务提交前失败会回滚；提交后、publish 前退出时，事件仍处于可恢复的 ready 状态；publish 之后、mark 之前失败仍可能重复通知，客户端继续按 message/event/cursor 去重。网络 publish 仍在数据库事务外。
+
+3500 req/s 使用同一空库模板克隆四个隔离数据库，固定 Pool 32、Batch 64、publish 并发 16、10 个热点用户、20 条 WebSocket、70000 条消息、并发 1000 和 30 秒等待，顺序为 `A1 → B1 → B2 → A2`。四轮 HTTP 都是 `70000/70000`，dropped、duplicate、unexpected、dead 都为 0；但 A1 和 B1 都没有在 30 秒窗口内清空 pending，因此这两轮的 Realtime/Sync 必须记为失败，不能把已观察消息的 P95 当成完整交付 SLO。
+
+| 两轮中位数 | A：serial | B：pipeline | 变化 |
+| --- | ---: | ---: | ---: |
+| 已观察 Realtime P95 | 23.480 s | 16.226 s | -30.9% |
+| pending 峰值 | 39315 | 27334 | -30.5% |
+| oldest age 峰值 | 23.500 s | 22.290 s | -5.1% |
+| HTTP P95 | 31.71 ms | 21.77 ms | -31.3% |
+| `prepare` | 24.03 ms | 35.12 ms | +46.1% |
+| `publish` | 6.95 ms | 14.93 ms | +114.6% |
+| `mark_published` | 6.33 ms | 5.61 ms | -11.3% |
+
+流水线在两组配对中都降低了 Realtime P95 和 pending 峰值，但单阶段耗时反而上升，说明重叠执行增加了 PostgreSQL、Redis、CPU 或调度等共享资源竞争；它提高的是批次重叠吞吐，不是让单次 SQL 或 publish 变快。A1 结束时 serial 尚有 3696 个 pending，B1 结束时 pipeline 尚有 18864 个；这种高波动也说明 3500 req/s 仍超过当前稳定边界，不能据两轮中位数宣称容量已经达到 3500。
+
+为确认稳定档没有退化，又在 Pool 24、60000 条、3000 req/s 下各跑一轮同条件对照。两轮 HTTP、Realtime、Sync 全部完整，missing、duplicate、unexpected、dead 均为 0：
+
+| 3000 req/s | serial | pipeline | 变化 |
+| --- | ---: | ---: | ---: |
+| Realtime P95 | 3.312 s | 2.234 s | -32.5% |
+| pending 峰值 | 10332 | 7004 | -32.2% |
+| oldest age 峰值 | 3.444 s | 2.337 s | -32.1% |
+| HTTP P95 | 5.51 ms | 9.43 ms | +71.2% |
+| `claim + prepare` | 11.85 ms | 16.72 ms | +41.1% |
+| `publish + mark` | 11.45 ms | 20.49 ms | +79.0% |
+
+因此采用 pipeline 作为默认值，同时保留 serial 回退。代价是本轮 HTTP P95 和各阶段墙钟时间上升；收益是3000稳定档的实时延迟与积压峰值下降。流水线模式下不再把四阶段耗时简单相加判断吞吐，而应分别比较两条 Lane：3000负载下准备 Lane 约 `16.72ms`，投递 Lane 约 `20.49ms`。3500 req/s 对 Batch 64 的预算约为 `18.29ms`，所以当前下一瓶颈首先是投递 Lane，其中 `publish` 约 `17.01ms`，再加 `mark` 后超过预算；prepare 中的结构化重复写入仍是第二个接近边界的候选。
+
+报告：
+
+- `loadtest-rate-3500-pipeline-ab-a1-serial.json`
+- `loadtest-rate-3500-pipeline-ab-b1-pipeline.json`
+- `loadtest-rate-3500-pipeline-ab-b2-pipeline.json`
+- `loadtest-rate-3500-pipeline-ab-a2-serial.json`
+- `loadtest-rate-3000-pipeline-default.json`
+- `loadtest-rate-3000-pipeline-ab-serial.json`

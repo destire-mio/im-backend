@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -83,6 +84,224 @@ func TestOutboxWorkerPublishesAndMarksEventComplete(t *testing.T) {
 	}
 	if publishedAt == nil || attemptCount != 1 || lockedUntil != nil || lockToken != nil {
 		t.Fatalf("published=%v attempts=%d lockUntil=%v lockToken=%v", publishedAt, attemptCount, lockedUntil, lockToken)
+	}
+}
+
+func TestOutboxPipelinePreparesNextBatchWhileDeliveringCurrent(t *testing.T) {
+	db := openTestDatabase(t)
+	eventIDs := []string{
+		createPendingOutboxEvent(t, db),
+		createPendingOutboxEvent(t, db),
+	}
+	firstPublishStarted := make(chan struct{})
+	secondBatchPrepared := make(chan struct{})
+	releaseFirstPublish := make(chan struct{})
+	var prepareCalls atomic.Int32
+	var publishCalls atomic.Int32
+	publisher := &testPublisher{publish: func(ctx context.Context, _ outboxEvent) error {
+		if publishCalls.Add(1) != 1 {
+			return nil
+		}
+		close(firstPublishStarted)
+		select {
+		case <-releaseFirstPublish:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}}
+	config := testWorkerConfig()
+	config.BatchSize = 1
+	config.ExecutionMode = outboxExecutionModePipeline
+	worker := mustTestWorker(t, db, publisher, config)
+	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
+		if prepareCalls.Add(1) == 2 {
+			close(secondBatchPrepared)
+		}
+		return events, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("pipeline worker did not stop")
+		}
+	}()
+
+	select {
+	case <-firstPublishStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first batch did not reach delivery")
+	}
+	select {
+	case <-secondBatchPrepared:
+		// The first publish is still blocked, so this can happen only if the
+		// preparation and delivery stages overlap.
+	case <-time.After(2 * time.Second):
+		t.Fatal("second batch was not prepared while first delivery was blocked")
+	}
+	close(releaseFirstPublish)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var published int
+		if err := db.QueryRow(
+			context.Background(),
+			`SELECT count(*)
+			 FROM outbox_events
+			 WHERE event_id::text = ANY($1::text[])
+			   AND published_at IS NOT NULL`,
+			eventIDs,
+		).Scan(&published); err != nil {
+			t.Fatalf("count pipeline publications: %v", err)
+		}
+		if published == len(eventIDs) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("published %d pipeline events, want %d", published, len(eventIDs))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestOutboxSerialRunWaitsForCurrentDeliveryBeforePreparingNextBatch(t *testing.T) {
+	db := openTestDatabase(t)
+	createPendingOutboxEvent(t, db)
+	createPendingOutboxEvent(t, db)
+	firstPublishStarted := make(chan struct{})
+	secondBatchPrepared := make(chan struct{})
+	releaseFirstPublish := make(chan struct{})
+	var prepareCalls atomic.Int32
+	var publishCalls atomic.Int32
+	publisher := &testPublisher{publish: func(ctx context.Context, _ outboxEvent) error {
+		if publishCalls.Add(1) != 1 {
+			return nil
+		}
+		close(firstPublishStarted)
+		select {
+		case <-releaseFirstPublish:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}}
+	config := testWorkerConfig()
+	config.BatchSize = 1
+	config.ExecutionMode = outboxExecutionModeSerial
+	worker := mustTestWorker(t, db, publisher, config)
+	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
+		if prepareCalls.Add(1) == 2 {
+			close(secondBatchPrepared)
+		}
+		return events, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("serial worker did not stop")
+		}
+	}()
+
+	select {
+	case <-firstPublishStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first serial batch did not reach delivery")
+	}
+	select {
+	case <-secondBatchPrepared:
+		t.Fatal("serial mode prepared the next batch before current delivery completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirstPublish)
+	select {
+	case <-secondBatchPrepared:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serial mode did not prepare the next batch after delivery completed")
+	}
+}
+
+func TestOutboxPipelineShutdownReleasesPreparedBatchLeases(t *testing.T) {
+	db := openTestDatabase(t)
+	eventIDs := []string{
+		createPendingOutboxEvent(t, db),
+		createPendingOutboxEvent(t, db),
+	}
+	firstPublishStarted := make(chan struct{})
+	secondBatchPrepared := make(chan struct{})
+	var prepareCalls atomic.Int32
+	var publishCalls atomic.Int32
+	publisher := &testPublisher{publish: func(ctx context.Context, _ outboxEvent) error {
+		if publishCalls.Add(1) == 1 {
+			close(firstPublishStarted)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	config := testWorkerConfig()
+	config.BatchSize = 1
+	config.ExecutionMode = outboxExecutionModePipeline
+	worker := mustTestWorker(t, db, publisher, config)
+	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
+		if prepareCalls.Add(1) == 2 {
+			close(secondBatchPrepared)
+		}
+		return events, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	select {
+	case <-firstPublishStarted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("first batch did not reach delivery")
+	}
+	select {
+	case <-secondBatchPrepared:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("second batch was not prepared before shutdown")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stop pipeline worker: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pipeline worker did not stop after cancellation")
+	}
+
+	var released int
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT count(*)
+		 FROM outbox_events
+		 WHERE event_id::text = ANY($1::text[])
+		   AND published_at IS NULL
+		   AND dead_at IS NULL
+		   AND locked_until IS NULL
+		   AND lock_token IS NULL
+		   AND last_error IS NOT NULL`,
+		eventIDs,
+	).Scan(&released); err != nil {
+		t.Fatalf("count released pipeline leases: %v", err)
+	}
+	if released != len(eventIDs) {
+		t.Fatalf("released %d pipeline leases, want %d", released, len(eventIDs))
 	}
 }
 
@@ -256,6 +475,14 @@ func TestMessageOutboxWorkerRejectsUnsupportedProjectionMode(t *testing.T) {
 	config.ProjectionMode = "unsupported"
 	if _, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
 		t.Fatal("unsupported projection mode was accepted")
+	}
+}
+
+func TestOutboxWorkerRejectsUnsupportedExecutionMode(t *testing.T) {
+	config := defaultOutboxWorkerConfig()
+	config.ExecutionMode = "unsupported"
+	if _, err := newOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
+		t.Fatal("unsupported execution mode was accepted")
 	}
 }
 

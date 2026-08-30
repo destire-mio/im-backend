@@ -8,7 +8,7 @@
 
 - 用户注册、Argon2id 密码哈希、短期 Access Token、Refresh Token 轮换及多设备 Session 管理。
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
-- Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；网络发布不占用数据库行锁。
+- Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 prepare 与当前批 publish，网络发布不占用数据库行锁。
 - Sync cursor 与结构化 `outbox_recipients` 在同一事务提交，Outbox 不再二次回写带 recipients/cursor 的完整 JSONB。
 - 为每个用户分配连续 Sync cursor，支持快照分页补拉和设备 ACK；WebSocket 只负责实时通知，Sync API 负责恢复。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
@@ -20,9 +20,9 @@
 ```text
 POST /messages
   -> PostgreSQL: message + pending outbox（同一事务）
-  -> Outbox Worker: claim
-  -> PostgreSQL: 分配用户 cursor + 写入 sync event + outbox_recipients + ready（同一事务）
-  -> Redis / 本地 Hub
+  -> Outbox 准备 Lane: claim + 分配用户 cursor
+     + 写入 sync event + outbox_recipients + ready（同一事务）
+  -> Outbox 投递 Lane: Redis / 本地 Hub + mark published
   -> WebSocket 实时通知
 
 断线或实时通知失败
@@ -106,7 +106,7 @@ go run ./cmd/im-loadtest \
 
 压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)。仓库中命名为 `loadtest-*.json` 的文件是文档所引用的脱敏实验报告，默认临时输出 `loadtest-report*.json` 不进入 Git。
 
-当前本机隔离库证据显示：结构化 recipients 默认模式在 3000 req/s、60000 条消息下，HTTP、Realtime 和 Sync 均完整，Realtime P95 为 0.584 秒，pending/oldest 峰值为 1818/0.607 秒；提高到 3500 req/s 后仍出现约 11 秒的 Realtime P95，不能宣称系统容量为 3500 req/s。原始报告见 [3000 req/s 复核](./loadtest-rate-3000-recipients-default.json) 与 3500 req/s 的 [B1](./loadtest-rate-3500-storage-ab-b1-recipients.json)、[B2](./loadtest-rate-3500-storage-ab-b2-recipients.json)，完整 A/B 与边界解释见 [LOAD_TEST.md](./LOAD_TEST.md)。
+当前本机隔离库证据显示：在 Pool 24、3000 req/s、60000 条消息的同条件对照中，serial 与 pipeline 的 HTTP、Realtime、Sync 均完整；pipeline 将 Realtime P95 从 3.312 秒降到 2.234 秒，pending 峰值从 10332 降到 7004，但 HTTP P95 从 5.51ms 升到 9.43ms。3500 req/s 的四轮顺序平衡实验中，两种模式各有一轮未能在 30 秒等待窗口内清空，因此不能宣称当前稳定容量达到 3500 req/s。原始报告见 [3000 pipeline](./loadtest-rate-3000-pipeline-default.json)、[3000 serial](./loadtest-rate-3000-pipeline-ab-serial.json) 和 [完整 A/B 说明](./LOAD_TEST.md)。
 
 ## 许可证
 

@@ -1,0 +1,170 @@
+{
+  "runId": "260830091837a36b2d",
+  "startedAt": "2026-08-30T09:18:37.017231Z",
+  "finishedAt": "2026-08-30T09:19:12.113719Z",
+  "database": "im_bench_pipeline_a2_serial_20260830_1",
+  "users": 10,
+  "devicesPerUser": 2,
+  "webSocketCount": 20,
+  "concurrency": 1000,
+  "loadModel": "fixed-rate",
+  "targetRateRps": 3500,
+  "requestTimeout": "10s",
+  "deliveryWait": "30s",
+  "loadDurationMs": 20047.005,
+  "messagesAttempted": 70000,
+  "messagesSucceeded": 70000,
+  "messagesFailed": 0,
+  "droppedStarts": 0,
+  "idempotentRecovered": 0,
+  "httpThroughputRps": 3491.7932963539374,
+  "httpLatency": {
+    "count": 70000,
+    "p50Ms": 3.763,
+    "p95Ms": 40.22,
+    "p99Ms": 116.447,
+    "maxMs": 191.392
+  },
+  "realtimeLatency": {
+    "count": 280000,
+    "p50Ms": 12981.21,
+    "p95Ms": 13944.828,
+    "p99Ms": 13958.122,
+    "maxMs": 13967.34
+  },
+  "realtime": {
+    "expected": 280000,
+    "observed": 280000,
+    "passed": true
+  },
+  "sync": {
+    "expected": 140000,
+    "observed": 140000,
+    "passed": true
+  },
+  "duplicateRealtime": 0,
+  "unexpectedRealtime": 0,
+  "metricDeltas": {
+    "im_backend_database_pool_acquire_duration_seconds_total": 400.68577306699996,
+    "im_backend_database_pool_acquires_total": 145659,
+    "im_backend_database_pool_canceled_acquires_total": 0,
+    "im_backend_database_pool_empty_acquire_wait_seconds_total": 400.664468082,
+    "im_backend_database_pool_empty_acquires_total": 33281,
+    "im_backend_outbox_projection_batches_total": 1094,
+    "im_backend_outbox_projection_query_duration_seconds_count": 3282,
+    "im_backend_outbox_projection_query_duration_seconds_sum": 3.8562261829999986,
+    "im_backend_outbox_projection_users_total": 10940,
+    "im_backend_outbox_publish_duration_seconds_count": 70000,
+    "im_backend_outbox_publish_duration_seconds_sum": 107.34402038100095,
+    "im_backend_outbox_publish_total": 70000,
+    "im_backend_realtime_routing_total": 280000,
+    "im_backend_sync_events_total": 140000,
+    "im_backend_websocket_deliveries_total": 280000,
+    "im_backend_websocket_io_total": 280020,
+    "im_backend_websocket_send_queue_depth_count": 280000,
+    "im_backend_websocket_send_queue_depth_sum": 26471,
+    "im_backend_websocket_write_duration_seconds_count": 280000,
+    "im_backend_websocket_write_duration_seconds_sum": 1.697690218000022
+  },
+  "metricEnd": {
+    "go_goroutines": 753,
+    "im_backend_database_metrics_collection_success": 1,
+    "im_backend_database_pool_acquired_connections": 1,
+    "im_backend_database_pool_constructing_connections": 0,
+    "im_backend_database_pool_idle_connections": 31,
+    "im_backend_database_pool_max_connections": 32,
+    "im_backend_database_pool_total_connections": 32,
+    "im_backend_outbox_dead_events": 0,
+    "im_backend_outbox_oldest_pending_age_seconds": 0,
+    "im_backend_outbox_pending_events": 0,
+    "im_backend_outbox_pipeline_enabled": 0,
+    "im_backend_outbox_projection_bulk_enabled": 1,
+    "im_backend_outbox_projection_recipients_enabled": 1,
+    "im_backend_outbox_worker_batch_size": 64,
+    "im_backend_outbox_worker_concurrency": 16,
+    "im_backend_websocket_connections": 20,
+    "im_backend_websocket_send_queue_high_watermark": 4,
+    "process_resident_memory_bytes": 66813952
+  },
+  "outboxStageDurations": {
+    "claim": {
+      "count": 1094,
+      "averageMs": 2.6329170274223097,
+      "p50BucketMs": 2.5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 25
+    },
+    "mark_published": {
+      "count": 1094,
+      "averageMs": 7.663198734917736,
+      "p50BucketMs": 10,
+      "p95BucketMs": 25,
+      "p99BucketMs": 50
+    },
+    "prepare": {
+      "count": 1094,
+      "averageMs": 13.702903284277875,
+      "p50BucketMs": 25,
+      "p95BucketMs": 50,
+      "p99BucketMs": 100
+    },
+    "prepare_begin": {
+      "count": 1094,
+      "averageMs": 0.6141086608775123,
+      "p50BucketMs": 0.25,
+      "p95BucketMs": 2.5,
+      "p99BucketMs": 25
+    },
+    "prepare_commit": {
+      "count": 1094,
+      "averageMs": 0.9572792056672761,
+      "p50BucketMs": 1,
+      "p95BucketMs": 5,
+      "p99BucketMs": 10
+    },
+    "prepare_decode": {
+      "count": 1094,
+      "averageMs": 0.1081073299817184,
+      "p50BucketMs": 0.1,
+      "p95BucketMs": 0.25,
+      "p99BucketMs": 0.5
+    },
+    "prepare_encode": {
+      "count": 1094,
+      "averageMs": 0.05797363985374776,
+      "p50BucketMs": 0.1,
+      "p95BucketMs": 0.25,
+      "p99BucketMs": 0.25
+    },
+    "prepare_project_users": {
+      "count": 1094,
+      "averageMs": 3.5345866535649004,
+      "p50BucketMs": 2.5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 25
+    },
+    "prepare_store": {
+      "count": 1094,
+      "averageMs": 8.403247564899468,
+      "p50BucketMs": 10,
+      "p95BucketMs": 25,
+      "p99BucketMs": 50
+    },
+    "publish": {
+      "count": 1094,
+      "averageMs": 6.441526975319931,
+      "p50BucketMs": 10,
+      "p95BucketMs": 25,
+      "p99BucketMs": 25
+    }
+  },
+  "metricSampling": {
+    "interval": "250ms",
+    "samples": 139,
+    "errors": 0,
+    "peaks": {
+      "im_backend_outbox_oldest_pending_age_seconds": 13.969642,
+      "im_backend_outbox_pending_events": 42038
+    }
+  }
+}

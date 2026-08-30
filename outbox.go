@@ -34,10 +34,18 @@ type outboxBatchPreparer interface {
 	PrepareBatch(context.Context, []outboxEvent) ([]outboxEvent, error)
 }
 
+type outboxExecutionMode string
+
+const (
+	outboxExecutionModeSerial   outboxExecutionMode = "serial"
+	outboxExecutionModePipeline outboxExecutionMode = "pipeline"
+)
+
 type outboxWorkerConfig struct {
 	EventTypes        []string
 	BatchSize         int
 	Concurrency       int
+	ExecutionMode     outboxExecutionMode
 	ProjectionMode    syncProjectionMode
 	ProjectionStorage syncProjectionStorage
 	LeaseDuration     time.Duration
@@ -92,11 +100,23 @@ func retryablePublishError(err error, retryAfter time.Duration) error {
 	return &publishFailure{err: err, retryAfter: retryAfter}
 }
 
+func normalizeOutboxExecutionMode(mode outboxExecutionMode) (outboxExecutionMode, error) {
+	switch mode {
+	case "", outboxExecutionModePipeline:
+		return outboxExecutionModePipeline, nil
+	case outboxExecutionModeSerial:
+		return outboxExecutionModeSerial, nil
+	default:
+		return "", fmt.Errorf("unsupported outbox execution mode %q", mode)
+	}
+}
+
 func defaultOutboxWorkerConfig() outboxWorkerConfig {
 	return outboxWorkerConfig{
 		EventTypes:        []string{"message.created"},
 		BatchSize:         64,
 		Concurrency:       16,
+		ExecutionMode:     outboxExecutionModePipeline,
 		ProjectionMode:    syncProjectionModeBulk,
 		ProjectionStorage: syncProjectionStorageRecipients,
 		LeaseDuration:     30 * time.Second,
@@ -133,6 +153,11 @@ func newOutboxWorker(
 	if config.BaseBackoff > config.MaxBackoff {
 		return nil, errors.New("outbox base backoff cannot exceed max backoff")
 	}
+	executionMode, err := normalizeOutboxExecutionMode(config.ExecutionMode)
+	if err != nil {
+		return nil, err
+	}
+	config.ExecutionMode = executionMode
 	if config.jitter == nil {
 		config.jitter = equalJitter
 	}
@@ -173,37 +198,100 @@ func newMessageOutboxWorker(
 }
 
 func (worker *outboxWorker) Run(ctx context.Context) error {
+	switch worker.config.ExecutionMode {
+	case outboxExecutionModeSerial:
+		return worker.runSerial(ctx)
+	case outboxExecutionModePipeline:
+		return worker.runPipeline(ctx)
+	default:
+		return fmt.Errorf("unsupported outbox execution mode %q", worker.config.ExecutionMode)
+	}
+}
+
+func (worker *outboxWorker) runSerial(ctx context.Context) error {
 	for {
 		processed, err := worker.RunOnce(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("outbox worker batch: %v", err)
 		}
-		if ctx.Err() != nil {
+		if !worker.continueAfterBatch(ctx, processed) {
 			return nil
-		}
-		if processed == worker.config.BatchSize {
-			continue
-		}
-		timer := time.NewTimer(worker.config.PollInterval)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil
-		case <-timer.C:
 		}
 	}
 }
 
+// runPipeline overlaps database preparation for batch N+1 with realtime
+// delivery and durable completion for batch N. The unbuffered handoff keeps at
+// most one batch in each stage, so a slow publisher cannot accumulate leases.
+func (worker *outboxWorker) runPipeline(ctx context.Context) error {
+	preparedBatches := make(chan []outboxEvent)
+	go func() {
+		defer close(preparedBatches)
+		worker.prepareBatches(ctx, preparedBatches)
+	}()
+
+	for events := range preparedBatches {
+		if err := worker.deliverBatch(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("outbox worker delivery batch: %v", err)
+		}
+	}
+	return nil
+}
+
+func (worker *outboxWorker) prepareBatches(ctx context.Context, preparedBatches chan<- []outboxEvent) {
+	for {
+		processed, events, err := worker.claimAndPrepare(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("outbox worker preparation batch: %v", err)
+		}
+		if len(events) > 0 {
+			// Always hand an already-claimed batch to the delivery stage. On
+			// shutdown, delivery observes the canceled context and releases each
+			// lease through the normal retry path instead of abandoning it.
+			preparedBatches <- events
+		}
+		if !worker.continueAfterBatch(ctx, processed) {
+			return
+		}
+	}
+}
+
+func (worker *outboxWorker) continueAfterBatch(ctx context.Context, processed int) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if processed == worker.config.BatchSize {
+		return true
+	}
+	timer := time.NewTimer(worker.config.PollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// RunOnce deliberately remains a complete serial batch operation. Production
+// Run can pipeline consecutive batches, while tests and maintenance callers can
+// still execute one deterministic claim -> prepare -> publish -> mark cycle.
 func (worker *outboxWorker) RunOnce(ctx context.Context) (int, error) {
+	processed, events, err := worker.claimAndPrepare(ctx)
+	if err != nil || len(events) == 0 {
+		return processed, err
+	}
+	return processed, worker.deliverBatch(ctx, events)
+}
+
+func (worker *outboxWorker) claimAndPrepare(ctx context.Context) (int, []outboxEvent, error) {
 	claimStarted := time.Now()
 	events, err := worker.claim(ctx)
 	if len(events) > 0 {
 		worker.metrics.ObserveOutboxStage(outboxStageClaim, time.Since(claimStarted))
 	}
 	if err != nil || len(events) == 0 {
-		return len(events), err
+		return len(events), nil, err
 	}
 	if worker.preparer != nil {
 		prepareStarted := time.Now()
@@ -222,10 +310,13 @@ func (worker *outboxWorker) RunOnce(ctx context.Context) (int, error) {
 					stateErrors = append(stateErrors, fmt.Errorf("event %s: %w", event.EventID, stateErr))
 				}
 			}
-			return len(events), errors.Join(append([]error{err}, stateErrors...)...)
+			return len(events), nil, errors.Join(append([]error{err}, stateErrors...)...)
 		}
 	}
+	return len(events), events, nil
+}
 
+func (worker *outboxWorker) deliverBatch(ctx context.Context, events []outboxEvent) error {
 	publishStageStarted := time.Now()
 	semaphore := make(chan struct{}, worker.config.Concurrency)
 	outcomes := make(chan outboxPublishOutcome, len(events))
@@ -309,7 +400,7 @@ func (worker *outboxWorker) RunOnce(ctx context.Context) (int, error) {
 			worker.metrics.outboxPublish.WithLabelValues(outcome.event.EventType, result).Inc()
 		}
 	}
-	return len(events), errors.Join(processingErrors...)
+	return errors.Join(processingErrors...)
 }
 
 func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
