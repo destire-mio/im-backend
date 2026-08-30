@@ -167,20 +167,26 @@ func main() {
 	workerConfig.ExecutionMode = outboxExecutionMode(environmentString("OUTBOX_EXECUTION_MODE", string(workerConfig.ExecutionMode)))
 	workerConfig.ProjectionMode = syncProjectionMode(environmentString("OUTBOX_PROJECTION_MODE", string(workerConfig.ProjectionMode)))
 	workerConfig.ProjectionStorage = syncProjectionStorage(environmentString("OUTBOX_PROJECTION_STORAGE", string(workerConfig.ProjectionStorage)))
-	worker, err := newMessageOutboxWorker(db, &webSocketOutboxPublisher{router: router}, workerConfig, app.metrics)
+	batchPresence := environmentBool("OUTBOX_BATCH_PRESENCE_LOOKUP", true)
+	worker, err := newMessageOutboxWorker(db, &webSocketOutboxPublisher{
+		router:        router,
+		batchPresence: batchPresence,
+	}, workerConfig, app.metrics)
 	if err != nil {
 		cancelRouter()
 		cancelHub()
 		log.Fatalf("configure outbox worker: %v", err)
 	}
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
+	app.metrics.SetOutboxBatchPresenceEnabled(batchPresence)
 	log.Printf(
-		"outbox worker batch size %d concurrency %d execution mode %s projection mode %s storage %s",
+		"outbox worker batch size %d concurrency %d execution mode %s projection mode %s storage %s batch presence %t",
 		workerConfig.BatchSize,
 		workerConfig.Concurrency,
 		workerConfig.ExecutionMode,
 		workerConfig.ProjectionMode,
 		workerConfig.ProjectionStorage,
+		batchPresence,
 	)
 	workerContext, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan struct{})

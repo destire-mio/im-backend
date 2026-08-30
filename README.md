@@ -12,6 +12,7 @@
 - Sync cursor 与结构化 `outbox_recipients` 在同一事务提交，Outbox 不再二次回写带 recipients/cursor 的完整 JSONB。
 - 为每个用户分配连续 Sync cursor，支持快照分页补拉和设备 ACK；WebSocket 只负责实时通知，Sync API 负责恢复。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
+- Outbox 投递前对同批 recipient 去重，用两段 Redis pipeline 生成仅在本批存活的 Presence 快照，避免热点用户被重复查询。
 - Prometheus 指标覆盖 HTTP、连接池、Outbox 各阶段、Redis 路由、WebSocket、Sync 和 ACK。
 - 自带真实链路压测器，分别校验 HTTP、Realtime 和 Sync durability，不把“HTTP 成功”误当成“消息已送达”。
 
@@ -22,7 +23,7 @@ POST /messages
   -> PostgreSQL: message + pending outbox（同一事务）
   -> Outbox 准备 Lane: claim + 分配用户 cursor
      + 写入 sync event + outbox_recipients + ready（同一事务）
-  -> Outbox 投递 Lane: Redis / 本地 Hub + mark published
+  -> Outbox 投递 Lane: 批内 Presence 快照 + Redis / 本地 Hub + mark published
   -> WebSocket 实时通知
 
 断线或实时通知失败
@@ -104,9 +105,9 @@ go run ./cmd/im-loadtest \
   -report ./loadtest-report.json
 ```
 
-压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)。仓库中命名为 `loadtest-*.json` 的文件是文档所引用的脱敏实验报告，默认临时输出 `loadtest-report*.json` 不进入 Git。
+压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)；待验证实验见 [TODO.md](./TODO.md)。仓库中命名为 `loadtest-*.json` 的文件是文档所引用的脱敏实验报告，默认临时输出 `loadtest-report*.json` 不进入 Git。
 
-当前本机隔离库证据显示：在 Pool 24、3000 req/s、60000 条消息的同条件对照中，serial 与 pipeline 的 HTTP、Realtime、Sync 均完整；pipeline 将 Realtime P95 从 3.312 秒降到 2.234 秒，pending 峰值从 10332 降到 7004，但 HTTP P95 从 5.51ms 升到 9.43ms。3500 req/s 的四轮顺序平衡实验中，两种模式各有一轮未能在 30 秒等待窗口内清空，因此不能宣称当前稳定容量达到 3500 req/s。原始报告见 [3000 pipeline](./loadtest-rate-3000-pipeline-default.json)、[3000 serial](./loadtest-rate-3000-pipeline-ab-serial.json) 和 [完整 A/B 说明](./LOAD_TEST.md)。
+当前本机隔离库证据显示：在 Pool 24、Batch 64、3000 req/s、60000 条消息、10 个热点用户的四轮顺序平衡 A/B 中，HTTP、Realtime、Sync 均完整；批内 Presence 快照将每轮解析次数从 120000 降到约 9389，整批 `publish` 两轮中点从 16.54ms 降到 1.68ms，Realtime P95 中点从 7.528s 降到 1.195s。优化后准备 Lane 约 18.90ms，大于投递 Lane 的 6.48ms，下一个已观测瓶颈转为 `claim + prepare`，其中 `prepare_store` 最大。这仍是单机热点用户结果，不代表多用户或生产容量；原始报告与完整边界见 [LOAD_TEST.md](./LOAD_TEST.md)。
 
 ## 许可证
 

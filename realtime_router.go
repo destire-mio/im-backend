@@ -23,6 +23,10 @@ type webSocketDeliveryRouter interface {
 	Publish(context.Context, int64, []byte) (int, error)
 }
 
+type webSocketDeliveryBatchPreparer interface {
+	PrepareDeliveryBatch(context.Context, []int64) (webSocketDeliveryRouter, error)
+}
+
 type realtimeInstanceCommand struct {
 	Type         string          `json:"type"`
 	ReceiverID   int64           `json:"receiverId,omitempty"`
@@ -40,6 +44,14 @@ type redisRealtimeRouter struct {
 	ready      chan struct{}
 	readyOnce  sync.Once
 	metrics    *applicationMetrics
+}
+
+// redisRealtimeBatchRouter owns one immutable Presence snapshot. It is created
+// for exactly one Outbox batch and is never retained after that batch finishes.
+type redisRealtimeBatchRouter struct {
+	router        *redisRealtimeRouter
+	recordsByUser map[int64][]webSocketPresenceRecord
+	lookupErr     error
 }
 
 func newRedisRealtimeRouter(
@@ -69,6 +81,70 @@ func newRedisRealtimeRouter(
 }
 
 func (router *redisRealtimeRouter) Publish(ctx context.Context, receiverID int64, payload []byte) (int, error) {
+	delivered, err := router.publishLocal(ctx, receiverID, payload)
+	if err != nil {
+		return 0, err
+	}
+	records, err := router.presence.LookupUser(ctx, receiverID)
+	if err != nil {
+		router.observeRouting("presence_lookup", "error")
+		return delivered, err
+	}
+	router.observeRouting("presence_lookup", "success")
+	return router.publishRemote(ctx, receiverID, payload, delivered, records)
+}
+
+func (router *redisRealtimeRouter) PrepareDeliveryBatch(
+	ctx context.Context,
+	userIDs []int64,
+) (webSocketDeliveryRouter, error) {
+	recordsByUser, err := router.presence.LookupUsers(ctx, userIDs)
+	result := "success"
+	resolvedUsers := len(recordsByUser)
+	if err != nil {
+		result = "error"
+		resolvedUsers = len(userIDs)
+		router.observeRouting("presence_lookup", "error")
+	} else {
+		for range recordsByUser {
+			router.observeRouting("presence_lookup", "success")
+		}
+	}
+	if router.metrics != nil {
+		router.metrics.ObserveOutboxBatchPresence(resolvedUsers, result)
+	}
+	return &redisRealtimeBatchRouter{
+		router:        router,
+		recordsByUser: recordsByUser,
+		lookupErr:     err,
+	}, nil
+}
+
+func (router *redisRealtimeBatchRouter) Publish(
+	ctx context.Context,
+	receiverID int64,
+	payload []byte,
+) (int, error) {
+	delivered, err := router.router.publishLocal(ctx, receiverID, payload)
+	if err != nil {
+		return 0, err
+	}
+	if router.lookupErr != nil {
+		return delivered, router.lookupErr
+	}
+	records, found := router.recordsByUser[receiverID]
+	if !found {
+		router.router.observeRouting("presence_lookup", "missing_batch_user")
+		return delivered, fmt.Errorf("user %d was not prepared in the Presence batch", receiverID)
+	}
+	return router.router.publishRemote(ctx, receiverID, payload, delivered, records)
+}
+
+func (router *redisRealtimeRouter) publishLocal(
+	ctx context.Context,
+	receiverID int64,
+	payload []byte,
+) (int, error) {
 	delivered, err := router.hub.Publish(ctx, receiverID, payload)
 	if err != nil {
 		router.observeRouting("local_hub", "error")
@@ -79,13 +155,16 @@ func (router *redisRealtimeRouter) Publish(ctx context.Context, receiverID int64
 	} else {
 		router.observeRouting("local_hub", "delivered")
 	}
+	return delivered, nil
+}
 
-	records, err := router.presence.LookupUser(ctx, receiverID)
-	if err != nil {
-		router.observeRouting("presence_lookup", "error")
-		return delivered, err
-	}
-	router.observeRouting("presence_lookup", "success")
+func (router *redisRealtimeRouter) publishRemote(
+	ctx context.Context,
+	receiverID int64,
+	payload []byte,
+	delivered int,
+	records []webSocketPresenceRecord,
+) (int, error) {
 	remoteInstances := make(map[string]struct{})
 	for _, record := range records {
 		if record.InstanceID != router.instanceID {

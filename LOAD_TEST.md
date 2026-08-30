@@ -321,3 +321,62 @@ B 使用无缓冲 Channel 交接已准备批次。投递第 N 批时，准备协
 - `loadtest-rate-3500-pipeline-ab-a2-serial.json`
 - `loadtest-rate-3000-pipeline-default.json`
 - `loadtest-rate-3000-pipeline-ab-serial.json`
+
+## Presence 批内快照
+
+投递阶段保留一个可回退开关：
+
+```text
+A：OUTBOX_BATCH_PRESENCE_LOOKUP=false
+   每个 event 逐 recipient 执行 SMEMBERS + MGET
+
+B：OUTBOX_BATCH_PRESENCE_LOOKUP=true（当前默认）
+   取出一批 event 的 recipient
+   → 按 user_id 去重
+   → 第一段 Redis pipeline 批量 SMEMBERS
+   → 第二段 Redis pipeline 批量 MGET
+   → 本批并发 publish 共享这份不可变快照
+   → 批次结束即丢弃
+```
+
+这不是跨批长期缓存，因此不需要额外失效协议。代价是同一批处理期间的 Presence 变化可能不会进入当前快照；WebSocket 仍只是实时通知，客户端必须用 Sync 恢复。Redis 预取失败时，批内 Router 仍会先尝试本地 Hub 投递，然后返回可重试错误，不会把 Redis 故障变成本地通知的前置条件。
+
+`outbox_stage_duration_seconds{stage="publish"}` 包含批内预取，`stage="publish_prepare"` 单独显示快照准备耗时；单事件 `outbox_publish_duration_seconds` 不包含这段共享成本。`outbox_batch_presence_users_total / outbox_batch_presence_batches_total` 用来观察实际唯一用户数/批。
+
+集成测试已确认：重复 user ID 只生成两段 Redis pipeline；Redis 不可用时本地 Hub 仍先收到通知；跨实例 Outbox 投递可以通过批内快照到达远端 WebSocket。
+
+### 10 个热点用户 A/B
+
+四轮使用独立空库和 Redis DB，固定 Pool 24、Batch 64、publish 并发 16、pipeline + bulk + recipients、10 个用户、20 条 WebSocket、60000 条消息、3000 req/s 和并发 1000，顺序为 `A1 → B1 → B2 → A2`。四轮 HTTP 都是 `60000/60000`，Realtime 都是 `240000/240000`，Sync 都是 `120000/120000`；dropped、missing、duplicate、unexpected、dead 均为 0。
+
+| 两轮中点 | A：逐 recipient 查询 | B：批内快照 | 变化 |
+| --- | ---: | ---: | ---: |
+| Presence 解析次数/轮 | 120000 | 9388.5 | -92.2% |
+| 唯一用户/批 | 不适用 | 10.0 | — |
+| `publish_prepare` | 0.003 ms | 0.628 ms | 新增共享成本 |
+| 整批 `publish` | 16.54 ms | 1.68 ms | -89.8% |
+| Realtime P95 | 7.528 s | 1.195 s | -84.1% |
+| pending 峰值 | 22898 | 3898 | -83.0% |
+| oldest age 峰值 | 7.652 s | 1.301 s | -83.0% |
+
+A 的两轮 Realtime P95 为 `4.916s / 10.139s`，B 为 `0.539s / 1.851s`，本机端到端波动仍然明显；但直接的 `publish` 阶段在 A 两轮为 `17.75ms / 15.32ms`，B 两轮为 `1.70ms / 1.67ms`，方向和幅度都一致。因此可以确认热点用户下批内快照消除了当前投递阶段的重复 Presence 往返，但不把四轮单机数字外推为生产容量。
+
+### 优化后的下一瓶颈
+
+B 两轮的平均阶段中点组成为：
+
+```text
+准备 Lane：claim 4.26ms + prepare 14.64ms = 18.90ms
+投递 Lane：publish 1.68ms + mark 4.80ms = 6.48ms
+```
+
+所以原先约 `20.49ms` 的投递 Lane 已不是首要限制，下一瓶颈转到准备 Lane。其中最大单个子阶段是 `prepare_store` 约 `6.75ms`，其次是 `prepare_project_users` 约 `5.68ms`；3500 req/s 对 Batch 64 的预算约 `18.29ms`，而准备 Lane 已约 `18.90ms`。下一个数据模型候选仍是减少 `prepare_store` 中 `user_message_events` 与 `outbox_recipients` 的重复 user/cursor 写入，但需要单独设计、A/B 和 push，本步骤不继续改数据模型。
+
+更多不同用户、缓存命中率下降的实验已列入 [TODO.md](./TODO.md)。
+
+报告：
+
+- `loadtest-rate-3000-presence-ab-a1-per-recipient.json`
+- `loadtest-rate-3000-presence-ab-b1-batch.json`
+- `loadtest-rate-3000-presence-ab-b2-batch.json`
+- `loadtest-rate-3000-presence-ab-a2-per-recipient.json`

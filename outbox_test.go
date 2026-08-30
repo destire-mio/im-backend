@@ -19,6 +19,25 @@ type testPublisher struct {
 	publish func(context.Context, outboxEvent) error
 }
 
+type testBatchPublisher struct {
+	prepareCalls atomic.Int32
+	prepared     *testPublisher
+	directCalls  atomic.Int32
+}
+
+func (publisher *testBatchPublisher) PreparePublishBatch(
+	_ context.Context,
+	_ []outboxEvent,
+) (outboxPublisher, error) {
+	publisher.prepareCalls.Add(1)
+	return publisher.prepared, nil
+}
+
+func (publisher *testBatchPublisher) Publish(context.Context, outboxEvent) error {
+	publisher.directCalls.Add(1)
+	return errors.New("unprepared publisher was called")
+}
+
 func (publisher *testPublisher) Publish(ctx context.Context, event outboxEvent) error {
 	publisher.mu.Lock()
 	publisher.events = append(publisher.events, event)
@@ -84,6 +103,37 @@ func TestOutboxWorkerPublishesAndMarksEventComplete(t *testing.T) {
 	}
 	if publishedAt == nil || attemptCount != 1 || lockedUntil != nil || lockToken != nil {
 		t.Fatalf("published=%v attempts=%d lockUntil=%v lockToken=%v", publishedAt, attemptCount, lockedUntil, lockToken)
+	}
+}
+
+func TestOutboxWorkerPreparesPublisherOncePerBatch(t *testing.T) {
+	db := openTestDatabase(t)
+	eventIDs := map[string]bool{
+		createPendingOutboxEvent(t, db): true,
+		createPendingOutboxEvent(t, db): true,
+	}
+	prepared := &testPublisher{}
+	publisher := &testBatchPublisher{prepared: prepared}
+	worker := mustTestWorker(t, db, publisher, testWorkerConfig())
+
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || processed != len(eventIDs) {
+		t.Fatalf("run batch-aware worker = processed %d, err %v", processed, err)
+	}
+	if calls := publisher.prepareCalls.Load(); calls != 1 {
+		t.Fatalf("publisher prepare calls = %d, want 1", calls)
+	}
+	if calls := publisher.directCalls.Load(); calls != 0 {
+		t.Fatalf("unprepared publisher calls = %d, want 0", calls)
+	}
+	received := prepared.received()
+	if len(received) != len(eventIDs) {
+		t.Fatalf("prepared publisher received %d events, want %d", len(received), len(eventIDs))
+	}
+	for _, event := range received {
+		if !eventIDs[event.EventID] {
+			t.Fatalf("prepared publisher received unexpected event %s", event.EventID)
+		}
 	}
 }
 

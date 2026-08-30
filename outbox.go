@@ -30,6 +30,10 @@ type outboxPublisher interface {
 	Publish(context.Context, outboxEvent) error
 }
 
+type outboxBatchPublishPreparer interface {
+	PreparePublishBatch(context.Context, []outboxEvent) (outboxPublisher, error)
+}
+
 type outboxBatchPreparer interface {
 	PrepareBatch(context.Context, []outboxEvent) ([]outboxEvent, error)
 }
@@ -71,16 +75,17 @@ type outboxPublishOutcome struct {
 }
 
 const (
-	outboxStageClaim         = "claim"
-	outboxStagePrepare       = "prepare"
-	outboxStagePrepareDecode = "prepare_decode"
-	outboxStagePrepareBegin  = "prepare_begin"
-	outboxStagePrepareUsers  = "prepare_project_users"
-	outboxStagePrepareEncode = "prepare_encode"
-	outboxStagePrepareStore  = "prepare_store"
-	outboxStagePrepareCommit = "prepare_commit"
-	outboxStagePublish       = "publish"
-	outboxStageMarkPublished = "mark_published"
+	outboxStageClaim          = "claim"
+	outboxStagePrepare        = "prepare"
+	outboxStagePrepareDecode  = "prepare_decode"
+	outboxStagePrepareBegin   = "prepare_begin"
+	outboxStagePrepareUsers   = "prepare_project_users"
+	outboxStagePrepareEncode  = "prepare_encode"
+	outboxStagePrepareStore   = "prepare_store"
+	outboxStagePrepareCommit  = "prepare_commit"
+	outboxStagePublish        = "publish"
+	outboxStagePublishPrepare = "publish_prepare"
+	outboxStageMarkPublished  = "mark_published"
 )
 
 type publishFailure struct {
@@ -318,6 +323,36 @@ func (worker *outboxWorker) claimAndPrepare(ctx context.Context) (int, []outboxE
 
 func (worker *outboxWorker) deliverBatch(ctx context.Context, events []outboxEvent) error {
 	publishStageStarted := time.Now()
+	publisher := worker.publisher
+	if preparer, ok := worker.publisher.(outboxBatchPublishPreparer); ok {
+		prepareStarted := time.Now()
+		prepareContext, cancelPrepare := context.WithTimeout(ctx, worker.config.AttemptTimeout)
+		preparedPublisher, err := preparer.PreparePublishBatch(prepareContext, events)
+		cancelPrepare()
+		worker.metrics.ObserveOutboxStage(outboxStagePublishPrepare, time.Since(prepareStarted))
+		if err != nil {
+			failure := retryablePublishError(fmt.Errorf("prepare outbox publisher batch: %w", err), 0)
+			outcomes := make(chan outboxPublishOutcome, len(events))
+			for _, event := range events {
+				outcomes <- outboxPublishOutcome{event: event, err: failure}
+			}
+			close(outcomes)
+			worker.metrics.ObserveOutboxStage(outboxStagePublish, time.Since(publishStageStarted))
+			return worker.completeDeliveryBatch(ctx, events, outcomes)
+		}
+		if preparedPublisher == nil {
+			failure := retryablePublishError(errors.New("prepared outbox publisher is nil"), 0)
+			outcomes := make(chan outboxPublishOutcome, len(events))
+			for _, event := range events {
+				outcomes <- outboxPublishOutcome{event: event, err: failure}
+			}
+			close(outcomes)
+			worker.metrics.ObserveOutboxStage(outboxStagePublish, time.Since(publishStageStarted))
+			return worker.completeDeliveryBatch(ctx, events, outcomes)
+		}
+		publisher = preparedPublisher
+	}
+
 	semaphore := make(chan struct{}, worker.config.Concurrency)
 	outcomes := make(chan outboxPublishOutcome, len(events))
 	var wait sync.WaitGroup
@@ -329,7 +364,7 @@ func (worker *outboxWorker) deliverBatch(ctx context.Context, events []outboxEve
 			defer func() { <-semaphore }()
 			started := time.Now()
 			attemptContext, cancelAttempt := context.WithTimeout(ctx, worker.config.AttemptTimeout)
-			publishErr := worker.publisher.Publish(attemptContext, current)
+			publishErr := publisher.Publish(attemptContext, current)
 			cancelAttempt()
 			if worker.metrics != nil {
 				worker.metrics.outboxPublishDuration.WithLabelValues(current.EventType).Observe(time.Since(started).Seconds())
@@ -340,7 +375,14 @@ func (worker *outboxWorker) deliverBatch(ctx context.Context, events []outboxEve
 	wait.Wait()
 	worker.metrics.ObserveOutboxStage(outboxStagePublish, time.Since(publishStageStarted))
 	close(outcomes)
+	return worker.completeDeliveryBatch(ctx, events, outcomes)
+}
 
+func (worker *outboxWorker) completeDeliveryBatch(
+	ctx context.Context,
+	events []outboxEvent,
+	outcomes <-chan outboxPublishOutcome,
+) error {
 	allOutcomes := make([]outboxPublishOutcome, 0, len(events))
 	successful := make([]outboxEvent, 0, len(events))
 	for outcome := range outcomes {

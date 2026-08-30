@@ -23,6 +23,8 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	app.metrics = newApplicationMetrics(db)
 	workerConfig := defaultOutboxWorkerConfig()
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
+	app.metrics.SetOutboxBatchPresenceEnabled(true)
+	app.metrics.ObserveOutboxBatchPresence(2, "success")
 	server := httptest.NewServer(app.routes())
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("metrics_s"), "Metrics Sender")
@@ -43,6 +45,9 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 		"im_backend_outbox_worker_concurrency 16",
 		"im_backend_outbox_worker_batch_size 64",
 		"im_backend_outbox_pipeline_enabled 1",
+		"im_backend_outbox_batch_presence_enabled 1",
+		`im_backend_outbox_batch_presence_batches_total{result="success"} 1`,
+		"im_backend_outbox_batch_presence_users_total 2",
 		"im_backend_outbox_projection_bulk_enabled 1",
 		"im_backend_outbox_projection_recipients_enabled 1",
 		"im_backend_outbox_projection_batches_total 1",

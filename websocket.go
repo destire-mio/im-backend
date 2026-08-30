@@ -473,7 +473,54 @@ func webSocketDisconnectReason(reason string) string {
 }
 
 type webSocketOutboxPublisher struct {
-	router webSocketDeliveryRouter
+	router        webSocketDeliveryRouter
+	batchPresence bool
+}
+
+func (publisher *webSocketOutboxPublisher) PreparePublishBatch(
+	ctx context.Context,
+	events []outboxEvent,
+) (outboxPublisher, error) {
+	if !publisher.batchPresence {
+		return publisher, nil
+	}
+	batchRouter, ok := publisher.router.(webSocketDeliveryBatchPreparer)
+	if !ok {
+		return publisher, nil
+	}
+
+	userIDs := make([]int64, 0, len(events)*2)
+	seen := make(map[int64]struct{}, len(events)*2)
+	for _, event := range events {
+		if event.EventType != "message.created" {
+			continue
+		}
+		payload, err := decodeMessageCreatedEvent(event)
+		if err != nil {
+			// Publish classifies a malformed event independently. It must not
+			// prevent valid events in the same batch from using the snapshot.
+			continue
+		}
+		for _, recipient := range payload.Recipients {
+			if _, found := seen[recipient.UserID]; found {
+				continue
+			}
+			seen[recipient.UserID] = struct{}{}
+			userIDs = append(userIDs, recipient.UserID)
+		}
+	}
+
+	preparedRouter, err := batchRouter.PrepareDeliveryBatch(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	if preparedRouter == nil {
+		return nil, errors.New("prepared websocket delivery router is nil")
+	}
+	prepared := *publisher
+	prepared.router = preparedRouter
+	prepared.batchPresence = false
+	return &prepared, nil
 }
 
 func (publisher *webSocketOutboxPublisher) Publish(ctx context.Context, event outboxEvent) error {

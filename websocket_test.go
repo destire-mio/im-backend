@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,34 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type testBatchDeliveryRouter struct {
+	preparedUsers  []int64
+	publishedUsers []int64
+	directCalls    int
+}
+
+func (router *testBatchDeliveryRouter) PrepareDeliveryBatch(
+	_ context.Context,
+	userIDs []int64,
+) (webSocketDeliveryRouter, error) {
+	router.preparedUsers = append([]int64(nil), userIDs...)
+	return testPreparedDeliveryRouter{owner: router}, nil
+}
+
+func (router *testBatchDeliveryRouter) Publish(context.Context, int64, []byte) (int, error) {
+	router.directCalls++
+	return 0, errors.New("unprepared delivery router was called")
+}
+
+type testPreparedDeliveryRouter struct {
+	owner *testBatchDeliveryRouter
+}
+
+func (router testPreparedDeliveryRouter) Publish(_ context.Context, userID int64, _ []byte) (int, error) {
+	router.owner.publishedUsers = append(router.owner.publishedUsers, userID)
+	return 0, nil
+}
 
 func TestWebSocketRequiresAuthentication(t *testing.T) {
 	db := openTestDatabase(t)
@@ -70,6 +100,65 @@ func TestWebSocketPublisherDeliversToEveryOnlineDevice(t *testing.T) {
 				t.Fatalf("envelope message = %+v", envelope)
 			}
 		})
+	}
+}
+
+func TestWebSocketPublisherDeduplicatesBatchPresenceUsers(t *testing.T) {
+	router := &testBatchDeliveryRouter{}
+	publisher := &webSocketOutboxPublisher{router: router, batchPresence: true}
+	first := testMessageCreatedOutboxEvent(t, "event-1", 101, []int64{7, 9})
+	second := testMessageCreatedOutboxEvent(t, "event-2", 102, []int64{9, 11})
+	malformed := outboxEvent{
+		EventID:        "event-malformed",
+		EventType:      "message.created",
+		PayloadVersion: 2,
+		Payload:        json.RawMessage(`{"message":`),
+	}
+
+	prepared, err := publisher.PreparePublishBatch(context.Background(), []outboxEvent{first, malformed, second})
+	if err != nil {
+		t.Fatalf("prepare websocket publisher batch: %v", err)
+	}
+	if want := []int64{7, 9, 11}; !reflect.DeepEqual(router.preparedUsers, want) {
+		t.Fatalf("prepared Presence users = %v, want %v", router.preparedUsers, want)
+	}
+	for _, event := range []outboxEvent{first, second} {
+		if err := prepared.Publish(context.Background(), event); err != nil {
+			t.Fatalf("publish prepared event %s: %v", event.EventID, err)
+		}
+	}
+	if router.directCalls != 0 {
+		t.Fatalf("unprepared delivery calls = %d, want 0", router.directCalls)
+	}
+	if want := []int64{7, 9, 9, 11}; !reflect.DeepEqual(router.publishedUsers, want) {
+		t.Fatalf("prepared delivery users = %v, want %v", router.publishedUsers, want)
+	}
+}
+
+func testMessageCreatedOutboxEvent(
+	t *testing.T,
+	eventID string,
+	messageID int64,
+	userIDs []int64,
+) outboxEvent {
+	t.Helper()
+	recipients := make([]messageEventRecipient, 0, len(userIDs))
+	for index, userID := range userIDs {
+		recipients = append(recipients, messageEventRecipient{UserID: userID, Cursor: int64(index + 1)})
+	}
+	payload, err := json.Marshal(messageCreatedEventPayload{
+		Message:    message{ID: messageID},
+		Recipients: recipients,
+	})
+	if err != nil {
+		t.Fatalf("encode test message.created payload: %v", err)
+	}
+	return outboxEvent{
+		EventID:        eventID,
+		EventType:      "message.created",
+		PayloadVersion: 2,
+		MessageID:      messageID,
+		Payload:        payload,
 	}
 }
 

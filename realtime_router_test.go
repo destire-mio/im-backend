@@ -3,14 +3,41 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+type redisPipelineCountHook struct {
+	pipelines atomic.Int32
+	commands  atomic.Int32
+}
+
+func (hook *redisPipelineCountHook) DialHook(next redis.DialHook) redis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return next(ctx, network, addr)
+	}
+}
+
+func (hook *redisPipelineCountHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		return next(ctx, command)
+	}
+}
+
+func (hook *redisPipelineCountHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, commands []redis.Cmder) error {
+		hook.pipelines.Add(1)
+		hook.commands.Add(int32(len(commands)))
+		return next(ctx, commands)
+	}
+}
 
 func TestRedisPresenceFencesReplacedConnection(t *testing.T) {
 	redisClient, namespace := openTestRedis(t)
@@ -63,6 +90,40 @@ func TestRedisPresenceExpiresAndLazilyCleansUserIndex(t *testing.T) {
 	}
 	if count := redisClient.SCard(context.Background(), presence.userSessionsKey(record.UserID)).Val(); count != 0 {
 		t.Fatalf("stale user session count = %d, want 0", count)
+	}
+}
+
+func TestRedisPresenceLookupUsersDeduplicatesIntoTwoPipelineRoundTrips(t *testing.T) {
+	redisClient, namespace := openTestRedis(t)
+	presence := mustTestPresence(t, redisClient, namespace, time.Second, 250*time.Millisecond)
+	first := webSocketPresenceRecord{UserID: 61, SessionID: 71, ConnectionID: "first", InstanceID: "instance-a"}
+	second := webSocketPresenceRecord{UserID: 67, SessionID: 73, ConnectionID: "second", InstanceID: "instance-b"}
+	for _, record := range []webSocketPresenceRecord{first, second} {
+		if _, err := presence.Register(context.Background(), record); err != nil {
+			t.Fatalf("register batch Presence record: %v", err)
+		}
+	}
+
+	hook := &redisPipelineCountHook{}
+	redisClient.AddHook(hook)
+	recordsByUser, err := presence.LookupUsers(context.Background(), []int64{61, 67, 61, 79, 67})
+	if err != nil {
+		t.Fatalf("lookup Presence batch: %v", err)
+	}
+	if records := recordsByUser[61]; len(records) != 1 || records[0] != first {
+		t.Fatalf("first user Presence = %+v", records)
+	}
+	if records := recordsByUser[67]; len(records) != 1 || records[0] != second {
+		t.Fatalf("second user Presence = %+v", records)
+	}
+	if records := recordsByUser[79]; len(records) != 0 {
+		t.Fatalf("offline user Presence = %+v, want empty", records)
+	}
+	if calls := hook.pipelines.Load(); calls != 2 {
+		t.Fatalf("Redis pipeline round trips = %d, want 2", calls)
+	}
+	if commands := hook.commands.Load(); commands != 5 {
+		t.Fatalf("Redis commands = %d, want 5 (3 SMEMBERS + 2 MGET)", commands)
 	}
 }
 
@@ -266,6 +327,44 @@ func TestRedisRouterKeepsLocalDeliveryWhenRedisIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestRedisBatchRouterKeepsLocalDeliveryWhenRedisIsUnavailable(t *testing.T) {
+	options := &redis.Options{
+		Addr:         "127.0.0.1:1",
+		DialTimeout:  25 * time.Millisecond,
+		ReadTimeout:  25 * time.Millisecond,
+		WriteTimeout: 25 * time.Millisecond,
+		MaxRetries:   0,
+	}
+	redisClient := redis.NewClient(options)
+	defer redisClient.Close()
+	presence := mustTestPresence(t, redisClient, "im:test:batch-unavailable", time.Second, 250*time.Millisecond)
+	hub, stopHub := startTestHub(t)
+	defer stopHub()
+	client := &webSocketClient{userID: 83, sessionID: 89, connectionID: "local", send: make(chan []byte, 1)}
+	if err := hub.Register(context.Background(), client); err != nil {
+		t.Fatalf("register local batch client: %v", err)
+	}
+	router := mustTestRouter(t, redisClient, presence, hub, "instance-local")
+	prepareContext, cancelPrepare := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	batchRouter, err := router.PrepareDeliveryBatch(prepareContext, []int64{client.userID})
+	cancelPrepare()
+	if err != nil {
+		t.Fatalf("prepare unavailable Redis batch router: %v", err)
+	}
+	delivered, err := batchRouter.Publish(context.Background(), client.userID, []byte("local-batch"))
+	if err == nil || delivered != 1 {
+		t.Fatalf("Redis outage batch publish = delivered %d, err %v", delivered, err)
+	}
+	select {
+	case payload := <-client.send:
+		if string(payload) != "local-batch" {
+			t.Fatalf("local batch outage payload = %q", payload)
+		}
+	default:
+		t.Fatal("local batch delivery was lost during Redis outage")
+	}
+}
+
 func TestTwoApplicationInstancesDeliverOutboxEventToRemoteWebSocket(t *testing.T) {
 	db := openTestDatabase(t)
 	redisClient, namespace := openTestRedis(t)
@@ -302,7 +401,10 @@ func TestTwoApplicationInstancesDeliverOutboxEventToRemoteWebSocket(t *testing.T
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
 	config.Concurrency = 1
-	worker := mustMessageTestWorker(t, db, &webSocketOutboxPublisher{router: appA.realtimeRouter}, config)
+	worker := mustMessageTestWorker(t, db, &webSocketOutboxPublisher{
+		router:        appA.realtimeRouter,
+		batchPresence: true,
+	}, config)
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || processed != 1 {
 		t.Fatalf("run cross-instance outbox worker = processed %d, err %v", processed, err)

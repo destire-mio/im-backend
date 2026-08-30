@@ -35,6 +35,9 @@ type applicationMetrics struct {
 	outboxWorkerConcurrency    prometheus.Gauge
 	outboxWorkerBatchSize      prometheus.Gauge
 	outboxPipelineEnabled      prometheus.Gauge
+	outboxBatchPresenceEnabled prometheus.Gauge
+	outboxBatchPresenceBatches *prometheus.CounterVec
+	outboxBatchPresenceUsers   prometheus.Counter
 	outboxProjectionBulk       prometheus.Gauge
 	outboxProjectionRecipients prometheus.Gauge
 	outboxProjectionBatches    prometheus.Counter
@@ -146,6 +149,21 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Name:      "outbox_pipeline_enabled",
 			Help:      "Whether preparation of the next Outbox batch overlaps delivery of the current batch.",
 		}),
+		outboxBatchPresenceEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_batch_presence_enabled",
+			Help:      "Whether each Outbox batch resolves duplicate recipient Presence records once.",
+		}),
+		outboxBatchPresenceBatches: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_batch_presence_batches_total",
+			Help:      "Outbox batch Presence snapshot attempts by bounded result.",
+		}, []string{"result"}),
+		outboxBatchPresenceUsers: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_batch_presence_users_total",
+			Help:      "Distinct recipient users included in Outbox batch Presence snapshot attempts.",
+		}),
 		outboxProjectionBulk: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_projection_bulk_enabled",
@@ -196,6 +214,9 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.outboxWorkerConcurrency,
 		metrics.outboxWorkerBatchSize,
 		metrics.outboxPipelineEnabled,
+		metrics.outboxBatchPresenceEnabled,
+		metrics.outboxBatchPresenceBatches,
+		metrics.outboxBatchPresenceUsers,
 		metrics.outboxProjectionBulk,
 		metrics.outboxProjectionRecipients,
 		metrics.outboxProjectionBatches,
@@ -246,6 +267,14 @@ func (metrics *applicationMetrics) ObserveOutboxProjectionBatch(users int) {
 	metrics.outboxProjectionUsers.Add(float64(users))
 }
 
+func (metrics *applicationMetrics) ObserveOutboxBatchPresence(users int, result string) {
+	if metrics == nil {
+		return
+	}
+	metrics.outboxBatchPresenceBatches.WithLabelValues(result).Inc()
+	metrics.outboxBatchPresenceUsers.Add(float64(users))
+}
+
 func (metrics *applicationMetrics) ObserveOutboxProjectionQuery(duration time.Duration) {
 	if metrics != nil {
 		metrics.outboxProjectionQueries.Observe(duration.Seconds())
@@ -272,6 +301,17 @@ func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConf
 		metrics.outboxProjectionRecipients.Set(1)
 	} else {
 		metrics.outboxProjectionRecipients.Set(0)
+	}
+}
+
+func (metrics *applicationMetrics) SetOutboxBatchPresenceEnabled(enabled bool) {
+	if metrics == nil {
+		return
+	}
+	if enabled {
+		metrics.outboxBatchPresenceEnabled.Set(1)
+	} else {
+		metrics.outboxBatchPresenceEnabled.Set(0)
 	}
 }
 
