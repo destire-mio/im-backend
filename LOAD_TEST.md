@@ -274,9 +274,40 @@ B：OUTBOX_PROJECTION_STORAGE=sync_events（候选）
 
 `sync_events` 在正常路径中只把 `user_message_events` 和 `outbox_events.ready_at` 放在同一事务提交，不再插入 `outbox_recipients`。若在提交后、publish 前崩溃，重启 Worker 通过 `outbox_events.message_id → user_message_events.message_id` 批量重建 user/cursor；该恢复只发生在已 ready 事件的重试路径，正常首次投递仍使用内存中的投影结果。
 
-集成测试已覆盖提交后崩溃恢复、Lease 丢失全事务回滚、自发自收，以及 `recipients`/`sync_events` 双向切换恢复。候选模式尚未切为默认，也尚未删除 `outbox_recipients`；是否采用以新鲜隔离库 A/B 的 `prepare_store`、准备 Lane、pending/oldest 和端到端正确性为准。
+集成测试已覆盖提交后崩溃恢复、Lease 丢失全事务回滚、自发自收，以及 `recipients`/`sync_events` 双向切换恢复。
 
-报告：
+3500 req/s 的有效 A/B 按 `A1 → B1 → B2 → A2` 运行，每轮都重启 PostgreSQL/Redis，再从同一空库模板克隆隔离库。固定 Pool 24、Batch 64、publish 并发 16、pipeline + bulk + 批内 Presence、10 个热点用户、20 条 WebSocket、70000 条消息、并发 1000 和 30 秒等待。四轮都完成 `70000/70000` HTTP、`280000/280000` Realtime 和 `140000/140000` Sync，dropped、missing、duplicate、unexpected、dead 均为 0；A 每轮写入 140000 条 `outbox_recipients`，B 为 0。
+
+| 两轮中点 | A：recipients | B：sync_events | 变化 |
+| --- | ---: | ---: | ---: |
+| `prepare_store` | 4.83 ms | 1.81 ms | -62.4% |
+| `prepare` 总计 | 10.66 ms | 7.96 ms | -25.4% |
+| 准备 Lane（claim + prepare） | 13.71 ms | 11.14 ms | -18.7% |
+| `prepare_project_users` | 4.33 ms | 4.55 ms | 基本持平 |
+
+直接写入指标的两轮区间没有重叠：A 的 `prepare_store` 为 `4.69/4.96ms`，B 为 `1.79/1.84ms`，因此可确认去掉重复 recipient 插入减少了准备写成本。但本档不把它说成端到端容量提升：A 的 Realtime P95 为 `0.510/0.506s`、pending 峰值 `1815/1967`，B 为 `0.510/0.602s` 和 `2256/2347`，端到端峰值没有同步改善。该结果支持为了减少写放大和单一权威数据源而切换默认，不证明 4000 或 5000 容量已提高。
+
+4000 的四轮在每轮重启依赖后仍有一轮 B 出现 657 个 dropped starts，其余三轮完整；该组只作边界诊断，不进入采用计算。5000 四轮全部未完成目标 HTTP，且同为 recipients 的 A1/A2 `prepare` 从 `20.44ms` 漂移到 `204.01ms`，证明连续极限写入中存在跨轮环境漂移。该组只能说明“仅去掉 recipient 写入未解决 5000 过载”，不能用来比较 A/B 优劣。
+
+3500 有效 A/B 报告：
+
+- `benchmarks/reports/loadtest-rate-3500-sync-events-ab-a1-recipients.json`
+- `benchmarks/reports/loadtest-rate-3500-sync-events-ab-b1-sync-events.json`
+- `benchmarks/reports/loadtest-rate-3500-sync-events-ab-b2-sync-events.json`
+- `benchmarks/reports/loadtest-rate-3500-sync-events-ab-a2-recipients.json`
+
+4000/5000 边界诊断报告：
+
+- `benchmarks/reports/loadtest-rate-4000-sync-events-ab-a1-recipients.json`
+- `benchmarks/reports/loadtest-rate-4000-sync-events-ab-b1-sync-events.json`
+- `benchmarks/reports/loadtest-rate-4000-sync-events-ab-b2-sync-events.json`
+- `benchmarks/reports/loadtest-rate-4000-sync-events-ab-a2-recipients.json`
+- `benchmarks/reports/loadtest-rate-5000-sync-events-ab-a1-recipients.json`
+- `benchmarks/reports/loadtest-rate-5000-sync-events-ab-b1-sync-events.json`
+- `benchmarks/reports/loadtest-rate-5000-sync-events-ab-b2-sync-events.json`
+- `benchmarks/reports/loadtest-rate-5000-sync-events-ab-a2-recipients.json`
+
+此前 JSONB/recipients 拆分报告：
 
 - `benchmarks/reports/loadtest-rate-3500-storage-ab-a1-jsonb.json`
 - `benchmarks/reports/loadtest-rate-3500-storage-ab-b1-recipients.json`

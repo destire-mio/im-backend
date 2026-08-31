@@ -1,0 +1,201 @@
+{
+  "runId": "260831045835c691b7",
+  "startedAt": "2026-08-31T04:58:35.837224Z",
+  "finishedAt": "2026-08-31T04:58:57.962786Z",
+  "database": "im_ab_sync3500_a1_recipients_73423",
+  "users": 10,
+  "devicesPerUser": 2,
+  "webSocketCount": 20,
+  "concurrency": 1000,
+  "loadModel": "fixed-rate",
+  "targetRateRps": 3500,
+  "requestTimeout": "10s",
+  "deliveryWait": "30s",
+  "loadDurationMs": 20009.088,
+  "messagesAttempted": 70000,
+  "messagesSucceeded": 70000,
+  "messagesFailed": 0,
+  "droppedStarts": 0,
+  "idempotentRecovered": 0,
+  "httpThroughputRps": 3498.4101985620523,
+  "httpLatency": {
+    "count": 70000,
+    "p50Ms": 2.442,
+    "p95Ms": 4.49,
+    "p99Ms": 7.462,
+    "maxMs": 47.667
+  },
+  "realtimeLatency": {
+    "count": 280000,
+    "p50Ms": 292.299,
+    "p95Ms": 509.871,
+    "p99Ms": 523.546,
+    "maxMs": 540.484
+  },
+  "realtime": {
+    "expected": 280000,
+    "observed": 280000,
+    "passed": true
+  },
+  "sync": {
+    "expected": 140000,
+    "observed": 140000,
+    "passed": true
+  },
+  "duplicateRealtime": 0,
+  "unexpectedRealtime": 0,
+  "metricDeltas": {
+    "im_backend_database_pool_acquire_duration_seconds_total": 6.0095856,
+    "im_backend_database_pool_acquires_total": 145561,
+    "im_backend_database_pool_canceled_acquires_total": 0,
+    "im_backend_database_pool_empty_acquire_wait_seconds_total": 5.99043738,
+    "im_backend_database_pool_empty_acquires_total": 1841,
+    "im_backend_outbox_batch_presence_batches_total": 1096,
+    "im_backend_outbox_batch_presence_users_total": 10960,
+    "im_backend_outbox_projection_batches_total": 1096,
+    "im_backend_outbox_projection_query_duration_seconds_count": 3288,
+    "im_backend_outbox_projection_query_duration_seconds_sum": 4.591903153999984,
+    "im_backend_outbox_projection_users_total": 10960,
+    "im_backend_outbox_publish_duration_seconds_count": 70000,
+    "im_backend_outbox_publish_duration_seconds_sum": 11.878921003999857,
+    "im_backend_outbox_publish_total": 70000,
+    "im_backend_realtime_routing_total": 150960,
+    "im_backend_sync_events_total": 140000,
+    "im_backend_websocket_deliveries_total": 280000,
+    "im_backend_websocket_io_total": 280000,
+    "im_backend_websocket_send_queue_depth_count": 280000,
+    "im_backend_websocket_send_queue_depth_sum": 499300,
+    "im_backend_websocket_write_duration_seconds_count": 280000,
+    "im_backend_websocket_write_duration_seconds_sum": 1.7644542880000074
+  },
+  "metricEnd": {
+    "go_goroutines": 214,
+    "im_backend_database_metrics_collection_success": 1,
+    "im_backend_database_pool_acquired_connections": 1,
+    "im_backend_database_pool_constructing_connections": 0,
+    "im_backend_database_pool_idle_connections": 23,
+    "im_backend_database_pool_max_connections": 24,
+    "im_backend_database_pool_total_connections": 24,
+    "im_backend_outbox_batch_presence_enabled": 1,
+    "im_backend_outbox_dead_events": 0,
+    "im_backend_outbox_oldest_pending_age_seconds": 0,
+    "im_backend_outbox_pending_events": 0,
+    "im_backend_outbox_pipeline_enabled": 1,
+    "im_backend_outbox_projection_bulk_enabled": 1,
+    "im_backend_outbox_projection_recipients_enabled": 1,
+    "im_backend_outbox_projection_sync_events_enabled": 0,
+    "im_backend_outbox_worker_batch_size": 64,
+    "im_backend_outbox_worker_concurrency": 16,
+    "im_backend_websocket_connections": 20,
+    "im_backend_websocket_send_queue_high_watermark": 13,
+    "process_resident_memory_bytes": 68616192
+  },
+  "outboxStageDurations": {
+    "claim": {
+      "count": 1096,
+      "averageMs": 2.9750143494525583,
+      "p50BucketMs": 5,
+      "p95BucketMs": 5,
+      "p99BucketMs": 10
+    },
+    "mark_published": {
+      "count": 1096,
+      "averageMs": 3.2333102271897807,
+      "p50BucketMs": 5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 25
+    },
+    "prepare": {
+      "count": 1096,
+      "averageMs": 10.338932639598518,
+      "p50BucketMs": 10,
+      "p95BucketMs": 25,
+      "p99BucketMs": 25
+    },
+    "prepare_begin": {
+      "count": 1096,
+      "averageMs": 0.3685243722627733,
+      "p50BucketMs": 0.5,
+      "p95BucketMs": 1,
+      "p99BucketMs": 2.5
+    },
+    "prepare_commit": {
+      "count": 1096,
+      "averageMs": 0.8481322855839418,
+      "p50BucketMs": 1,
+      "p95BucketMs": 2.5,
+      "p99BucketMs": 2.5
+    },
+    "prepare_decode": {
+      "count": 1096,
+      "averageMs": 0.13407203558394182,
+      "p50BucketMs": 0.25,
+      "p95BucketMs": 0.25,
+      "p99BucketMs": 0.5
+    },
+    "prepare_encode": {
+      "count": 1096,
+      "averageMs": 0.06435548905109505,
+      "p50BucketMs": 0.1,
+      "p95BucketMs": 0.25,
+      "p99BucketMs": 0.25
+    },
+    "prepare_project_users": {
+      "count": 1096,
+      "averageMs": 4.201417884124084,
+      "p50BucketMs": 5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 25
+    },
+    "prepare_store": {
+      "count": 1096,
+      "averageMs": 4.69146014872263,
+      "p50BucketMs": 5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 25
+    },
+    "publish": {
+      "count": 1096,
+      "averageMs": 1.5556670045620429,
+      "p50BucketMs": 2.5,
+      "p95BucketMs": 2.5,
+      "p99BucketMs": 5
+    },
+    "publish_prepare": {
+      "count": 1096,
+      "averageMs": 0.5909941760948902,
+      "p50BucketMs": 1,
+      "p95BucketMs": 1,
+      "p99BucketMs": 2.5
+    }
+  },
+  "databaseAcquireDurations": {
+    "api": {
+      "success": {
+        "count": 142100,
+        "averageMs": 0.042687117255536616,
+        "p50BucketMs": 0.01,
+        "p95BucketMs": 0.01,
+        "p99BucketMs": 0.5
+      }
+    },
+    "outbox": {
+      "success": {
+        "count": 3289,
+        "averageMs": 0.007479652477956879,
+        "p50BucketMs": 0.01,
+        "p95BucketMs": 0.01,
+        "p99BucketMs": 0.025
+      }
+    }
+  },
+  "metricSampling": {
+    "interval": "250ms",
+    "samples": 87,
+    "errors": 0,
+    "peaks": {
+      "im_backend_outbox_oldest_pending_age_seconds": 0.527155,
+      "im_backend_outbox_pending_events": 1815
+    }
+  }
+}
