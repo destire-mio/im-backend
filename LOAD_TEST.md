@@ -543,3 +543,28 @@ Realtime 和 Sync 在压测器的 30 秒窗口与单次核验时分别缺少 133
 报告：
 
 - `benchmarks/reports/loadtest-rate-5000-db-acquire-r1.json`
+
+## `sync_events` 默认下的 5000 req/s 复核
+
+切换默认存储后，重启 PostgreSQL/Redis，使用全新隔离库和空 Redis DB，不设置 `OUTBOX_PROJECTION_STORAGE`。其余固定为 Pool 24、Batch 64、publish 并发 16、pipeline + bulk + 批内 Presence、10 个用户、20 条 WebSocket、100000 条消息、5000 req/s、max-inflight 1000 和 30 秒投递等待。运行指标确认 `sync_events=1 / recipients=0`。
+
+该轮必须判为失败：HTTP 完成 `99190/100000`，810 个计划开始因 1000 个 in-flight 槽已满而未启动；实际成功吞吐为 `4943.6 req/s`，HTTP P95/P99 为 `212.39/225.32ms`。30 秒窗口结束时 Realtime 为 `90884/396760`，Sync 为 `45492/198380`，pending 为 76405；过程 pending/oldest 峰值为 `79891/45.861s`。duplicate、unexpected 和 dead 仍为 0。
+
+| 负载窗口内指标 | 5000 req/s |
+| --- | ---: |
+| API acquisition 平均 / P95 | 42.62 / 250 ms |
+| Outbox acquisition 平均 / P95 | 16.38 / 100 ms |
+| `claim` 平均 | 19.89 ms |
+| `prepare` 平均 | 119.56 ms |
+| `prepare_store` 平均 | 95.23 ms |
+| `prepare_project_users` 平均 | 5.32 ms |
+| `publish` 平均 | 1.78 ms |
+| `mark_published` 平均 | 27.96 ms |
+
+`prepare_store` 在当前 `sync_events` 路径里只是按 event/lease 批量更新 `outbox_events.ready_at`；它的计时在获得连接并开启事务之后，不包含 Pool acquisition。因此该轮同时观察到两层 PostgreSQL 压力：API/Worker 等待共享连接，以及拿到连接后 Outbox ready 更新出现极长写入延迟。`publish` 仍只有 1.78ms，所以不是 Redis、Presence 或 Channel 发布阶段。本轮没有采集 WAL、I/O、锁等待和 autovacuum 分解，不能再把 95.23ms 进一步归因为某一种底层资源。
+
+压测器结束核验、API 流量停止后，Worker 又用 10 秒将积压全部排空。最终直接查库为 99190 条 message、198380 条 `user_message_events`、0 条 `outbox_recipients`、99190 个 published Outbox，pending/dead 为 `0/0`。这仍是“目标速率与时间窗口失败”，不是“已成功写入的消息最终丢失”。由于本轮与较早 recipients 5000 轮次不是受控 A/B，不用两者的成功数差异声称吞吐提升。
+
+报告：
+
+- `benchmarks/reports/loadtest-rate-5000-sync-events-default-r1.json`

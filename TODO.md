@@ -7,6 +7,7 @@
 - [x] 在 3500 req/s 稳定负载上按 `recipients A1 → sync_events B1 → sync_events B2 → recipients A2` 使用四个新鲜隔离库运行；每轮重启 PostgreSQL/Redis，四轮 HTTP、Realtime、Sync 都完整。
 - [x] 直接目标指标方向一致：`prepare_store` 两轮中点从 `4.83ms` 降到 `1.81ms`（-62.4%），准备 Lane 从 `13.71ms` 降到 `11.14ms`（-18.7%）；每轮 140000 条重复 recipient 写入降为 0。Realtime/pending 峰值未同步改善，因此不宣称容量提升。
 - [x] 将 `sync_events` 切为默认，保留 `OUTBOX_PROJECTION_STORAGE=recipients` 回退开关。全量测试、race、vet 通过；不显式设置存储开关的 1000 条真实链路 smoke 完成 HTTP 1000/1000、Realtime 4000/4000、Sync 2000/2000，且 `outbox_recipients=0`、pending/dead 为 0。
+- [x] 用当前默认 `sync_events` 在新鲜隔离状态复核 5000 req/s：HTTP 99190/100000，Realtime/Sync 未在 30 秒窗口内完整，pending/oldest 峰值 `79891/45.861s`；API/Outbox acquisition P95 为 `250/100ms`，`prepare_store` 平均 95.23ms，`publish` 平均 1.78ms。Worker 在流量停止后 10 秒排空，最终数据完整。
 - [ ] 切换默认后先保留 `outbox_recipients` 回退窗口；只有确认没有旧版 Worker 且已 ready 事件全部排空后，才用独立迁移删表。
 
 ## 下一容量升档：区分 Pool 等待与事务执行
@@ -26,6 +27,7 @@
   - [x] 按用户要求跳过 3200，使用新鲜隔离状态运行一轮 3500 req/s；70000/70000 HTTP、280000/280000 Realtime、140000/140000 Sync 完整，dropped/missing/dead 为 0。
   - [x] 使用新鲜隔离状态运行一轮 4000 req/s；80000/80000 HTTP、320000/320000 Realtime、160000/160000 Sync 完整，但 API/Outbox acquisition P95 已升到 `25/1ms`，准备 Lane 约 `15.30ms`，接近 `16ms` 预算。
   - [x] 使用新鲜隔离状态运行 5000 req/s；仅 97664/100000 HTTP 成功，Realtime/Sync 未在核验窗口内完整，pending/oldest 峰值达到 `83072/36.738s`，首次明确越界；最终数据库计数完整且 pending/dead 为 0，不是持久化丢失。
+  - [x] 切换默认 `sync_events` 后重复 5000 req/s 仍明确失败；去掉重复 recipient 写入未使该档达标，也不足以从非受控轮次声称容量提升。
   - [ ] 在 4000～5000 区间内使用新鲜状态复测，找到第一个可重复失败档；单轮 4000 通过不能当作稳定容量上限。
   - [ ] 同时比较 API/Outbox acquisition、`prepare_store`、`prepare_project_users`、HTTP、Realtime 和 pending/oldest，不能从一个平均阶段直接猜原因。
 
