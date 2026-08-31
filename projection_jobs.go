@@ -478,13 +478,16 @@ func (pool *messageProjectionPool) completeJobsAndReadyEvents(
 		eventIDs = append(eventIDs, eventID)
 	}
 	sort.Strings(eventIDs)
+	// Cast each input value to UUID instead of casting the indexed event_id
+	// column to text. The latter scans the entire primary-key index per batch.
 	rows, err := tx.Query(
 		ctx,
-		`SELECT event_id::text
-		 FROM outbox_events
-		 WHERE event_id::text = ANY($1::text[])
-		 ORDER BY event_id
-		 FOR UPDATE`,
+		`SELECT event.event_id::text
+		 FROM unnest($1::text[]) AS requested(event_id)
+		 JOIN outbox_events AS event
+		   ON event.event_id = requested.event_id::uuid
+		 ORDER BY event.event_id
+		 FOR UPDATE OF event`,
 		eventIDs,
 	)
 	if err != nil {
@@ -507,7 +510,8 @@ func (pool *messageProjectionPool) completeJobsAndReadyEvents(
 		ctx,
 		`UPDATE outbox_events AS event
 		 SET ready_at = CURRENT_TIMESTAMP
-		 WHERE event.event_id::text = ANY($1::text[])
+		 FROM unnest($1::text[]) AS requested(event_id)
+		 WHERE event.event_id = requested.event_id::uuid
 		   AND event.event_type = 'message.created'
 		   AND event.ready_at IS NULL
 		   AND event.published_at IS NULL
@@ -535,7 +539,8 @@ func (pool *messageProjectionPool) completeJobsAndReadyEvents(
 	_, err = tx.Exec(
 		ctx,
 		`DELETE FROM message_projection_jobs AS job
-		 WHERE job.event_id::text = ANY($1::text[])
+		 USING unnest($1::text[]) AS requested(event_id)
+		 WHERE job.event_id = requested.event_id::uuid
 		   AND EXISTS (
 		     SELECT 1
 		     FROM outbox_events AS event
