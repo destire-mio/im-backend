@@ -7,14 +7,15 @@
 → 正常 Login 创建 Session
 → 建立 WebSocket
 → POST /messages
-→ PostgreSQL message + pending Outbox（HTTP 在这里即可返回）
-→ Outbox Worker 按用户批量分配连续 seq
-→ user_message_events + Outbox ready 原子提交
+→ PostgreSQL conversation_seq + message + ready v4 Outbox 原子提交
+→ Outbox Worker claim；v4 prepare 不再写用户级 Sync 投影
 → Hub / Channel / WebSocket
-→ Sync API 持久性核验
+→ 扫描会话列表并逐会话调用 Sync API 做持久性核验
 ```
 
-实时链路诊断同时记录每条连接的 `send Channel` 深度、历史最高水位和 WebSocket 写耗时。压测客户端的收件跟踪表按消息 ID 分成 64 个锁分片，避免多个 WebSocket reader 因一把全局锁被误判为服务端慢连接。
+实时链路诊断同时记录每条连接的 `send Channel` 深度、历史最高水位和 WebSocket 写耗时。压测客户端还会验证 WebSocket 外层和消息内层的 `conversationId/conversationSeq` 一致。收件跟踪表按消息 ID 分成 64 个锁分片，避免多个 WebSocket reader 因一把全局锁被误判为服务端慢连接。
+
+> `benchmarks/reports/` 中原有 3000～5000 req/s 报告均生成于 v3 用户级 cursor 投影模型。以下保留的历史 A/B 结论用于解释改造动机，不是 v4 当前容量；v4 的新鲜隔离库容量阶梯见“当前 v4 容量证据”。
 
 ## 它会写入什么
 
@@ -65,7 +66,7 @@ go run ./cmd/im-loadtest \
 
 - `HTTP`：数据库写入请求的成功数、吞吐量和 P50/P95/P99 耗时。
 - `Realtime`：每条成功消息是否到达发送方和接收方的每个 WebSocket，以及实时到达延迟。
-- `Sync durability`：即使实时通知缺失，成功写入的消息是否仍能被发送方和接收方从 Sync API 找回。
+- `Sync durability`：即使实时通知缺失，成功写入的消息是否仍能被发送方和接收方通过“会话列表 → 各会话消息补拉”找回。
 
 结果的含义不要混在一起：
 
@@ -98,9 +99,12 @@ go run ./cmd/im-loadtest \
   -messages 10000 \
   -rate 500 \
   -concurrency 100 \
+  -traffic-pattern ring \
   -delivery-wait 30s \
   -report ./loadtest-report-rate-500.json
 ```
+
+`-traffic-pattern ring` 是默认值：第 `i` 个用户发给下一个用户，10 个用户形成 10 条会话，用于观察总写入容量。`-traffic-pattern hot` 让所有消息在前两个用户之间双向发送，只产生一条会话，用于单独放大 `conversation_seq` 热点；报告会保存实际 pattern，两个模式的结果不能混为同一种负载。
 
 压测器会把 HTTP 连接池的 `MaxIdleConns`、`MaxIdleConnsPerHost` 和 `MaxConnsPerHost` 设为 `-concurrency`，使连接在固定速率测试中复用。否则 Go 默认每个目标只保留 2 个空闲连接，高并发下会制造大量短连接，并可能以 `can't assign requested address` 先耗尽压测机临时端口；这种失败属于压测器瓶颈，不能算作服务端容量。
 
@@ -113,16 +117,41 @@ go run ./cmd/im-loadtest \
 
 测容量时必须同时观察成功率、P95/P99、`droppedStarts`、Realtime 延迟、Outbox 堆积与数据库连接池等待。只看吞吐量会上报一个看似更高、但已经积压或丢弃计划请求的数字。
 
+## 当前 v4 容量证据
+
+2026-08-31 在每轮全新 PostgreSQL 数据库和隔离 Redis DB 上使用 API Pool 24、Outbox Batch 64、publish 并发 16、pipeline 模式运行 20 秒固定速率。每条成功消息都验证发送方与接收方各 2 个设备的 Realtime 投递，以及双方的会话 Sync；下列各轮已提交消息均为零 missing、duplicate、unexpected、dead，结束时 Outbox pending 为 0。
+
+`ring` 使用 10 个用户、20 条 WebSocket 和 10 条会话。3000 req/s 的逐步 A/B 为：
+
+| 实现 | HTTP | HTTP P95 | Realtime P95 | Outbox pending 峰值 | API acquire 平均 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 初始 v4 | 54552/60000 | 409.77ms | 17.35s | 47448 | 166.48ms | FAIL，5448 个计划请求未启动 |
+| 既有会话只读快路径 | 58405/60000 | 393.04ms | 7.29s | 21057 | 61.51ms | FAIL，但争用明显下降 |
+| 快路径 + 单 SQL 临界区，共享 Pool | 60000/60000 | 16.73ms | 486.66ms | 1512 | 0.53ms | PASS |
+| 同上，独立 Outbox Pool 8（总连接 32） | 60000/60000 | 119.78ms | 537.10ms | 1715 | 10.81ms | PASS，但 HTTP 延迟回归 |
+
+这里的决定性变化是把 `conversation_seq` 分配、消息插入、v4 Outbox JSON 构造与插入合并为一条 data-modifying CTE；既有会话不再每条消息都执行冲突写和重复 membership 写。并发幂等冲突会回滚整条语句和临时序号，因此没有用正确性换吞吐。
+
+`hot` 使用 2 个用户、4 条 WebSocket 和 1 条会话；每条消息的 Realtime fan-out 仍是 4。2000 req/s 的结果为：
+
+| 实现 | HTTP | HTTP P95 | Realtime P95 | Outbox pending 峰值 | API acquire 平均 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 初始 v4 | 26803/40000 | 900.51ms | 17.78s | 23198 | 354.82ms | FAIL，13197 个计划请求未启动 |
+| 快路径 + 单 SQL 临界区，共享 Pool | 34806/40000 | 642.60ms | 17.48s | 29987 | 260.97ms | FAIL，写入提高但实时仍被共享 Pool 饿死 |
+| 同上，独立 Outbox Pool 8 | 32735/40000 | 713.87ms | 1.13s | 843 | 282.90ms | HTTP 仍 FAIL；Realtime 被隔离保护 |
+
+因此默认 `OUTBOX_DATABASE_MAX_CONNECTIONS=0`，API 与 Outbox 继续共用 Pool。设置正数会启用独立 Outbox Pool，只适合把“过载时实时链路不被 API 饿死”作为明确目标，并把两池总连接预算纳入 A/B；它不是写入扩容开关。当前本机证据把 `ring` 通过点恢复到 3000 req/s，但单会话 `hot` 2000 仍失败：严格连续 `conversation_seq` 使同一会话保持单行串行化。以上均是单机、短时结果，不是生产容量承诺。
+
 ## 当前测试边界
 
-- 这是第一个单实例基线，不是容量上限。
-- 它检查结果是否到达，但还没有注入 Redis 断联、Worker 崩溃、慢 WebSocket 或多实例故障。
+- 当前阶梯是单实例、20 秒本机测试，不是生产容量上限，也没有覆盖长稳、CPU/磁盘隔离或跨机网络。
+- 压测脚本本身没有注入 Redis 断联、Worker 崩溃或慢 WebSocket。独立进程集成测试已覆盖跨 Redis Pub/Sub 投递、双实例 200 条并发突发，以及一个实例被杀后通过会话 Sync 恢复；这些是正确性证据，不是多实例容量证据。
 - Login 仍经过生产限流链路。默认 20 次 Login 低于当前每 IP 30 次/分钟的上限；如果同一 Redis 近期已有 Login 请求，工具会显示 `Retry-After` 并停止，不会绕过限流。
-- 脚本不发送 ACK：它只能证明 Sync API 返回数据，不能伪装真实手机已将数据落盘。ACK 需要在真实客户端或单独的客户端持久化故障实验中验证。
+- 脚本不发送按会话 ACK：它只能证明 Sync API 返回数据，不能伪装真实手机已将数据落盘。ACK 需要在真实客户端或单独的客户端持久化故障实验中验证。
 
 ## Outbox 并发 A/B
 
-服务端支持通过 `DATABASE_MAX_CONNECTIONS`、`OUTBOX_CONCURRENCY`、`OUTBOX_BATCH_SIZE`、`OUTBOX_PROJECTION_MODE` 和 `OUTBOX_PROJECTION_STORAGE` 设置连接池、推送并发、单次投影批量、投影 SQL 与投影结果存储。A/B 时一次只改一个参数：
+服务端支持通过 `DATABASE_MAX_CONNECTIONS`、`OUTBOX_CONCURRENCY` 和 `OUTBOX_BATCH_SIZE` 设置连接池、推送并发与单次 claim 批量。`OUTBOX_PROJECTION_MODE`、`OUTBOX_PROJECTION_STORAGE` 和 `OUTBOX_PREPARE_MODE=user_sharded` 现在只用于迁移前 v3 事件的排空/回退验证；v4 新消息不会进入这些用户级投影路径。A/B 时一次只改一个参数：
 
 ```text
 对照组：DATABASE_MAX_CONNECTIONS=24 OUTBOX_CONCURRENCY=8

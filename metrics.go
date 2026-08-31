@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -67,7 +68,7 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		databaseAcquireDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "im_backend",
 			Name:      "database_pool_acquire_duration_seconds",
-			Help:      "Client-observed duration of acquiring a shared database pool connection by bounded workload and result.",
+			Help:      "Client-observed duration of acquiring a database pool connection by bounded workload and result.",
 			Buckets:   []float64{0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		}, []string{"workload", "result"}),
 		outboxPublish: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -263,6 +264,13 @@ func (metrics *applicationMetrics) registerDatabaseCollectors(db *pgxpool.Pool) 
 		return
 	}
 	metrics.registry.MustRegister(newDatabaseStateCollector(db), newDatabasePoolCollector(db))
+}
+
+func (metrics *applicationMetrics) registerOutboxDatabasePoolCollector(db *pgxpool.Pool) {
+	if metrics == nil || db == nil {
+		return
+	}
+	metrics.registry.MustRegister(newOutboxDatabasePoolCollector(db))
 }
 
 func (metrics *applicationMetrics) ObserveWebSocketQueueDepth(depth int) {
@@ -465,47 +473,55 @@ type databasePoolCollector struct {
 }
 
 func newDatabasePoolCollector(pool *pgxpool.Pool) *databasePoolCollector {
+	return newNamedDatabasePoolCollector(pool, "im_backend_database_pool", "API application")
+}
+
+func newOutboxDatabasePoolCollector(pool *pgxpool.Pool) *databasePoolCollector {
+	return newNamedDatabasePoolCollector(pool, "im_backend_outbox_database_pool", "isolated Outbox")
+}
+
+func newNamedDatabasePoolCollector(pool *pgxpool.Pool, metricPrefix, poolDescription string) *databasePoolCollector {
 	return &databasePoolCollector{
 		pool: pool,
 		acquiredConnections: prometheus.NewDesc(
-			"im_backend_database_pool_acquired_connections",
-			"Database connections currently checked out from the application pool.", nil, nil,
+			metricPrefix+"_acquired_connections",
+			fmt.Sprintf("Database connections currently checked out from the %s pool.", poolDescription), nil, nil,
 		),
 		idleConnections: prometheus.NewDesc(
-			"im_backend_database_pool_idle_connections",
-			"Database connections currently idle in the application pool.", nil, nil,
+			metricPrefix+"_idle_connections",
+			fmt.Sprintf("Database connections currently idle in the %s pool.", poolDescription), nil, nil,
 		),
 		constructingConnections: prometheus.NewDesc(
-			"im_backend_database_pool_constructing_connections",
-			"Database connections currently being constructed by the application pool.", nil, nil,
+			metricPrefix+"_constructing_connections",
+			fmt.Sprintf("Database connections currently being constructed by the %s pool.", poolDescription), nil, nil,
 		),
 		totalConnections: prometheus.NewDesc(
-			"im_backend_database_pool_total_connections",
-			"Database connections currently present in the application pool.", nil, nil,
+			metricPrefix+"_total_connections",
+			fmt.Sprintf("Database connections currently present in the %s pool.", poolDescription), nil, nil,
 		),
 		maximumConnections: prometheus.NewDesc(
-			"im_backend_database_pool_max_connections",
-			"Configured maximum number of database connections in the application pool.", nil, nil,
+			metricPrefix+"_max_connections",
+			fmt.Sprintf("Configured maximum number of database connections in the %s pool.", poolDescription), nil, nil,
 		),
 		acquires: prometheus.NewDesc(
-			"im_backend_database_pool_acquires_total",
-			"Successful database connection acquisitions from the application pool.", nil, nil,
+			metricPrefix+"_acquires_total",
+			fmt.Sprintf("Successful database connection acquisitions from the %s pool.", poolDescription), nil, nil,
 		),
 		emptyAcquires: prometheus.NewDesc(
-			"im_backend_database_pool_empty_acquires_total",
-			"Successful acquisitions that had to wait because the application pool was empty.", nil, nil,
+			metricPrefix+"_empty_acquires_total",
+			fmt.Sprintf("Successful acquisitions that had to wait because the %s pool was empty.", poolDescription), nil, nil,
 		),
 		canceledAcquires: prometheus.NewDesc(
-			"im_backend_database_pool_canceled_acquires_total",
-			"Database connection acquisitions canceled while waiting.", nil, nil,
+			metricPrefix+"_canceled_acquires_total",
+			fmt.Sprintf("Database connection acquisitions canceled while waiting for the %s pool.", poolDescription), nil, nil,
 		),
 		acquireDuration: prometheus.NewDesc(
-			"im_backend_database_pool_acquire_duration_seconds_total",
-			"Cumulative duration of successful database connection acquisitions.", nil, nil,
+			metricPrefix+"_acquire_duration_seconds_total",
+			fmt.Sprintf("Cumulative duration of successful database connection acquisitions from the %s pool.", poolDescription), nil, nil,
 		),
 		emptyAcquireWait: prometheus.NewDesc(
-			"im_backend_database_pool_empty_acquire_wait_seconds_total",
-			"Cumulative time spent waiting because the application pool was empty.", nil, nil,
+			metricPrefix+"_empty_acquire_wait_seconds_total",
+			fmt.Sprintf("Cumulative time spent waiting because the %s pool was empty.", poolDescription), nil, nil,
 		),
 	}
 }
@@ -570,11 +586,11 @@ func newDatabaseStateCollector(db *pgxpool.Pool) *databaseStateCollector {
 		),
 		ackDevices: prometheus.NewDesc(
 			"im_backend_device_sync_states",
-			"Number of devices with a recorded ACK state.", nil, nil,
+			"Number of device and conversation pairs with a recorded ACK state.", nil, nil,
 		),
 		ackMaxLag: prometheus.NewDesc(
 			"im_backend_device_sync_max_ack_lag",
-			"Maximum difference between the user stream cursor and a recorded device ACK.", nil, nil,
+			"Maximum difference between a conversation cursor and a recorded device ACK.", nil, nil,
 		),
 	}
 }
@@ -626,9 +642,9 @@ func (collector *databaseStateCollector) Collect(destination chan<- prometheus.M
 	err = collector.db.QueryRow(
 		ctx,
 		`SELECT count(*)::double precision,
-		        COALESCE(max(GREATEST(COALESCE(counter.last_seq, 0) - state.applied_seq, 0)), 0)::double precision
-		 FROM device_sync_states AS state
-		 LEFT JOIN user_sync_counters AS counter ON counter.user_id = state.user_id`,
+		        COALESCE(max(GREATEST(conversation.last_seq - state.applied_seq, 0)), 0)::double precision
+		 FROM device_conversation_sync_states AS state
+		 JOIN conversations AS conversation ON conversation.id = state.conversation_id`,
 	).Scan(&devices, &maxLag)
 	if err != nil {
 		destination <- prometheus.MustNewConstMetric(collector.collectionSuccess, prometheus.GaugeValue, 0)

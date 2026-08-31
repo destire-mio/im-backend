@@ -86,8 +86,50 @@ CREATE TABLE refresh_idempotency_results (
     CONSTRAINT refresh_idempotency_expiry_valid CHECK (expires_at > created_at)
 );
 
+CREATE TABLE conversations (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'direct',
+    direct_user_low_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    direct_user_high_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    last_seq BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT conversations_kind_valid CHECK (kind IN ('direct', 'group')),
+    CONSTRAINT conversations_last_seq_valid CHECK (last_seq >= 0),
+    CONSTRAINT conversations_updated_at_valid CHECK (updated_at >= created_at),
+    CONSTRAINT conversations_direct_pair_valid CHECK (
+        (
+            kind = 'direct'
+            AND direct_user_low_id IS NOT NULL
+            AND direct_user_high_id IS NOT NULL
+            AND direct_user_low_id <= direct_user_high_id
+        )
+        OR (
+            kind = 'group'
+            AND direct_user_low_id IS NULL
+            AND direct_user_high_id IS NULL
+        )
+    ),
+    CONSTRAINT conversations_direct_pair_unique UNIQUE (
+        direct_user_low_id,
+        direct_user_high_id
+    )
+);
+
+CREATE TABLE conversation_members (
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (conversation_id, user_id)
+);
+
+CREATE INDEX conversation_members_user_conversation_idx
+    ON conversation_members (user_id, conversation_id);
+
 CREATE TABLE messages (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id),
+    conversation_seq BIGINT NOT NULL,
     sender_id BIGINT NOT NULL REFERENCES users(id),
     receiver_id BIGINT NOT NULL REFERENCES users(id),
     client_message_id TEXT NOT NULL,
@@ -99,8 +141,19 @@ CREATE TABLE messages (
     CONSTRAINT messages_content_length_valid CHECK (
         char_length(content) BETWEEN 1 AND 4000
     ),
+    CONSTRAINT messages_conversation_seq_valid CHECK (conversation_seq > 0),
+    CONSTRAINT messages_conversation_seq_unique UNIQUE (conversation_id, conversation_seq),
     CONSTRAINT messages_sender_client_id_unique UNIQUE (sender_id, client_message_id)
 );
+
+CREATE INDEX messages_direction_history_idx
+    ON messages (sender_id, receiver_id, created_at DESC, id DESC);
+
+CREATE STATISTICS messages_sender_receiver_stats (dependencies, mcv)
+    ON sender_id, receiver_id
+    FROM messages;
+
+ALTER STATISTICS messages_sender_receiver_stats SET STATISTICS 1000;
 
 CREATE TABLE user_sync_counters (
     user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -131,6 +184,26 @@ CREATE TABLE device_sync_states (
         char_length(device_id) BETWEEN 1 AND 128
     ),
     CONSTRAINT device_sync_states_applied_seq_valid CHECK (applied_seq >= 0)
+);
+
+-- Legacy device_sync_states remains during the expand/contract rollout so an
+-- old binary can drain version-3 Outbox events. New clients ACK per
+-- conversation in this table.
+CREATE TABLE device_conversation_sync_states (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    conversation_id BIGINT NOT NULL,
+    applied_seq BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, device_id, conversation_id),
+    CONSTRAINT device_conversation_sync_states_membership_fk
+        FOREIGN KEY (conversation_id, user_id)
+        REFERENCES conversation_members(conversation_id, user_id)
+        ON DELETE CASCADE,
+    CONSTRAINT device_conversation_sync_states_device_id_valid CHECK (
+        char_length(device_id) BETWEEN 1 AND 128
+    ),
+    CONSTRAINT device_conversation_sync_states_applied_seq_valid CHECK (applied_seq >= 0)
 );
 
 CREATE TABLE outbox_events (

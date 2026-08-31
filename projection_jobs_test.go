@@ -4,11 +4,56 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestUserShardedCompatibilityModePublishesVersionFourWithoutProjectionJobs(t *testing.T) {
+	db := openTestDatabase(t)
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	sender := registerTestAccount(t, db, server.URL, uniqueUsername("v4_shard_s"), "V4 Sender")
+	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("v4_shard_r"), "V4 Receiver")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "skip legacy projection")
+
+	config := defaultOutboxWorkerConfig()
+	config.BatchSize = 1
+	config.PrepareMode = outboxPrepareModeUserSharded
+	config.PrepareWorkers = 4
+	pool, err := newMessageProjectionPool(db, config, nil)
+	if err != nil {
+		t.Fatalf("create projection pool: %v", err)
+	}
+	if dispatched, err := pool.dispatchJobs(context.Background(), 10); err != nil || dispatched != 0 {
+		t.Fatalf("version-4 projection dispatch = %d, err %v, want 0", dispatched, err)
+	}
+
+	publisher := &testPublisher{}
+	worker := mustMessageTestWorker(t, db, publisher, config)
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || processed != 1 {
+		t.Fatalf("version-4 user-sharded publish = %d, err %v", processed, err)
+	}
+	if received := publisher.received(); len(received) != 1 || received[0].PayloadVersion != 4 {
+		t.Fatalf("published version-4 events = %+v", received)
+	}
+
+	var jobs, syncEvents int
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT (SELECT count(*) FROM message_projection_jobs WHERE message_id = $1),
+		        (SELECT count(*) FROM user_message_events WHERE message_id = $1)`,
+		created.ID,
+	).Scan(&jobs, &syncEvents); err != nil {
+		t.Fatalf("read version-4 projection state: %v", err)
+	}
+	if jobs != 0 || syncEvents != 0 {
+		t.Fatalf("version-4 projection state jobs=%d sync=%d, want 0/0", jobs, syncEvents)
+	}
+}
 
 func TestUserShardedProjectionRequiresAllUsersBeforeDelivery(t *testing.T) {
 	db := openTestDatabase(t)
@@ -392,17 +437,79 @@ func createProjectionTestMessage(
 	receiverID int64,
 ) (message, string) {
 	t.Helper()
-	var created message
-	if err := db.QueryRow(
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin projection test message: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+	lowUserID, highUserID := senderID, receiverID
+	if lowUserID > highUserID {
+		lowUserID, highUserID = highUserID, lowUserID
+	}
+	var conversationID int64
+	if err := tx.QueryRow(
 		context.Background(),
-		`INSERT INTO messages (sender_id, receiver_id, client_message_id, content)
-		 VALUES ($1, $2, $3, 'projection test')
-		 RETURNING id, client_message_id, sender_id, receiver_id, content, created_at`,
+		`INSERT INTO conversations (kind, direct_user_low_id, direct_user_high_id)
+		 VALUES ('direct', $1, $2)
+		 ON CONFLICT (direct_user_low_id, direct_user_high_id) DO UPDATE
+		 SET kind = EXCLUDED.kind
+		 RETURNING id`,
+		lowUserID,
+		highUserID,
+	).Scan(&conversationID); err != nil {
+		t.Fatalf("create projection test conversation: %v", err)
+	}
+	if _, err := tx.Exec(
+		context.Background(),
+		`INSERT INTO conversation_members (conversation_id, user_id)
+		 SELECT $1, user_id
+		 FROM (
+		     SELECT DISTINCT user_id
+		     FROM unnest($2::bigint[]) AS users(user_id)
+		 ) AS participant
+		 ON CONFLICT DO NOTHING`,
+		conversationID,
+		[]int64{senderID, receiverID},
+	); err != nil {
+		t.Fatalf("create projection test members: %v", err)
+	}
+	var created message
+	if err := tx.QueryRow(
+		context.Background(),
+		`WITH allocated AS (
+		   UPDATE conversations
+		   SET last_seq = last_seq + 1,
+		       updated_at = GREATEST(updated_at, clock_timestamp())
+		   WHERE id = $1
+		   RETURNING last_seq, updated_at
+		 )
+		 INSERT INTO messages (
+		     conversation_id,
+		     conversation_seq,
+		     sender_id,
+		     receiver_id,
+		     client_message_id,
+		     content,
+		     created_at
+		 )
+		 SELECT $1, allocated.last_seq, $2, $3, $4, 'projection test', allocated.updated_at
+		 FROM allocated
+		 RETURNING id,
+		           conversation_id,
+		           conversation_seq,
+		           client_message_id,
+		           sender_id,
+		           receiver_id,
+		           content,
+		           created_at`,
+		conversationID,
 		senderID,
 		receiverID,
 		uniqueOpaqueID("projection-message"),
 	).Scan(
 		&created.ID,
+		&created.ConversationID,
+		&created.ConversationSeq,
 		&created.ClientMessageID,
 		&created.SenderID,
 		&created.ReceiverID,
@@ -416,7 +523,7 @@ func createProjectionTestMessage(
 		t.Fatalf("encode projection test payload: %v", err)
 	}
 	var eventID string
-	if err := db.QueryRow(
+	if err := tx.QueryRow(
 		context.Background(),
 		`INSERT INTO outbox_events (event_type, payload_version, message_id, payload)
 		 VALUES ('message.created', 3, $1, $2::jsonb)
@@ -425,6 +532,9 @@ func createProjectionTestMessage(
 		payload,
 	).Scan(&eventID); err != nil {
 		t.Fatalf("create projection test Outbox event: %v", err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit projection test message: %v", err)
 	}
 	return created, eventID
 }

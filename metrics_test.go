@@ -60,6 +60,31 @@ func TestDatabaseAcquireTracerPartitionsAPIAndOutboxWait(t *testing.T) {
 	}
 }
 
+func TestMetricsExposeIsolatedOutboxDatabasePool(t *testing.T) {
+	config, err := databasePoolConfig(defaultDatabaseURL, "8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	metrics := newApplicationMetrics(nil)
+	metrics.registerOutboxDatabasePoolCollector(pool)
+	exposition := scrapeMetrics(t, metrics)
+	for _, expected := range []string{
+		"im_backend_outbox_database_pool_max_connections 8",
+		"im_backend_outbox_database_pool_acquired_connections 0",
+		"im_backend_outbox_database_pool_acquires_total 0",
+	} {
+		if !strings.Contains(exposition, expected) {
+			t.Fatalf("metrics exposition missing %q\n%s", expected, exposition)
+		}
+	}
+}
+
 func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	db := openTestDatabase(t)
 	app := newTestApplication(t, db)
@@ -73,10 +98,24 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("metrics_s"), "Metrics Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("metrics_r"), "Metrics Receiver")
 
-	createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "observable message")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "observable message")
 	projectPendingMessageEvents(t, db, app.metrics)
-	page := syncMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 0, 10)
-	acknowledgeMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, page.NextCursor, http.StatusOK)
+	page := syncConversationMessagesThroughAPI(
+		t,
+		server.URL,
+		receiver.Auth.AccessToken,
+		created.ConversationID,
+		0,
+		10,
+	)
+	acknowledgeConversationThroughAPI(
+		t,
+		server.URL,
+		receiver.Auth.AccessToken,
+		created.ConversationID,
+		page.NextCursor,
+		http.StatusOK,
+	)
 
 	exposition := scrapeMetrics(t, app.metrics)
 	for _, expected := range []string{
@@ -97,9 +136,9 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 		"im_backend_outbox_projection_bulk_enabled 1",
 		"im_backend_outbox_projection_recipients_enabled 0",
 		"im_backend_outbox_projection_sync_events_enabled 1",
-		"im_backend_outbox_projection_batches_total 1",
-		"im_backend_outbox_projection_users_total 2",
-		"im_backend_outbox_projection_query_duration_seconds_count 3",
+		"im_backend_outbox_projection_batches_total 0",
+		"im_backend_outbox_projection_users_total 0",
+		"im_backend_outbox_projection_query_duration_seconds_count 0",
 		"im_backend_http_requests_total",
 		`route="POST /messages"`,
 		`status="201"`,

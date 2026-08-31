@@ -232,7 +232,7 @@ func (projector *messageSyncProjector) prepareStructuredBatch(
 	decodeStarted := time.Now()
 	projections := make([]pendingProjection, 0, len(events))
 	for _, event := range events {
-		if event.EventType != "message.created" {
+		if event.EventType != "message.created" || event.PayloadVersion == 4 {
 			continue
 		}
 		projectedMessage, err := decodeProjectionMessage(event)

@@ -1,5 +1,25 @@
 # TODO
 
+## Conversation-scoped Sync 主链路
+
+- [x] 增加 `conversations`、`conversation_members`、`messages.conversation_id` 与会话内连续 `conversation_seq`；单聊使用规范化用户对保证双向消息落在同一会话。
+- [x] `POST /messages` 在一个事务内完成会话解析、序号分配、消息写入和 ready 的 v4 Outbox；并发幂等冲突回滚临时序号，不留下 cursor 空洞。
+- [x] 增加会话列表快照分页、逐会话消息快照分页和按设备/会话单调 ACK；旧 `/messages/sync` 与 `/messages/ack` 返回 `410 Gone`，避免静默漏掉 v4 消息。
+- [x] WebSocket v4 同时携带 `conversationId` / `conversationSeq`；inline 和 user-sharded 兼容投影都跳过 v4，v3 仍可排空。
+- [x] `015` 已在旧 schema 副本上真实验证：双向消息回填到同一会话、序号连续、自发自收只生成一个成员、未发布 v1/v2/v3 payload 补齐会话 cursor。
+- [x] 新 Worker 已在该迁移副本上真实排空 v1/v2/v3 混合 backlog：三种版本全部 ready/published、dead=0，v3 仍正确补齐旧用户 Sync 行。
+- [x] 独立库真实链路 smoke 完成 100/100 HTTP、200/200 Realtime、200/200 会话 Sync，missing/duplicate/unexpected 为 0；这只证明链路正确，不是容量结论。
+- [x] 使用新鲜隔离数据库/Redis 建立首轮 v4 容量阶梯：`ring` 2500 req/s 通过、3000 失败；`hot` 1000 通过、2000 失败。所有已提交消息的 Realtime/Sync 正确性完整，失败点由 dropped starts、连接池等待和 Outbox 峰值判定。
+- [x] 增加双进程真实边界测试：跨 Redis Pub/Sub 投递、双实例 200 条并发突发，以及一个实例被杀后通过会话 Sync 恢复。
+- [x] 针对 3000 `ring` 与 2000 `hot` 拆分发送事务和 Pool 贡献：既有会话跳过冲突写；序号、消息和 ready Outbox 合并为一条 SQL。`ring` 3000 从 54552/60000 恢复到 60000/60000，HTTP P95 从 409.77ms 降到 16.73ms。
+- [x] 完成独立 Outbox Pool 诊断轮：`hot` 2000 的 Realtime P95 从 17.48s 降到 1.13s、pending 峰值从 29987 降到 843，但 HTTP 只完成 32735/40000；`ring` 3000 HTTP P95 回升到 119.78ms。结论是隔离能保护实时链路但不是写入扩容，默认保持共享；`OUTBOX_DATABASE_MAX_CONNECTIONS>0` 仅作为显式隔离开关。
+- [ ] 单会话 `hot` 2000 仍受严格连续 `conversation_seq` 串行化限制；任何序号分段或放宽顺序方案都需要先确认产品语义，不能当成本轮机械清理继续修改。
+- [ ] 补做“热点会话 vs 高基数分散会话”受控 A/B：固定目标 QPS、消息数、Pool、Outbox 和正确性验证，对比 1 个热点会话与约 5 万个分散会话。高基数路径必须绕过会话 get-or-create，或单独记录 `conversation_resolve`，以便真正隔离 `conversation_seq` 行竞争；不再把“10 万用户各发 1 条”当成独立的全局 QPS 结论。
+- [ ] 生产数据量较大时，把当前停写、单事务回填的 `015` 拆成 expand → 在线分批 backfill → 校验 → enforce constraints；当前迁移只适合可接受维护窗口的规模。
+- [ ] 确认所有 v1～v3 Outbox 已 published/dead、没有旧 Worker 且回退窗口结束后，再用独立 contract migration 删除用户级 Sync/projector 表、旧路由和 014 方向索引。
+
+> 下列 projection、recipient 与容量实验记录属于 v3 用户级 cursor 架构。代码仍保留它们用于旧事件排空，但它们不再描述 v4 正常消息路径。
+
 ## Prepare Worker 按用户分片候选
 
 - [x] 将每条 `message.created` 拆成每个参与用户一项的临时持久化投影任务；自发自收只生成一项。

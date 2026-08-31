@@ -433,14 +433,18 @@ func TestCreateMessageIdempotencyCreatesOneMessageAndOneOutboxEvent(t *testing.T
 	}
 
 	var messages, events int
+	var lastSeq int64
 	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM messages WHERE sender_id = $1 AND client_message_id = $2`, sender.User.ID, clientMessageID).Scan(&messages); err != nil {
 		t.Fatalf("count idempotent messages: %v", err)
 	}
 	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE message_id = $1 AND event_type = 'message.created'`, first.ID).Scan(&events); err != nil {
 		t.Fatalf("count outbox events: %v", err)
 	}
-	if messages != 1 || events != 1 {
-		t.Fatalf("messages = %d, events = %d, want one each", messages, events)
+	if err := db.QueryRow(context.Background(), `SELECT last_seq FROM conversations WHERE id = $1`, first.ConversationID).Scan(&lastSeq); err != nil {
+		t.Fatalf("read idempotent conversation cursor: %v", err)
+	}
+	if messages != 1 || events != 1 || lastSeq != 1 {
+		t.Fatalf("messages = %d, events = %d, last seq = %d, want one each", messages, events, lastSeq)
 	}
 
 	differentContent := "different payload"
@@ -523,14 +527,25 @@ func TestConcurrentDuplicateMessageRequestsConvergeToOneResult(t *testing.T) {
 	}
 
 	var messages, events int
+	var lastSeq int64
 	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM messages WHERE sender_id = $1 AND client_message_id = $2`, sender.User.ID, clientMessageID).Scan(&messages); err != nil {
 		t.Fatalf("count concurrent messages: %v", err)
 	}
 	if err := db.QueryRow(context.Background(), `SELECT count(*) FROM outbox_events WHERE message_id = $1`, messageID).Scan(&events); err != nil {
 		t.Fatalf("count concurrent outbox events: %v", err)
 	}
-	if messages != 1 || events != 1 {
-		t.Fatalf("messages = %d, events = %d, want one each", messages, events)
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT conversation.last_seq
+		 FROM conversations AS conversation
+		 JOIN messages AS message ON message.conversation_id = conversation.id
+		 WHERE message.id = $1`,
+		messageID,
+	).Scan(&lastSeq); err != nil {
+		t.Fatalf("read concurrent idempotent cursor: %v", err)
+	}
+	if messages != 1 || events != 1 || lastSeq != 1 {
+		t.Fatalf("messages = %d, events = %d, last seq = %d, want one each", messages, events, lastSeq)
 	}
 }
 
@@ -559,15 +574,15 @@ func TestDatabaseConstraintsProtectDirectWrites(t *testing.T) {
 	assertPostgresCode(t, err, "23514")
 }
 
-func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
+func TestMessageCreationMakesConversationOutboxReadyInSendTransaction(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("async_s"), "Async Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("async_r"), "Async Receiver")
 
-	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "project later")
-	var syncEvents, recipients int
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "ready immediately")
+	var syncEvents, recipients, members int
 	var payloadVersion int
 	var ready bool
 	if err := db.QueryRow(
@@ -578,21 +593,37 @@ func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
 		        (SELECT count(*)
 		         FROM outbox_recipients AS recipient
 		         JOIN outbox_events AS event USING (event_id)
-		         WHERE event.message_id = $1)
+		         WHERE event.message_id = $1),
+		        (SELECT count(*)
+		         FROM conversation_members
+		         WHERE conversation_id = $2)
 		 FROM user_message_events
 		 WHERE message_id = $1`,
 		created.ID,
-	).Scan(&syncEvents, &payloadVersion, &ready, &recipients); err != nil {
-		t.Fatalf("read pending projection: %v", err)
+		created.ConversationID,
+	).Scan(&syncEvents, &payloadVersion, &ready, &recipients, &members); err != nil {
+		t.Fatalf("read conversation Outbox state: %v", err)
 	}
-	if syncEvents != 0 || payloadVersion != 3 || ready || recipients != 0 {
+	if syncEvents != 0 || payloadVersion != 4 || !ready || recipients != 0 || members != 2 {
 		t.Fatalf(
-			"before projection: sync events=%d payload version=%d ready=%v recipients=%d",
+			"send transaction: sync events=%d payload version=%d ready=%v recipients=%d members=%d",
 			syncEvents,
 			payloadVersion,
 			ready,
 			recipients,
+			members,
 		)
+	}
+	var lastSeq int64
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT last_seq FROM conversations WHERE id = $1`,
+		created.ConversationID,
+	).Scan(&lastSeq); err != nil {
+		t.Fatalf("read conversation cursor: %v", err)
+	}
+	if created.ConversationSeq != 1 || lastSeq != created.ConversationSeq {
+		t.Fatalf("message seq=%d conversation last=%d, want 1", created.ConversationSeq, lastSeq)
 	}
 
 	projectPendingMessageEvents(t, db)
@@ -613,14 +644,71 @@ func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
 	).Scan(&syncEvents, &payloadVersion, &ready, &published, &recipients); err != nil {
 		t.Fatalf("read completed projection: %v", err)
 	}
-	if syncEvents != 2 || payloadVersion != 3 || !ready || !published || recipients != 0 {
+	if syncEvents != 0 || payloadVersion != 4 || !ready || !published || recipients != 0 {
 		t.Fatalf(
-			"after projection: sync events=%d payload version=%d ready=%v published=%v recipients=%d",
+			"after publish: sync events=%d payload version=%d ready=%v published=%v recipients=%d",
 			syncEvents,
 			payloadVersion,
 			ready,
 			published,
 			recipients,
+		)
+	}
+}
+
+func TestResolveDirectConversationUsesExistingFastPath(t *testing.T) {
+	db := openTestDatabase(t)
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	first := registerTestAccount(t, db, server.URL, uniqueUsername("resolve_a"), "Resolve A")
+	second := registerTestAccount(t, db, server.URL, uniqueUsername("resolve_b"), "Resolve B")
+	lowUserID, highUserID := first.User.ID, second.User.ID
+	if lowUserID > highUserID {
+		lowUserID, highUserID = highUserID, lowUserID
+	}
+
+	firstTransaction, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin first conversation transaction: %v", err)
+	}
+	firstConversationID, firstCreated, err := resolveDirectConversation(
+		context.Background(),
+		firstTransaction,
+		lowUserID,
+		highUserID,
+	)
+	if err != nil {
+		_ = firstTransaction.Rollback(context.Background())
+		t.Fatalf("resolve new direct conversation: %v", err)
+	}
+	if !firstCreated {
+		_ = firstTransaction.Rollback(context.Background())
+		t.Fatal("new direct conversation was reported as existing")
+	}
+	if err := firstTransaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit first conversation transaction: %v", err)
+	}
+
+	secondTransaction, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin second conversation transaction: %v", err)
+	}
+	defer secondTransaction.Rollback(context.Background())
+	secondConversationID, secondCreated, err := resolveDirectConversation(
+		context.Background(),
+		secondTransaction,
+		lowUserID,
+		highUserID,
+	)
+	if err != nil {
+		t.Fatalf("resolve existing direct conversation: %v", err)
+	}
+	if secondCreated || secondConversationID != firstConversationID {
+		t.Fatalf(
+			"existing conversation = id %d created %v, want id %d created false",
+			secondConversationID,
+			secondCreated,
+			firstConversationID,
 		)
 	}
 }
@@ -680,7 +768,7 @@ func testStructuredProjectionRecovery(
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("recover_s"), "Recover Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("recover_r"), "Recover Receiver")
-	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "recover projection")
+	created := createLegacyPendingMessageThroughAPI(t, db, server.URL, sender.Auth.AccessToken, receiver.User.ID, "recover projection")
 
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
@@ -774,7 +862,7 @@ func TestJSONBProjectionStorageRemainsAvailableForRollback(t *testing.T) {
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("jsonb_s"), "JSONB Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("jsonb_r"), "JSONB Receiver")
-	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "jsonb rollback")
+	created := createLegacyPendingMessageThroughAPI(t, db, server.URL, sender.Auth.AccessToken, receiver.User.ID, "jsonb rollback")
 
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
@@ -826,7 +914,7 @@ func TestStructuredProjectionStoresOneSyncEventForSelfMessage(t *testing.T) {
 			server := httptest.NewServer(newTestApplication(t, db).routes())
 			t.Cleanup(server.Close)
 			account := registerTestAccount(t, db, server.URL, uniqueUsername("self"), "Self Sender")
-			created := createMessageThroughAPI(t, server.URL, account.Auth.AccessToken, account.User.ID, "note to self")
+			created := createLegacyPendingMessageThroughAPI(t, db, server.URL, account.Auth.AccessToken, account.User.ID, "note to self")
 			config := defaultOutboxWorkerConfig()
 			config.BatchSize = 1
 			config.ProjectionStorage = test.storage
@@ -878,7 +966,7 @@ func testStructuredProjectionLeaseLoss(t *testing.T, storage syncProjectionStora
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("lease_s"), "Lease Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("lease_r"), "Lease Receiver")
-	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "lose lease")
+	created := createLegacyPendingMessageThroughAPI(t, db, server.URL, sender.Auth.AccessToken, receiver.User.ID, "lose lease")
 
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
@@ -924,56 +1012,77 @@ func testStructuredProjectionLeaseLoss(t *testing.T, storage syncProjectionStora
 	}
 }
 
-func TestMessageSyncPaginatesWithPerUserCursor(t *testing.T) {
+func TestConversationMessageSyncPaginatesWithPerConversationCursor(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("sync_s"), "Sync Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("sync_r"), "Sync Receiver")
+	outsider := registerTestAccount(t, db, server.URL, uniqueUsername("sync_o"), "Sync Outsider")
 
 	created := []message{
 		createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "sync one"),
 		createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "sync two"),
 		createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "sync three"),
 	}
-	projectPendingMessageEvents(t, db)
+	conversationID := created[0].ConversationID
 
-	first := syncMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 0, 2)
-	if len(first.Events) != 2 || !first.HasMore || first.NextCursor != 2 || first.SnapshotCursor != 3 {
+	first := syncConversationMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, conversationID, 0, 2)
+	if len(first.Messages) != 2 || !first.HasMore || first.NextCursor != 2 || first.SnapshotCursor != 3 {
 		t.Fatalf("first sync page = %+v", first)
 	}
-	for index, event := range first.Events {
-		if event.Cursor != int64(index+1) || event.Message.ID != created[index].ID {
-			t.Fatalf("first sync event %d = %+v", index, event)
+	for index, current := range first.Messages {
+		if current.ConversationSeq != int64(index+1) || current.ID != created[index].ID {
+			t.Fatalf("first sync message %d = %+v", index, current)
 		}
 	}
 
-	second := syncMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, first.NextCursor, 2, first.SnapshotCursor)
-	if len(second.Events) != 1 || second.HasMore || second.NextCursor != 3 || second.SnapshotCursor != 3 {
+	second := syncConversationMessagesThroughAPI(
+		t,
+		server.URL,
+		receiver.Auth.AccessToken,
+		conversationID,
+		first.NextCursor,
+		2,
+		first.SnapshotCursor,
+	)
+	if len(second.Messages) != 1 || second.HasMore || second.NextCursor != 3 || second.SnapshotCursor != 3 {
 		t.Fatalf("second sync page = %+v", second)
 	}
-	if second.Events[0].Cursor != 3 || second.Events[0].Message.ID != created[2].ID {
-		t.Fatalf("second sync event = %+v", second.Events[0])
+	if second.Messages[0].ConversationSeq != 3 || second.Messages[0].ID != created[2].ID {
+		t.Fatalf("second sync message = %+v", second.Messages[0])
 	}
 
-	senderPage := syncMessagesThroughAPI(t, server.URL, sender.Auth.AccessToken, 0, 10)
-	if len(senderPage.Events) != 3 || senderPage.NextCursor != 3 {
+	senderPage := syncConversationMessagesThroughAPI(t, server.URL, sender.Auth.AccessToken, conversationID, 0, 10)
+	if len(senderPage.Messages) != 3 || senderPage.NextCursor != 3 {
 		t.Fatalf("sender device sync page = %+v", senderPage)
+	}
+	foreign := doRequest(
+		t,
+		http.MethodGet,
+		fmt.Sprintf("%s/conversations/%d/messages", server.URL, conversationID),
+		outsider.Auth.AccessToken,
+		"",
+	)
+	foreign.Body.Close()
+	if foreign.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign conversation sync status = %d, want 404", foreign.StatusCode)
 	}
 }
 
-func TestMessageSyncKeepsSnapshotStableWhileNewMessagesArrive(t *testing.T) {
+func TestConversationMessageSyncKeepsSnapshotStableWhileNewMessagesArrive(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("snapshot_s"), "Snapshot Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("snapshot_r"), "Snapshot Receiver")
 
+	var conversationID int64
 	for _, content := range []string{"snapshot one", "snapshot two", "snapshot three"} {
-		createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, content)
+		created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, content)
+		conversationID = created.ConversationID
 	}
-	projectPendingMessageEvents(t, db)
-	first := syncMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 0, 1)
+	first := syncConversationMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, conversationID, 0, 1)
 	if first.SnapshotCursor != 3 || first.NextCursor != 1 || !first.HasMore {
 		t.Fatalf("first snapshot page = %+v", first)
 	}
@@ -981,33 +1090,40 @@ func TestMessageSyncKeepsSnapshotStableWhileNewMessagesArrive(t *testing.T) {
 	for _, content := range []string{"live four", "live five"} {
 		createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, content)
 	}
-	projectPendingMessageEvents(t, db)
-	second := syncMessagesThroughAPI(
+	second := syncConversationMessagesThroughAPI(
 		t,
 		server.URL,
 		receiver.Auth.AccessToken,
+		conversationID,
 		first.NextCursor,
 		10,
 		first.SnapshotCursor,
 	)
-	if second.SnapshotCursor != 3 || second.NextCursor != 3 || second.HasMore || len(second.Events) != 2 {
+	if second.SnapshotCursor != 3 || second.NextCursor != 3 || second.HasMore || len(second.Messages) != 2 {
 		t.Fatalf("stable snapshot second page = %+v", second)
 	}
-	for index, event := range second.Events {
-		if event.Cursor != int64(index+2) {
-			t.Fatalf("stable snapshot event %d cursor = %d, want %d", index, event.Cursor, index+2)
+	for index, current := range second.Messages {
+		if current.ConversationSeq != int64(index+2) {
+			t.Fatalf("stable snapshot message %d cursor = %d, want %d", index, current.ConversationSeq, index+2)
 		}
 	}
 
-	nextCycle := syncMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, second.NextCursor, 10)
-	if nextCycle.SnapshotCursor != 5 || nextCycle.NextCursor != 5 || nextCycle.HasMore || len(nextCycle.Events) != 2 {
+	nextCycle := syncConversationMessagesThroughAPI(
+		t,
+		server.URL,
+		receiver.Auth.AccessToken,
+		conversationID,
+		second.NextCursor,
+		10,
+	)
+	if nextCycle.SnapshotCursor != 5 || nextCycle.NextCursor != 5 || nextCycle.HasMore || len(nextCycle.Messages) != 2 {
 		t.Fatalf("next sync cycle = %+v", nextCycle)
 	}
 
 	ahead := doRequest(
 		t,
 		http.MethodGet,
-		fmt.Sprintf("%s/messages/sync?after=3&limit=10&snapshotCursor=6", server.URL),
+		fmt.Sprintf("%s/conversations/%d/messages?after=3&limit=10&snapshotCursor=6", server.URL, conversationID),
 		receiver.Auth.AccessToken,
 		"",
 	)
@@ -1017,7 +1133,7 @@ func TestMessageSyncKeepsSnapshotStableWhileNewMessagesArrive(t *testing.T) {
 	}
 }
 
-func TestMessageAcknowledgementIsPerDeviceMonotonicAndBounded(t *testing.T) {
+func TestConversationAcknowledgementIsPerDeviceMonotonicAndBounded(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
@@ -1033,21 +1149,22 @@ func TestMessageAcknowledgementIsPerDeviceMonotonicAndBounded(t *testing.T) {
 		desktopDeviceID,
 	)
 
+	var conversationID int64
 	for _, content := range []string{"ack one", "ack two", "ack three"} {
-		createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, content)
+		created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, content)
+		conversationID = created.ConversationID
 	}
-	projectPendingMessageEvents(t, db)
 
-	phoneState := acknowledgeMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 3, http.StatusOK)
+	phoneState := acknowledgeConversationThroughAPI(t, server.URL, receiver.Auth.AccessToken, conversationID, 3, http.StatusOK)
 	if phoneState.AppliedCursor != 3 {
 		t.Fatalf("phone applied cursor = %d, want 3", phoneState.AppliedCursor)
 	}
-	phoneState = acknowledgeMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 1, http.StatusOK)
+	phoneState = acknowledgeConversationThroughAPI(t, server.URL, receiver.Auth.AccessToken, conversationID, 1, http.StatusOK)
 	if phoneState.AppliedCursor != 3 {
 		t.Fatalf("late phone ACK moved cursor to %d, want 3", phoneState.AppliedCursor)
 	}
 
-	desktopState := acknowledgeMessagesThroughAPI(t, server.URL, desktop.AccessToken, 1, http.StatusOK)
+	desktopState := acknowledgeConversationThroughAPI(t, server.URL, desktop.AccessToken, conversationID, 1, http.StatusOK)
 	if desktopState.AppliedCursor != 1 {
 		t.Fatalf("desktop applied cursor = %d, want 1", desktopState.AppliedCursor)
 	}
@@ -1055,13 +1172,25 @@ func TestMessageAcknowledgementIsPerDeviceMonotonicAndBounded(t *testing.T) {
 		t.Fatalf("desktop session device ID = %q, want %q", desktop.DeviceID, desktopDeviceID)
 	}
 
-	acknowledgeMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 4, http.StatusConflict)
-	invalid := doRequest(t, http.MethodPost, server.URL+"/messages/ack", receiver.Auth.AccessToken, `{"cursor":3,"deviceId":"spoofed-device"}`)
+	acknowledgeConversationThroughAPI(t, server.URL, receiver.Auth.AccessToken, conversationID, 4, http.StatusConflict)
+	invalid := doRequest(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("%s/conversations/%d/ack", server.URL, conversationID),
+		receiver.Auth.AccessToken,
+		`{"cursor":3,"deviceId":"spoofed-device"}`,
+	)
 	invalid.Body.Close()
 	if invalid.StatusCode != http.StatusBadRequest {
 		t.Fatalf("spoofed ACK identity status = %d, want 400", invalid.StatusCode)
 	}
-	unauthenticated := doRequest(t, http.MethodPost, server.URL+"/messages/ack", "", `{"cursor":1}`)
+	unauthenticated := doRequest(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("%s/conversations/%d/ack", server.URL, conversationID),
+		"",
+		`{"cursor":1}`,
+	)
 	unauthenticated.Body.Close()
 	if unauthenticated.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated ACK status = %d, want 401", unauthenticated.StatusCode)
@@ -1070,10 +1199,12 @@ func TestMessageAcknowledgementIsPerDeviceMonotonicAndBounded(t *testing.T) {
 	rows, err := db.Query(
 		context.Background(),
 		`SELECT device_id, applied_seq
-		 FROM device_sync_states
+		 FROM device_conversation_sync_states
 		 WHERE user_id = $1
+		   AND conversation_id = $2
 		 ORDER BY applied_seq DESC`,
 		receiver.User.ID,
+		conversationID,
 	)
 	if err != nil {
 		t.Fatalf("read device sync states: %v", err)
@@ -1102,15 +1233,7 @@ func TestMessageAcknowledgementIsPerDeviceMonotonicAndBounded(t *testing.T) {
 	}
 }
 
-func TestOppositeDirectionMessagesAllocateSyncCursorsWithoutDeadlock(t *testing.T) {
-	for _, mode := range []syncProjectionMode{syncProjectionModePerUser, syncProjectionModeBulk} {
-		t.Run(string(mode), func(t *testing.T) {
-			testOppositeDirectionMessagesAllocateSyncCursorsWithoutDeadlock(t, mode)
-		})
-	}
-}
-
-func testOppositeDirectionMessagesAllocateSyncCursorsWithoutDeadlock(t *testing.T, mode syncProjectionMode) {
+func TestOppositeDirectionMessagesAllocateOneConversationCursorWithoutGaps(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
@@ -1170,46 +1293,75 @@ func testOppositeDirectionMessagesAllocateSyncCursorsWithoutDeadlock(t *testing.
 			t.Fatalf("concurrent message result = status %d, err %v", result.status, result.err)
 		}
 	}
-	config := defaultOutboxWorkerConfig()
-	config.BatchSize = messagesPerDirection
-	config.ProjectionMode = mode
-	workers := []*outboxWorker{
-		mustMessageTestWorker(t, db, &webSocketOutboxPublisher{router: discardRealtimeRouter{}}, config),
-		mustMessageTestWorker(t, db, &webSocketOutboxPublisher{router: discardRealtimeRouter{}}, config),
+	var conversationID int64
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT id
+		 FROM conversations
+		 WHERE direct_user_low_id = LEAST($1::bigint, $2::bigint)
+		   AND direct_user_high_id = GREATEST($1::bigint, $2::bigint)`,
+		first.User.ID,
+		second.User.ID,
+	).Scan(&conversationID); err != nil {
+		t.Fatalf("read direct conversation: %v", err)
 	}
-	projectStart := make(chan struct{})
-	projectResults := make(chan error, len(workers))
-	for _, worker := range workers {
-		go func(current *outboxWorker) {
-			<-projectStart
-			processed, err := current.RunOnce(context.Background())
-			if err == nil && processed != messagesPerDirection {
-				err = fmt.Errorf("processed %d events, want %d", processed, messagesPerDirection)
-			}
-			projectResults <- err
-		}(worker)
+	var count, minimum, maximum, conversations, lastSeq, readyV4 int64
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT count(*),
+		        min(message.conversation_seq),
+		        max(message.conversation_seq),
+		        count(DISTINCT message.conversation_id),
+		        max(conversation.last_seq),
+		        count(*) FILTER (
+		            WHERE event.payload_version = 4 AND event.ready_at IS NOT NULL
+		        )
+		 FROM messages AS message
+		 JOIN conversations AS conversation ON conversation.id = message.conversation_id
+		 JOIN outbox_events AS event ON event.message_id = message.id
+		 WHERE message.conversation_id = $1`,
+		conversationID,
+	).Scan(&count, &minimum, &maximum, &conversations, &lastSeq, &readyV4); err != nil {
+		t.Fatalf("read conversation cursor range: %v", err)
 	}
-	close(projectStart)
-	for range workers {
-		if err := <-projectResults; err != nil {
-			t.Fatalf("run concurrent sync projector: %v", err)
-		}
+	wantMessages := int64(messagesPerDirection * 2)
+	if count != wantMessages || minimum != 1 || maximum != wantMessages || conversations != 1 || lastSeq != wantMessages {
+		t.Fatalf(
+			"conversation cursor range = count %d min %d max %d conversations %d last %d",
+			count,
+			minimum,
+			maximum,
+			conversations,
+			lastSeq,
+		)
 	}
-
-	for _, userID := range []int64{first.User.ID, second.User.ID} {
-		var count, minimum, maximum int64
-		if err := db.QueryRow(
-			context.Background(),
-			`SELECT count(*), min(seq), max(seq)
-			 FROM user_message_events
-			 WHERE user_id = $1`,
-			userID,
-		).Scan(&count, &minimum, &maximum); err != nil {
-			t.Fatalf("read sync cursor range for user %d: %v", userID, err)
-		}
-		if count != messagesPerDirection*2 || minimum != 1 || maximum != messagesPerDirection*2 {
-			t.Fatalf("user %d sync cursor range = count %d, min %d, max %d", userID, count, minimum, maximum)
-		}
+	var legacySync, timeRegressions int64
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT (SELECT count(*)
+		         FROM user_message_events AS sync_event
+		         JOIN messages AS projected ON projected.id = sync_event.message_id
+		         WHERE projected.conversation_id = $1),
+		        (SELECT count(*)
+		         FROM (
+		             SELECT created_at,
+		                    lag(created_at) OVER (ORDER BY conversation_seq) AS previous_created_at
+		             FROM messages
+		             WHERE conversation_id = $1
+		         ) AS ordered
+		         WHERE created_at < previous_created_at)`,
+		conversationID,
+	).Scan(&legacySync, &timeRegressions); err != nil {
+		t.Fatalf("read conversation projection and timestamp state: %v", err)
+	}
+	if readyV4 != wantMessages || legacySync != 0 || timeRegressions != 0 {
+		t.Fatalf(
+			"ready v4 events=%d legacy sync rows=%d timestamp regressions=%d, want %d/0/0",
+			readyV4,
+			legacySync,
+			timeRegressions,
+			wantMessages,
+		)
 	}
 }
 
@@ -1217,6 +1369,43 @@ type discardRealtimeRouter struct{}
 
 func (discardRealtimeRouter) Publish(context.Context, int64, []byte) (int, error) {
 	return 0, nil
+}
+
+// createLegacyPendingMessageThroughAPI turns a normal version-4 message into
+// the version-3 shape that may still be waiting when migration 015 deploys.
+// It keeps the legacy projector and rollback path covered without making the
+// production send path write user-level Sync events again.
+func createLegacyPendingMessageThroughAPI(
+	t *testing.T,
+	db *pgxpool.Pool,
+	serverURL string,
+	token string,
+	receiverID int64,
+	content string,
+) message {
+	t.Helper()
+	created := createMessageThroughAPI(t, serverURL, token, receiverID, content)
+	payload, err := json.Marshal(messageCreatedPendingPayload{Message: created})
+	if err != nil {
+		t.Fatalf("encode legacy pending message: %v", err)
+	}
+	if _, err := db.Exec(
+		context.Background(),
+		`DELETE FROM outbox_events WHERE message_id = $1`,
+		created.ID,
+	); err != nil {
+		t.Fatalf("remove version-4 test event: %v", err)
+	}
+	if _, err := db.Exec(
+		context.Background(),
+		`INSERT INTO outbox_events (event_type, payload_version, message_id, payload)
+		 VALUES ('message.created', 3, $1, $2::jsonb)`,
+		created.ID,
+		payload,
+	); err != nil {
+		t.Fatalf("create legacy pending Outbox event: %v", err)
+	}
+	return created
 }
 
 func projectPendingMessageEvents(t *testing.T, db *pgxpool.Pool, metricObservers ...*applicationMetrics) {
@@ -1299,23 +1488,36 @@ func loginTestAccountForDevice(t *testing.T, serverURL, username, password, requ
 	return authenticated
 }
 
-func acknowledgeMessagesThroughAPI(t *testing.T, serverURL, token string, cursor int64, wantStatus int) deviceSyncState {
+func acknowledgeConversationThroughAPI(
+	t *testing.T,
+	serverURL string,
+	token string,
+	conversationID int64,
+	cursor int64,
+	wantStatus int,
+) deviceConversationSyncState {
 	t.Helper()
 	body, err := json.Marshal(acknowledgeMessagesRequest{Cursor: &cursor})
 	if err != nil {
-		t.Fatalf("encode message ACK: %v", err)
+		t.Fatalf("encode conversation ACK: %v", err)
 	}
-	response := doRequest(t, http.MethodPost, serverURL+"/messages/ack", token, string(body))
+	response := doRequest(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("%s/conversations/%d/ack", serverURL, conversationID),
+		token,
+		string(body),
+	)
 	defer response.Body.Close()
 	if response.StatusCode != wantStatus {
-		t.Fatalf("message ACK status = %d, want %d", response.StatusCode, wantStatus)
+		t.Fatalf("conversation ACK status = %d, want %d", response.StatusCode, wantStatus)
 	}
 	if wantStatus != http.StatusOK {
-		return deviceSyncState{}
+		return deviceConversationSyncState{}
 	}
-	var state deviceSyncState
+	var state deviceConversationSyncState
 	if err := json.NewDecoder(response.Body).Decode(&state); err != nil {
-		t.Fatalf("decode message ACK: %v", err)
+		t.Fatalf("decode conversation ACK: %v", err)
 	}
 	return state
 }
@@ -1363,21 +1565,26 @@ func createMessageThroughAPI(t *testing.T, serverURL, token string, receiverID i
 
 func listMessagesThroughAPI(t *testing.T, serverURL, token string, peerID int64) []message {
 	t.Helper()
-	response := doRequest(t, http.MethodGet, fmt.Sprintf("%s/messages?peerId=%d", serverURL, peerID), token, "")
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("list messages status = %d, want 200", response.StatusCode)
-	}
-	var messages []message
-	if err := json.NewDecoder(response.Body).Decode(&messages); err != nil {
-		t.Fatalf("decode messages: %v", err)
-	}
-	return messages
+	return messageHistoryThroughAPI(t, serverURL, token, peerID, "", "", 0).Messages
 }
 
-func syncMessagesThroughAPI(t *testing.T, serverURL, token string, after int64, limit int, snapshotCursor ...int64) messageSyncResponse {
+func syncConversationMessagesThroughAPI(
+	t *testing.T,
+	serverURL string,
+	token string,
+	conversationID int64,
+	after int64,
+	limit int,
+	snapshotCursor ...int64,
+) conversationMessagePage {
 	t.Helper()
-	path := fmt.Sprintf("%s/messages/sync?after=%d&limit=%d", serverURL, after, limit)
+	path := fmt.Sprintf(
+		"%s/conversations/%d/messages?after=%d&limit=%d",
+		serverURL,
+		conversationID,
+		after,
+		limit,
+	)
 	if len(snapshotCursor) > 1 {
 		t.Fatal("sync helper accepts at most one snapshot cursor")
 	}
@@ -1393,11 +1600,11 @@ func syncMessagesThroughAPI(t *testing.T, serverURL, token string, after int64, 
 	)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		t.Fatalf("sync messages status = %d, want 200", response.StatusCode)
+		t.Fatalf("sync conversation messages status = %d, want 200", response.StatusCode)
 	}
-	var page messageSyncResponse
+	var page conversationMessagePage
 	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
-		t.Fatalf("decode message sync page: %v", err)
+		t.Fatalf("decode conversation message sync page: %v", err)
 	}
 	return page
 }

@@ -410,7 +410,10 @@ func TestTwoApplicationInstancesDeliverOutboxEventToRemoteWebSocket(t *testing.T
 		t.Fatalf("run cross-instance outbox worker = processed %d, err %v", processed, err)
 	}
 	envelope := readWebSocketEnvelope(t, connection)
-	if envelope.Message.ID != created.ID || envelope.Cursor <= 0 {
+	if envelope.Message.ID != created.ID ||
+		envelope.ConversationID != created.ConversationID ||
+		envelope.ConversationSeq != created.ConversationSeq ||
+		envelope.Cursor != 0 {
 		t.Fatalf("cross-instance websocket envelope = %+v", envelope)
 	}
 }

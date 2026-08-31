@@ -9,9 +9,11 @@
 - 用户注册、Argon2id 密码哈希、短期 Access Token、Refresh Token 轮换及多设备 Session 管理。
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
 - Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 prepare 与当前批 publish，网络发布不占用数据库行锁。
-- Sync cursor 与 Outbox ready 在同一事务提交；`user_message_events` 同时作为断线补拉和 Worker 崩溃恢复时的权威 user/cursor 数据源，正常路径不再重复写 `outbox_recipients`。
-- 提供实验性的按用户准备模式：每条消息拆成参与用户的临时持久化任务，由与 Prepare Worker 同数的 Dispatcher 并发生成；用户固定映射到 256 个逻辑分片，只有所有参与用户都完成 Sync 投影，Outbox 才会 ready。
-- 为每个用户分配连续 Sync cursor，支持快照分页补拉和设备 ACK；WebSocket 只负责实时通知，Sync API 负责恢复。
+- 单聊双方规范化为一个 `conversation_id`；消息只写一份，并在会话内分配连续 `conversation_seq`。
+- 新消息使用 Outbox payload v4：既有会话先走只读快路径；序号分配、消息写入和 ready Outbox 再由一条 data-modifying CTE 原子完成，不再为每个参与用户复制 `user_message_events`。
+- 重连时先分页扫描 `GET /conversations`，再按每个会话的 cursor 调用 `GET /conversations/{id}/messages`；设备 ACK 也按会话保存。WebSocket 只负责实时通知，SQL 仍是恢复权威。
+- v3 用户级 Sync projector、`user_sync_counters`、`user_message_events` 和相关实验模式暂时保留，只用于排空迁移前事件与短期回退；正常 v4 路径会跳过它们。
+- 普通单聊历史使用绑定 `conversation_id + conversation_seq` 的 `before` / `after` opaque cursor 和单个会话索引，不通过 `OFFSET` 扫描深页。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
 - Outbox 投递前对同批 recipient 去重，用两段 Redis pipeline 生成仅在本批存活的 Presence 快照，避免热点用户被重复查询。
 - Prometheus 指标覆盖 HTTP、连接池、Outbox 各阶段、Redis 路由、WebSocket、Sync 和 ACK。
@@ -21,19 +23,21 @@
 
 ```text
 POST /messages
-  -> PostgreSQL: message + pending outbox（同一事务）
-  -> Outbox 准备 Lane: claim + 分配用户 cursor
-     + 写入 user_message_events + ready（同一事务）
+  -> PostgreSQL: resolve/create conversation（既有会话只读快路径）
+     + allocate conversation_seq + message + ready v4 outbox（同一 SQL、同一事务）
+  -> Outbox 准备 Lane: claim；v4 无用户级投影
   -> Outbox 投递 Lane: 批内 Presence 快照 + Redis / 本地 Hub + mark published
-  -> WebSocket 实时通知
+  -> WebSocket 携带 conversationId + conversationSeq 实时通知
 
 断线或实时通知失败
-  -> GET /messages/sync
-  -> 客户端持久化
-  -> POST /messages/ack
+  -> GET /conversations
+  -> GET /conversations/{conversationId}/messages
+  -> 客户端持久化后 POST /conversations/{conversationId}/ack
 ```
 
-当前默认仍是 `OUTBOX_PREPARE_MODE=inline`、`OUTBOX_PREPARE_WORKERS=1`。实验候选 `user_sharded/4` 在 5000 req/s 下仍未达标，不作为默认容量方案；其逻辑分片数固定为 256，调整物理 Worker 数不需要重写已有任务的 shard。
+当前默认仍是 `OUTBOX_PREPARE_MODE=inline`、`OUTBOX_PREPARE_WORKERS=1`，但 v4 的 prepare 是无数据库写入的兼容步骤。`user_sharded`、projection mode 与 projection storage 开关只影响尚未排空的 v3 事件，不是新消息容量方案。
+
+该模型把热点从“同一用户的全局 counter”缩小到“同一会话的 counter”：不同会话可以并行写，同一会话为保证严格顺序仍会串行更新一行。超热点群聊未来仍需单独评估序号分段或其他排序方案，当前单聊实现没有宣称消除所有热点。
 
 ## 本地运行
 
@@ -84,10 +88,44 @@ POST /messages
 | `POST` | `/auth/logout` | 注销当前 Session |
 | `GET` | `/auth/sessions` | 查看当前用户的 Session |
 | `POST` | `/messages` | 幂等发送消息 |
-| `GET` | `/messages` | 查询会话消息 |
-| `GET` | `/messages/sync` | 按 cursor 补拉持久事件 |
-| `POST` | `/messages/ack` | 提交设备已持久化 cursor |
+| `GET` | `/messages` | 按 `peerId`、`before` / `after` cursor 和 `limit` 双向分页查询会话消息 |
+| `GET` | `/conversations` | 按稳定 membership snapshot 分页列出当前用户的单聊会话与 `lastSeq` |
+| `GET` | `/conversations/{conversationId}/messages` | 按该会话的 `after` / `snapshotCursor` 补拉消息 |
+| `POST` | `/conversations/{conversationId}/ack` | 提交当前设备已持久化的会话 cursor |
+| `GET` | `/messages/sync` | 旧用户级 Sync；返回 `410 Gone` 并提示迁移 |
+| `POST` | `/messages/ack` | 旧用户级 ACK；返回 `410 Gone` 并提示迁移 |
 | `GET` | `/ws` | 建立认证 WebSocket |
+
+`GET /messages` 默认返回最新 50 条，响应是分页对象而不是裸数组：
+
+```json
+{
+  "conversationId": 42,
+  "messages": [],
+  "beforeCursor": "opaque-cursor-for-the-oldest-returned-message",
+  "afterCursor": "opaque-cursor-for-the-newest-returned-message",
+  "hasMoreBefore": false,
+  "hasMoreAfter": false
+}
+```
+
+`before` 从当前页第一条继续向历史方向翻，`after` 从当前页最后一条向新消息方向翻；两者不能同时传入。`limit` 默认为 50，最大为 200。
+
+断线恢复的会话消息页使用数字型会话 cursor：
+
+```json
+{
+  "conversationId": 42,
+  "messages": [],
+  "nextCursor": 100,
+  "snapshotCursor": 137,
+  "hasMore": true
+}
+```
+
+客户端应先建立 WebSocket，再扫描会话列表并逐会话补拉；扫描期间收到的新消息由 WebSocket 覆盖。连接中断时重新开始一轮会话扫描，避免把不完整的一轮当成恢复完成。
+
+已有数据库升级到本模型时，先停止消息写入，再依次执行 `014`、`015`。`015` 会按规范化用户对回填会话和序号，并补全未发布 v1/v2/v3 Outbox payload；它是停写迁移，不是面向超大表的在线分批迁移。
 
 ## 测试与压测
 
@@ -110,7 +148,7 @@ go run ./cmd/im-loadtest \
 
 压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)；待验证实验见 [TODO.md](./TODO.md)。已收录的脱敏原始报告和容量阶梯索引见 [benchmarks/README.md](./benchmarks/README.md)；项目根目录的默认临时输出 `loadtest-report*.json` 不进入 Git。
 
-当前本机隔离库证据显示：在 Pool 24、Batch 64、10 个热点用户下，3000、3500 和 4000 req/s 都有单轮完整记录。切换为默认 `sync_events` 后的新鲜隔离库 5000 req/s 复核仅完成 99190/100000 HTTP，Realtime/Sync 在核验窗口内分别为 90884/396760 和 45492/198380，pending/oldest 峰值达到 `79891/45.861s`。API/Outbox acquisition P95 为 `250/100ms`，`prepare_store` 平均 95.23ms，而 `publish` 仅 1.78ms。流量停止后 Worker 用 10 秒排空，99190 条成功消息最终对应 198380 条 Sync 事件，pending/dead 为 0。这证明 5000 在规定窗口内明确过载，主压力在共享 PostgreSQL 连接获取和事务内写入，不是 Redis/Channel 发布；精确可重复边界仍需在 4000～5000 之间复测。完整方法和原始报告见 [LOAD_TEST.md](./LOAD_TEST.md)。
+`benchmarks/reports/` 中原有 3000～5000 req/s 容量阶梯来自 v3 用户级 cursor 投影架构，只能作为改造前基线。当前 v4 在每轮全新隔离状态下完成了发送事务 A/B：既有会话快路径加单 SQL 临界区后，10 会话 `ring` 3000 req/s 从 54552/60000 恢复到 60000/60000，HTTP P95 从 409.77ms 降到 16.73ms；单会话 `hot` 2000 req/s 仍失败，说明严格连续 `conversation_seq` 仍是热点边界。独立 Outbox Pool 可在过载时保护实时投递，但会增加 PostgreSQL 并发并回退普通链路延迟，所以默认继续共享 Pool，仅保留显式开关。精确条件、延迟和边界见 [LOAD_TEST.md](./LOAD_TEST.md)，这些本机短时结果不是生产容量承诺。
 
 ## 许可证
 

@@ -196,6 +196,7 @@ func TestReportKeepsLoadConditions(t *testing.T) {
 		Concurrency:    20,
 		LoadModel:      "fixed-rate",
 		TargetRateRPS:  500,
+		TrafficPattern: trafficPatternHot,
 		DroppedStarts:  3,
 		RequestTimeout: "10s",
 		DeliveryWait:   "30s",
@@ -206,10 +207,35 @@ func TestReportKeepsLoadConditions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{`"concurrency":20`, `"loadModel":"fixed-rate"`, `"targetRateRps":500`, `"droppedStarts":3`, `"requestTimeout":"10s"`, `"deliveryWait":"30s"`, `"loadDurationMs":750.5`, `"interval":"250ms"`, `"samples":4`} {
+	for _, field := range []string{`"concurrency":20`, `"loadModel":"fixed-rate"`, `"targetRateRps":500`, `"trafficPattern":"hot"`, `"droppedStarts":3`, `"requestTimeout":"10s"`, `"deliveryWait":"30s"`, `"loadDurationMs":750.5`, `"interval":"250ms"`, `"samples":4`} {
 		if !strings.Contains(string(payload), field) {
 			t.Fatalf("report does not contain %s: %s", field, payload)
 		}
+	}
+}
+
+func TestMessageParticipants(t *testing.T) {
+	tests := []struct {
+		name         string
+		pattern      string
+		index        int
+		users        int
+		wantSender   int
+		wantReceiver int
+	}{
+		{name: "ring first", pattern: trafficPatternRing, index: 0, users: 4, wantSender: 0, wantReceiver: 1},
+		{name: "ring wraps", pattern: trafficPatternRing, index: 3, users: 4, wantSender: 3, wantReceiver: 0},
+		{name: "hot forward", pattern: trafficPatternHot, index: 0, users: 10, wantSender: 0, wantReceiver: 1},
+		{name: "hot reverse", pattern: trafficPatternHot, index: 1, users: 10, wantSender: 1, wantReceiver: 0},
+		{name: "hot stays on pair", pattern: trafficPatternHot, index: 99, users: 10, wantSender: 1, wantReceiver: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sender, receiver := messageParticipants(test.pattern, test.index, test.users)
+			if sender != test.wantSender || receiver != test.wantReceiver {
+				t.Fatalf("participants = %d -> %d, want %d -> %d", sender, receiver, test.wantSender, test.wantReceiver)
+			}
+		})
 	}
 }
 

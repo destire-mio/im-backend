@@ -96,7 +96,10 @@ func TestWebSocketPublisherDeliversToEveryOnlineDevice(t *testing.T) {
 			if envelope.Type != "message.created" || envelope.EventID != event.EventID {
 				t.Fatalf("envelope identity = %+v", envelope)
 			}
-			if envelope.Message.ID != created.ID || envelope.Cursor <= 0 {
+			if envelope.Message.ID != created.ID ||
+				envelope.Cursor != 0 ||
+				envelope.ConversationID != created.ConversationID ||
+				envelope.ConversationSeq != created.ConversationSeq {
 				t.Fatalf("envelope message = %+v", envelope)
 			}
 		})
@@ -147,7 +150,11 @@ func testMessageCreatedOutboxEvent(
 		recipients = append(recipients, messageEventRecipient{UserID: userID, Cursor: int64(index + 1)})
 	}
 	payload, err := json.Marshal(messageCreatedEventPayload{
-		Message:    message{ID: messageID},
+		Message: message{
+			ID:         messageID,
+			SenderID:   userIDs[0],
+			ReceiverID: userIDs[len(userIDs)-1],
+		},
 		Recipients: recipients,
 	})
 	if err != nil {
@@ -190,8 +197,15 @@ func TestOfflineRecipientCanSyncAfterOutboxCompletes(t *testing.T) {
 	).Scan(&published); err != nil || !published {
 		t.Fatalf("offline outbox published = %v, err %v", published, err)
 	}
-	page := syncMessagesThroughAPI(t, server.URL, receiver.Auth.AccessToken, 0, 10)
-	if len(page.Events) != 1 || page.Events[0].Message.ID != created.ID {
+	page := syncConversationMessagesThroughAPI(
+		t,
+		server.URL,
+		receiver.Auth.AccessToken,
+		created.ConversationID,
+		0,
+		10,
+	)
+	if len(page.Messages) != 1 || page.Messages[0].ID != created.ID {
 		t.Fatalf("offline sync page = %+v", page)
 	}
 }

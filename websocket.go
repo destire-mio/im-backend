@@ -24,7 +24,7 @@ var errWebSocketHubStopped = errors.New("websocket hub is stopped")
 
 type messageEventRecipient struct {
 	UserID int64 `json:"userId"`
-	Cursor int64 `json:"cursor"`
+	Cursor int64 `json:"cursor,omitempty"`
 }
 
 type messageCreatedEventPayload struct {
@@ -32,19 +32,23 @@ type messageCreatedEventPayload struct {
 	Recipients []messageEventRecipient `json:"recipients"`
 }
 
-// messageCreatedPendingPayload is payload version 3. It is durable, but it is
+// messageCreatedPendingPayload is legacy payload version 3. It is durable, but it is
 // not publishable until the sync projector commits recipient cursors. The
 // default structured-recipient path leaves this JSONB immutable and builds a
 // version-2 payload in memory; the jsonb rollback path persists that payload.
+// Version 4 uses messageCreatedEventPayload directly and is ready in the send
+// transaction because conversation_seq is already the durable recovery cursor.
 type messageCreatedPendingPayload struct {
 	Message message `json:"message"`
 }
 
 type webSocketEnvelope struct {
-	Type    string  `json:"type"`
-	EventID string  `json:"eventId"`
-	Cursor  int64   `json:"cursor,omitempty"`
-	Message message `json:"message"`
+	Type            string  `json:"type"`
+	EventID         string  `json:"eventId"`
+	Cursor          int64   `json:"cursor,omitempty"`
+	ConversationID  int64   `json:"conversationId,omitempty"`
+	ConversationSeq int64   `json:"conversationSeq,omitempty"`
+	Message         message `json:"message"`
 }
 
 type webSocketClientConfig struct {
@@ -534,10 +538,12 @@ func (publisher *webSocketOutboxPublisher) Publish(ctx context.Context, event ou
 	}
 	for _, recipient := range payload.Recipients {
 		envelope, err := json.Marshal(webSocketEnvelope{
-			Type:    event.EventType,
-			EventID: event.EventID,
-			Cursor:  recipient.Cursor,
-			Message: payload.Message,
+			Type:            event.EventType,
+			EventID:         event.EventID,
+			Cursor:          recipient.Cursor,
+			ConversationID:  payload.Message.ConversationID,
+			ConversationSeq: payload.Message.ConversationSeq,
+			Message:         payload.Message,
 		})
 		if err != nil {
 			return permanentPublishError(fmt.Errorf("encode websocket event: %w", err))
@@ -554,6 +560,8 @@ func decodeMessageCreatedEvent(event outboxEvent) (messageCreatedEventPayload, e
 	case 1:
 		var legacy struct {
 			MessageID       int64     `json:"messageId"`
+			ConversationID  int64     `json:"conversationId"`
+			ConversationSeq int64     `json:"conversationSeq"`
 			ClientMessageID string    `json:"clientMessageId"`
 			SenderID        int64     `json:"senderId"`
 			ReceiverID      int64     `json:"receiverId"`
@@ -563,12 +571,14 @@ func decodeMessageCreatedEvent(event outboxEvent) (messageCreatedEventPayload, e
 		if err := json.Unmarshal(event.Payload, &legacy); err != nil {
 			return messageCreatedEventPayload{}, fmt.Errorf("decode legacy message.created payload: %w", err)
 		}
-		if legacy.MessageID <= 0 || legacy.ReceiverID <= 0 {
+		if legacy.MessageID <= 0 || legacy.ReceiverID <= 0 || (event.MessageID > 0 && legacy.MessageID != event.MessageID) {
 			return messageCreatedEventPayload{}, errors.New("legacy message.created payload is incomplete")
 		}
 		return messageCreatedEventPayload{
 			Message: message{
 				ID:              legacy.MessageID,
+				ConversationID:  legacy.ConversationID,
+				ConversationSeq: legacy.ConversationSeq,
 				ClientMessageID: legacy.ClientMessageID,
 				SenderID:        legacy.SenderID,
 				ReceiverID:      legacy.ReceiverID,
@@ -579,17 +589,49 @@ func decodeMessageCreatedEvent(event outboxEvent) (messageCreatedEventPayload, e
 				UserID: legacy.ReceiverID,
 			}},
 		}, nil
-	case 2:
+	case 2, 4:
 		var payload messageCreatedEventPayload
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
 			return messageCreatedEventPayload{}, fmt.Errorf("decode message.created payload: %w", err)
 		}
-		if payload.Message.ID <= 0 || len(payload.Recipients) == 0 {
+		if payload.Message.ID <= 0 ||
+			payload.Message.SenderID <= 0 ||
+			payload.Message.ReceiverID <= 0 ||
+			(event.MessageID > 0 && payload.Message.ID != event.MessageID) ||
+			len(payload.Recipients) == 0 {
 			return messageCreatedEventPayload{}, errors.New("message.created payload is incomplete")
 		}
+		expectedRecipients := map[int64]struct{}{
+			payload.Message.SenderID:   {},
+			payload.Message.ReceiverID: {},
+		}
+		seenRecipients := make(map[int64]struct{}, len(payload.Recipients))
 		for _, recipient := range payload.Recipients {
-			if recipient.UserID <= 0 || recipient.Cursor <= 0 {
+			if recipient.UserID <= 0 {
 				return messageCreatedEventPayload{}, errors.New("message.created recipient is invalid")
+			}
+			if event.PayloadVersion == 2 && recipient.Cursor <= 0 {
+				return messageCreatedEventPayload{}, errors.New("message.created recipient is invalid")
+			}
+			if _, expected := expectedRecipients[recipient.UserID]; !expected {
+				return messageCreatedEventPayload{}, errors.New("message.created recipient is not a message participant")
+			}
+			if _, duplicate := seenRecipients[recipient.UserID]; duplicate {
+				return messageCreatedEventPayload{}, errors.New("message.created recipient is duplicated")
+			}
+			seenRecipients[recipient.UserID] = struct{}{}
+		}
+		if len(seenRecipients) != len(expectedRecipients) {
+			return messageCreatedEventPayload{}, errors.New("message.created recipients are incomplete")
+		}
+		if event.PayloadVersion == 4 {
+			if payload.Message.ConversationID <= 0 || payload.Message.ConversationSeq <= 0 {
+				return messageCreatedEventPayload{}, errors.New("conversation-scoped message.created payload is incomplete")
+			}
+			for _, recipient := range payload.Recipients {
+				if recipient.Cursor != 0 {
+					return messageCreatedEventPayload{}, errors.New("conversation-scoped recipient must not contain a user cursor")
+				}
 			}
 		}
 		return payload, nil

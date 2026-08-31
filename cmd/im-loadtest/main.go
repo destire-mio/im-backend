@@ -32,6 +32,8 @@ import (
 
 const (
 	defaultDatabaseURL = "postgres://im:im@localhost:5433/im?sslmode=disable"
+	trafficPatternRing = "ring"
+	trafficPatternHot  = "hot"
 	passwordMemory     = 19 * 1024
 	passwordIterations = 2
 	passwordParallel   = 1
@@ -49,6 +51,7 @@ type config struct {
 	messages             int
 	concurrency          int
 	targetRate           int
+	trafficPattern       string
 	requestTimeout       time.Duration
 	deliveryWait         time.Duration
 	metricSampleInterval time.Duration
@@ -71,6 +74,8 @@ type authResponse struct {
 
 type apiMessage struct {
 	ID              int64     `json:"id"`
+	ConversationID  int64     `json:"conversationId"`
+	ConversationSeq int64     `json:"conversationSeq"`
 	ClientMessageID string    `json:"clientMessageId"`
 	SenderID        int64     `json:"senderId"`
 	ReceiverID      int64     `json:"receiverId"`
@@ -78,23 +83,32 @@ type apiMessage struct {
 	CreatedAt       time.Time `json:"createdAt"`
 }
 
-type syncEvent struct {
-	Cursor  int64      `json:"cursor"`
-	Message apiMessage `json:"message"`
+type conversationSummary struct {
+	ID      int64 `json:"id"`
+	LastSeq int64 `json:"lastSeq"`
 }
 
-type syncResponse struct {
-	Events         []syncEvent `json:"events"`
-	NextCursor     int64       `json:"nextCursor"`
-	SnapshotCursor int64       `json:"snapshotCursor"`
-	HasMore        bool        `json:"hasMore"`
+type conversationListResponse struct {
+	Conversations  []conversationSummary `json:"conversations"`
+	NextCursor     int64                 `json:"nextCursor"`
+	SnapshotCursor int64                 `json:"snapshotCursor"`
+	HasMore        bool                  `json:"hasMore"`
+}
+
+type conversationSyncResponse struct {
+	ConversationID int64        `json:"conversationId"`
+	Messages       []apiMessage `json:"messages"`
+	NextCursor     int64        `json:"nextCursor"`
+	SnapshotCursor int64        `json:"snapshotCursor"`
+	HasMore        bool         `json:"hasMore"`
 }
 
 type wsEnvelope struct {
-	Type    string     `json:"type"`
-	EventID string     `json:"eventId"`
-	Cursor  int64      `json:"cursor"`
-	Message apiMessage `json:"message"`
+	Type            string     `json:"type"`
+	EventID         string     `json:"eventId"`
+	ConversationID  int64      `json:"conversationId"`
+	ConversationSeq int64      `json:"conversationSeq"`
+	Message         apiMessage `json:"message"`
 }
 
 type testUser struct {
@@ -191,6 +205,7 @@ type report struct {
 	Concurrency              int                                        `json:"concurrency"`
 	LoadModel                string                                     `json:"loadModel"`
 	TargetRateRPS            int                                        `json:"targetRateRps,omitempty"`
+	TrafficPattern           string                                     `json:"trafficPattern"`
 	RequestTimeout           string                                     `json:"requestTimeout"`
 	DeliveryWait             string                                     `json:"deliveryWait"`
 	LoadDurationMS           float64                                    `json:"loadDurationMs"`
@@ -249,6 +264,7 @@ func main() {
 	fmt.Printf("run=%s database=%s\n", runID, databaseName)
 	fmt.Printf("setup: seed %d users, login %d devices, open %d WebSockets (not timed)\n",
 		cfg.users, cfg.users*cfg.devicesPerUser, cfg.users*cfg.devicesPerUser)
+	fmt.Printf("traffic: pattern=%s\n", cfg.trafficPattern)
 
 	users, err := seedUsers(ctx, pool, runID, cfg.users)
 	if err != nil {
@@ -314,6 +330,7 @@ func main() {
 		Concurrency:              cfg.concurrency,
 		LoadModel:                loadModel,
 		TargetRateRPS:            cfg.targetRate,
+		TrafficPattern:           cfg.trafficPattern,
 		RequestTimeout:           cfg.requestTimeout.String(),
 		DeliveryWait:             cfg.deliveryWait.String(),
 		LoadDurationMS:           durationMilliseconds(loadDuration),
@@ -362,6 +379,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.messages, "messages", 500, "number of messages to send")
 	flag.IntVar(&cfg.concurrency, "concurrency", 20, "concurrent HTTP senders")
 	flag.IntVar(&cfg.targetRate, "rate", 0, "fixed request-start rate per second; 0 keeps the closed-loop model")
+	flag.StringVar(&cfg.trafficPattern, "traffic-pattern", trafficPatternRing, "message distribution: ring spreads traffic across user pairs; hot keeps all traffic in one conversation")
 	flag.DurationVar(&cfg.requestTimeout, "request-timeout", 10*time.Second, "timeout for each HTTP request")
 	flag.DurationVar(&cfg.deliveryWait, "delivery-wait", 30*time.Second, "maximum wait for WebSocket deliveries")
 	flag.DurationVar(&cfg.metricSampleInterval, "metrics-sample-interval", 250*time.Millisecond, "interval for recording peak Outbox backlog metrics")
@@ -395,6 +413,9 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.targetRate < 0 || cfg.targetRate > 100_000 {
 		return errors.New("-rate must be between 0 and 100000")
+	}
+	if cfg.trafficPattern != trafficPatternRing && cfg.trafficPattern != trafficPatternHot {
+		return errors.New("-traffic-pattern must be ring or hot")
 	}
 	if cfg.requestTimeout <= 0 || cfg.deliveryWait <= 0 || cfg.metricSampleInterval <= 0 {
 		return errors.New("timeouts must be positive")
@@ -590,8 +611,7 @@ func droppedSend(runID string, index int, reason string) sendResult {
 }
 
 func sendOne(ctx context.Context, client *http.Client, cfg config, runID string, users []testUser, loadTracker *tracker, index int) sendResult {
-	senderIndex := index % len(users)
-	receiverIndex := (senderIndex + 1) % len(users)
+	senderIndex, receiverIndex := messageParticipants(cfg.trafficPattern, index, len(users))
 	clientID := fmt.Sprintf("msg_%s_%08d", runID, index+1)
 	labels := make([]string, 0, cfg.devicesPerUser*2)
 	for device := 0; device < cfg.devicesPerUser; device++ {
@@ -638,6 +658,15 @@ func sendOne(ctx context.Context, client *http.Client, cfg config, runID string,
 	return result
 }
 
+func messageParticipants(pattern string, index, userCount int) (int, int) {
+	if pattern == trafficPatternHot {
+		sender := index % 2
+		return sender, 1 - sender
+	}
+	sender := index % userCount
+	return sender, (sender + 1) % userCount
+}
+
 func verifySync(ctx context.Context, client *http.Client, cfg config, runID string, users []testUser, results []sendResult) (int, int, []string, error) {
 	expected := make(map[int64]map[int64]struct{}, len(users))
 	for _, user := range users {
@@ -672,14 +701,34 @@ func verifySync(ctx context.Context, client *http.Client, cfg config, runID stri
 
 func syncUser(ctx context.Context, client *http.Client, baseURL, token, clientIDPrefix string) (map[int64]struct{}, error) {
 	seen := make(map[int64]struct{})
+	conversationIDs, err := listConversationIDs(ctx, client, baseURL, token)
+	if err != nil {
+		return nil, err
+	}
+	for _, conversationID := range conversationIDs {
+		messages, err := syncOneConversation(ctx, client, baseURL, token, conversationID)
+		if err != nil {
+			return nil, fmt.Errorf("conversation %d: %w", conversationID, err)
+		}
+		for _, message := range messages {
+			if strings.HasPrefix(message.ClientMessageID, clientIDPrefix) {
+				seen[message.ID] = struct{}{}
+			}
+		}
+	}
+	return seen, nil
+}
+
+func listConversationIDs(ctx context.Context, client *http.Client, baseURL, token string) ([]int64, error) {
+	conversationIDs := make([]int64, 0)
 	var after, snapshot int64
 	first := true
 	for pageNumber := 0; pageNumber < 10_000; pageNumber++ {
-		path := fmt.Sprintf("%s/messages/sync?after=%d&limit=200", strings.TrimRight(baseURL, "/"), after)
+		path := fmt.Sprintf("%s/conversations?after=%d&limit=200", strings.TrimRight(baseURL, "/"), after)
 		if !first {
 			path += "&snapshotCursor=" + strconv.FormatInt(snapshot, 10)
 		}
-		var page syncResponse
+		var page conversationListResponse
 		status, _, err := doJSON(ctx, client, http.MethodGet, path, token, nil, &page)
 		if err != nil {
 			return nil, err
@@ -691,20 +740,79 @@ func syncUser(ctx context.Context, client *http.Client, baseURL, token, clientID
 			snapshot = page.SnapshotCursor
 			first = false
 		}
-		for _, event := range page.Events {
-			if strings.HasPrefix(event.Message.ClientMessageID, clientIDPrefix) {
-				seen[event.Message.ID] = struct{}{}
+		lastConversationID := after
+		for _, conversation := range page.Conversations {
+			if conversation.ID <= lastConversationID || conversation.ID > snapshot {
+				return nil, fmt.Errorf("invalid conversation list cursor %d", conversation.ID)
 			}
+			conversationIDs = append(conversationIDs, conversation.ID)
+			lastConversationID = conversation.ID
 		}
 		if !page.HasMore {
-			return seen, nil
+			return conversationIDs, nil
 		}
 		if page.NextCursor <= after {
-			return nil, errors.New("sync cursor did not advance")
+			return nil, errors.New("conversation list cursor did not advance")
 		}
 		after = page.NextCursor
 	}
-	return nil, errors.New("sync exceeded 10000 pages")
+	return nil, errors.New("conversation list exceeded 10000 pages")
+}
+
+func syncOneConversation(
+	ctx context.Context,
+	client *http.Client,
+	baseURL string,
+	token string,
+	conversationID int64,
+) ([]apiMessage, error) {
+	messages := make([]apiMessage, 0)
+	var after, snapshot int64
+	first := true
+	for pageNumber := 0; pageNumber < 10_000; pageNumber++ {
+		path := fmt.Sprintf(
+			"%s/conversations/%d/messages?after=%d&limit=200",
+			strings.TrimRight(baseURL, "/"),
+			conversationID,
+			after,
+		)
+		if !first {
+			path += "&snapshotCursor=" + strconv.FormatInt(snapshot, 10)
+		}
+		var page conversationSyncResponse
+		status, _, err := doJSON(ctx, client, http.MethodGet, path, token, nil, &page)
+		if err != nil {
+			return nil, err
+		}
+		if status != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d", status)
+		}
+		if page.ConversationID != conversationID {
+			return nil, fmt.Errorf("response conversation %d does not match request", page.ConversationID)
+		}
+		if first {
+			snapshot = page.SnapshotCursor
+			first = false
+		}
+		lastSequence := after
+		for _, message := range page.Messages {
+			if message.ConversationID != conversationID ||
+				message.ConversationSeq != lastSequence+1 ||
+				message.ConversationSeq > snapshot {
+				return nil, fmt.Errorf("invalid message cursor %d/%d", message.ConversationID, message.ConversationSeq)
+			}
+			messages = append(messages, message)
+			lastSequence = message.ConversationSeq
+		}
+		if !page.HasMore {
+			return messages, nil
+		}
+		if page.NextCursor <= after {
+			return nil, errors.New("conversation message cursor did not advance")
+		}
+		after = page.NextCursor
+	}
+	return nil, errors.New("conversation sync exceeded 10000 pages")
 }
 
 func newTracker() *tracker {
@@ -864,6 +972,13 @@ func readWebSocket(ctx context.Context, connection liveConnection, loadTracker *
 			continue
 		}
 		if envelope.Type == "message.created" {
+			if envelope.ConversationID <= 0 ||
+				envelope.ConversationSeq <= 0 ||
+				envelope.Message.ConversationID != envelope.ConversationID ||
+				envelope.Message.ConversationSeq != envelope.ConversationSeq {
+				loadTracker.readerError(connection.label, errors.New("message.created has an invalid conversation cursor"))
+				continue
+			}
 			loadTracker.observe(connection.label, envelope)
 		}
 	}
@@ -1187,6 +1302,11 @@ var deltaMetricNames = []string{
 	"im_backend_database_pool_canceled_acquires_total",
 	"im_backend_database_pool_acquire_duration_seconds_total",
 	"im_backend_database_pool_empty_acquire_wait_seconds_total",
+	"im_backend_outbox_database_pool_acquires_total",
+	"im_backend_outbox_database_pool_empty_acquires_total",
+	"im_backend_outbox_database_pool_canceled_acquires_total",
+	"im_backend_outbox_database_pool_acquire_duration_seconds_total",
+	"im_backend_outbox_database_pool_empty_acquire_wait_seconds_total",
 }
 
 var endMetricNames = []string{
@@ -1202,6 +1322,11 @@ var endMetricNames = []string{
 	"im_backend_database_pool_constructing_connections",
 	"im_backend_database_pool_total_connections",
 	"im_backend_database_pool_max_connections",
+	"im_backend_outbox_database_pool_acquired_connections",
+	"im_backend_outbox_database_pool_idle_connections",
+	"im_backend_outbox_database_pool_constructing_connections",
+	"im_backend_outbox_database_pool_total_connections",
+	"im_backend_outbox_database_pool_max_connections",
 	"im_backend_outbox_worker_concurrency",
 	"im_backend_outbox_worker_batch_size",
 	"im_backend_outbox_prepare_workers",
