@@ -425,3 +425,22 @@ Pool 整体发生 6442 次空池获取，所有 goroutine 的空池累计等待�
 报告：
 
 - `loadtest-rate-3000-db-acquire-r1.json`
+
+## 3500 req/s 单轮升档
+
+2026-08-31 按用户要求跳过 3200，直接使用新的隔离数据库和空 Redis DB 跑 3500 req/s。除目标速率和消息数改为 3500 req/s、70000 条外，Pool 24、Batch 64、publish 并发 16、pipeline + bulk + recipients + 批内 Presence 快照、10 个热点用户、20 条 WebSocket、并发 1000 和 30 秒投递等待均与上一轮 3000 相同。
+
+该轮 HTTP `70000/70000`、Realtime `280000/280000`、Sync `140000/140000` 全部完整，dropped、failed、missing、duplicate、unexpected、dead 均为 0；HTTP P95/P99 为 `10.20/41.46ms`，Realtime P95 为 `0.625s`，pending/oldest 峰值为 `2350/0.691s`，结束时 pending/dead 为 `0/0`。因此这是一次有效的 3500 完整通过结果，但只有一轮，不能单独宣称 3500 已是可重复容量。
+
+| acquisition workload | 3000 P95 | 3500 P95 | 3000 平均 | 3500 平均 |
+| --- | ---: | ---: | ---: | ---: |
+| API | 0.10 ms | 2.50 ms | 0.111 ms | 0.520 ms |
+| Outbox | 0.01 ms | 0.01 ms | 0.044 ms | 0.130 ms |
+
+Pool 整体空池累计等待由 3000 单轮的 `13.58s` 增至 `74.29s`，API acquisition 的 P95/P99 上界也升至 `2.50/25ms`，说明 API 侧已经出现更明显的连接等待信号；但 Outbox P95 仍不高于 `0.01ms`，没有出现 Worker 被共享 Pool 饿死。该轮没有 canceled acquire，且端到端正确性和延迟仍完整，因此“连接等待开始放大”不能等同于“连接池已经成为容量瓶颈”。
+
+Worker 平均阶段为 `claim=3.37ms`、`prepare=11.19ms`、`publish=1.60ms`、`mark=3.42ms`。准备 Lane 约 `14.56ms`，仍低于 3500 req/s 下每 64 条约 `18.29ms` 的预算；`prepare_store=5.05ms`、`prepare_project_users=4.46ms` 也没有在本轮形成积压。下一步若继续寻找边界，应使用新鲜状态继续升档或先重复 3500；只有出现可重复失败后，才能根据当轮 acquisition/SQL 指标选择分池或 SQL A/B。
+
+报告：
+
+- `loadtest-rate-3500-db-acquire-r1.json`

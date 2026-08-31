@@ -107,7 +107,7 @@ go run ./cmd/im-loadtest \
 
 压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)；待验证实验见 [TODO.md](./TODO.md)。仓库中命名为 `loadtest-*.json` 的文件是文档所引用的脱敏实验报告，默认临时输出 `loadtest-report*.json` 不进入 Git。
 
-当前本机隔离库证据显示：在 Pool 24、Batch 64、3000 req/s、60000 条消息、10 个热点用户的四轮顺序平衡 A/B 中，HTTP、Realtime、Sync 均完整；批内 Presence 快照将每轮解析次数从 120000 降到约 9389，整批 `publish` 两轮中点从 16.54ms 降到 1.68ms，Realtime P95 中点从 7.528s 降到 1.195s。按 workload 增加数据库 acquisition 指标后，新鲜隔离库再次完整通过 3000 req/s：API/Outbox acquisition P95 分别不高于 0.10ms/0.01ms，说明共享 Pool 在该稳定档不是瓶颈；准备内部仍以 `prepare_store` 和 `prepare_project_users` 最大，需在下一档继续观察。这些都是单机热点用户结果，不代表多用户或生产容量；原始报告与完整边界见 [LOAD_TEST.md](./LOAD_TEST.md)。
+当前本机隔离库证据显示：在 Pool 24、Batch 64、3000 req/s、60000 条消息、10 个热点用户的四轮顺序平衡 A/B 中，批内 Presence 快照将整批 `publish` 两轮中点从 16.54ms 降到 1.68ms。按 workload 增加数据库 acquisition 指标后，3000 新鲜隔离库完整通过；随后一轮 3500 req/s 也完成 70000/70000 HTTP、280000/280000 Realtime 和 140000/140000 Sync，dropped/missing/dead 为 0。3500 时 API acquisition P95 上升到 2.50ms，但 Outbox P95 仍不高于 0.01ms，准备 Lane 约 14.56ms，尚未形成容量瓶颈。这只是单轮单机热点用户结果，不代表可重复容量、多用户或生产容量；原始报告与完整边界见 [LOAD_TEST.md](./LOAD_TEST.md)。
 
 ## 许可证
 

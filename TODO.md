@@ -14,7 +14,8 @@
 
   下一步：
 
-  - [ ] 使用新鲜隔离状态运行 3200 req/s；若完整通过则继续逐档升压，直到出现第一个可重复的正确性、延迟或积压边界。
+  - [x] 按用户要求跳过 3200，使用新鲜隔离状态运行一轮 3500 req/s；70000/70000 HTTP、280000/280000 Realtime、140000/140000 Sync 完整，dropped/missing/dead 为 0。
+  - [ ] 重复 3500 或继续升档，直到出现第一个可重复的正确性、延迟或积压边界；单轮通过不能当作稳定容量上限。
   - [ ] 同时比较 API/Outbox acquisition、`prepare_store`、`prepare_project_users`、HTTP、Realtime 和 pending/oldest，不能从一个平均阶段直接猜原因。
 
   仅当 acquisition 在边界负载下明显放大时，执行分池 A/B：
