@@ -8,5 +8,5 @@
 /coverage.out
 /coverage.html
 
-# Ad-hoc load-test output. Named benchmark evidence files are tracked.
+# Ad-hoc load-test output. Named evidence is tracked under benchmarks/reports/.
 loadtest-report*.json

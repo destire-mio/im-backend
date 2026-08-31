@@ -59,6 +59,8 @@ go run ./cmd/im-loadtest \
 
 ## 怎样看结果
 
+未经筛选的本地运行默认写到项目根目录的 `loadtest-report*.json`，这些文件被 Git 忽略。用于支撑文档结论的脱敏原始报告收录在 [`benchmarks/reports/`](./benchmarks/reports/)，索引见 [`benchmarks/README.md`](./benchmarks/README.md)。报告文件名本身不代表 PASS，必须结合本文的试验条件和结论解读。
+
 终端会输出三个独立结论：
 
 - `HTTP`：数据库写入请求的成功数、吞吐量和 P50/P95/P99 耗时。
@@ -97,7 +99,7 @@ go run ./cmd/im-loadtest \
   -rate 500 \
   -concurrency 100 \
   -delivery-wait 30s \
-  -report ./loadtest-rate-500.json
+  -report ./loadtest-report-rate-500.json
 ```
 
 压测器会把 HTTP 连接池的 `MaxIdleConns`、`MaxIdleConnsPerHost` 和 `MaxConnsPerHost` 设为 `-concurrency`，使连接在固定速率测试中复用。否则 Go 默认每个目标只保留 2 个空闲连接，高并发下会制造大量短连接，并可能以 `can't assign requested address` 先耗尽压测机临时端口；这种失败属于压测器瓶颈，不能算作服务端容量。
@@ -131,9 +133,9 @@ go run ./cmd/im-loadtest \
 
 `OUTBOX_BATCH_SIZE` 不是越大越好。批次越大，单个用户计数器的更新次数越少，但一次事务写入的同步记录和 Outbox payload 越多，会形成更明显的 WAL/索引写入突刺，并扩大 Lease 内需要完成的工作。
 
-当前默认 Batch 为 `64`。在两个同 schema、初始为空的隔离库上，保持 Pool 24、Worker 8、10 个热点用户、20 条 WebSocket 和 3000 req/s 不变时，Batch 64 相比 32 将 Realtime P95 从约 19.84 秒降到 5.29 秒，过程 pending 峰值从 37467 降到 16028，数据库空池累计等待从约 132.30 秒降到 8.75 秒；HTTP、Realtime、Sync 均完整，missing、duplicate、dead 为 0。报告为 `loadtest-rate-3000-outbox-b32-fresh.json` 与 `loadtest-rate-3000-outbox-b64-fresh.json`。
+当前默认 Batch 为 `64`。在两个同 schema、初始为空的隔离库上，保持 Pool 24、Worker 8、10 个热点用户、20 条 WebSocket 和 3000 req/s 不变时，Batch 64 相比 32 将 Realtime P95 从约 19.84 秒降到 5.29 秒，过程 pending 峰值从 37467 降到 16028，数据库空池累计等待从约 132.30 秒降到 8.75 秒；HTTP、Realtime、Sync 均完整，missing、duplicate、dead 为 0。报告为 `benchmarks/reports/loadtest-rate-3000-outbox-b32-fresh.json` 与 `benchmarks/reports/loadtest-rate-3000-outbox-b64-fresh.json`。
 
-当前默认 publish 并发为 `16`。主机 CPU 恢复空闲后，在两个由同一空库克隆的隔离库上保持 Pool 24、Batch 64 和上述负载不变，并发 16 相比 8 将 Realtime P95 从约 2.71 秒降到 0.63 秒，pending 峰值从 8600 降到 2256，oldest-age 峰值从 2.87 秒降到 0.76 秒，数据库空池累计等待从 25.03 秒降到 19.21 秒。两组 60000 个 HTTP 请求、240000 次 Realtime 投递和 120000 条 Sync 事件均完整，missing、duplicate、dead 为 0。代价是结束采样 RSS 约增加 25.5 MB。报告为 `loadtest-rate-3000-outbox-b64-w8-clean-rerun.json` 与 `loadtest-rate-3000-outbox-b64-w16-clean-rerun.json`。
+当前默认 publish 并发为 `16`。主机 CPU 恢复空闲后，在两个由同一空库克隆的隔离库上保持 Pool 24、Batch 64 和上述负载不变，并发 16 相比 8 将 Realtime P95 从约 2.71 秒降到 0.63 秒，pending 峰值从 8600 降到 2256，oldest-age 峰值从 2.87 秒降到 0.76 秒，数据库空池累计等待从 25.03 秒降到 19.21 秒。两组 60000 个 HTTP 请求、240000 次 Realtime 投递和 120000 条 Sync 事件均完整，missing、duplicate、dead 为 0。代价是结束采样 RSS 约增加 25.5 MB。报告为 `benchmarks/reports/loadtest-rate-3000-outbox-b64-w8-clean-rerun.json` 与 `benchmarks/reports/loadtest-rate-3000-outbox-b64-w16-clean-rerun.json`。
 
 这个结果只证明 `64` 优于本次热点模型中的 `32`，不证明继续放大仍会改善；历史上的 `256` 曾显著恶化。3000 req/s 下 Batch 64 仍有约 5.34 秒的 oldest-age 峰值，因此容量边界尚未消失。
 
@@ -180,7 +182,7 @@ B 在同一事务内先批量确保 counter 行存在，再按 `user_id` 一次�
 
 整条链路仍受同一 PostgreSQL 连续写入状态影响：四对中的第二轮无论是 A 还是 B 都明显更慢，并伴随 `prepare_store`、mark 和连接池等待上升。四对 A/B 结束时没有立即切换默认值；随后在保持 `per_user` 回退能力的前提下采用 B，并用新的空库继续复核，结果见下一节。
 
-报告：`loadtest-rate-3000-projection-ab-a1-per-user.json` 至 `a4-per-user.json`，以及 `loadtest-rate-3000-projection-ab-b1-bulk.json` 至 `b4-bulk.json`。
+报告：`benchmarks/reports/loadtest-rate-3000-projection-ab-a1-per-user.json` 至 `a4-per-user.json`，以及 `benchmarks/reports/loadtest-rate-3000-projection-ab-b1-bulk.json` 至 `b4-bulk.json`。
 
 ## 批量投影采用后的容量复核
 
@@ -217,9 +219,9 @@ Channel 最高水位             5 / 256
 
 报告：
 
-- `loadtest-rate-3000-bulk-default.json`
-- `loadtest-rate-3500-bulk-default-p24.json`
-- `loadtest-rate-3500-bulk-default-p32.json`
+- `benchmarks/reports/loadtest-rate-3000-bulk-default.json`
+- `benchmarks/reports/loadtest-rate-3500-bulk-default-p24.json`
+- `benchmarks/reports/loadtest-rate-3500-bulk-default-p32.json`
 
 ## 结构化 recipients 拆分 A/B
 
@@ -263,11 +265,11 @@ claim 2.18ms + prepare 12.71ms + publish 6.27ms + mark 6.39ms
 
 报告：
 
-- `loadtest-rate-3500-storage-ab-a1-jsonb.json`
-- `loadtest-rate-3500-storage-ab-b1-recipients.json`
-- `loadtest-rate-3500-storage-ab-b2-recipients.json`
-- `loadtest-rate-3500-storage-ab-a2-jsonb.json`
-- `loadtest-rate-3000-recipients-default.json`
+- `benchmarks/reports/loadtest-rate-3500-storage-ab-a1-jsonb.json`
+- `benchmarks/reports/loadtest-rate-3500-storage-ab-b1-recipients.json`
+- `benchmarks/reports/loadtest-rate-3500-storage-ab-b2-recipients.json`
+- `benchmarks/reports/loadtest-rate-3500-storage-ab-a2-jsonb.json`
+- `benchmarks/reports/loadtest-rate-3000-recipients-default.json`
 
 ## Outbox 两段流水线 A/B
 
@@ -315,12 +317,12 @@ B 使用无缓冲 Channel 交接已准备批次。投递第 N 批时，准备协
 
 报告：
 
-- `loadtest-rate-3500-pipeline-ab-a1-serial.json`
-- `loadtest-rate-3500-pipeline-ab-b1-pipeline.json`
-- `loadtest-rate-3500-pipeline-ab-b2-pipeline.json`
-- `loadtest-rate-3500-pipeline-ab-a2-serial.json`
-- `loadtest-rate-3000-pipeline-default.json`
-- `loadtest-rate-3000-pipeline-ab-serial.json`
+- `benchmarks/reports/loadtest-rate-3500-pipeline-ab-a1-serial.json`
+- `benchmarks/reports/loadtest-rate-3500-pipeline-ab-b1-pipeline.json`
+- `benchmarks/reports/loadtest-rate-3500-pipeline-ab-b2-pipeline.json`
+- `benchmarks/reports/loadtest-rate-3500-pipeline-ab-a2-serial.json`
+- `benchmarks/reports/loadtest-rate-3000-pipeline-default.json`
+- `benchmarks/reports/loadtest-rate-3000-pipeline-ab-serial.json`
 
 ## Presence 批内快照
 
@@ -376,10 +378,10 @@ B 两轮的平均阶段中点组成为：
 
 报告：
 
-- `loadtest-rate-3000-presence-ab-a1-per-recipient.json`
-- `loadtest-rate-3000-presence-ab-b1-batch.json`
-- `loadtest-rate-3000-presence-ab-b2-batch.json`
-- `loadtest-rate-3000-presence-ab-a2-per-recipient.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-ab-a1-per-recipient.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-ab-b1-batch.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-ab-b2-batch.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-ab-a2-per-recipient.json`
 
 ## Presence 优化后的升档诊断
 
@@ -402,10 +404,10 @@ B 两轮的平均阶段中点组成为：
 
 报告：
 
-- `loadtest-rate-3200-presence-default-r1.json`
-- `loadtest-rate-3000-presence-capacity-control-r1.json`
-- `loadtest-rate-3000-presence-pool24-control-r2.json`
-- `loadtest-rate-3000-presence-postrestart-control-r1.json`
+- `benchmarks/reports/loadtest-rate-3200-presence-default-r1.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-capacity-control-r1.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-pool24-control-r2.json`
+- `benchmarks/reports/loadtest-rate-3000-presence-postrestart-control-r1.json`
 
 ## 按 workload 拆分连接获取后的 3000 复核
 
@@ -424,7 +426,7 @@ Pool 整体发生 6442 次空池获取，所有 goroutine 的空池累计等待�
 
 报告：
 
-- `loadtest-rate-3000-db-acquire-r1.json`
+- `benchmarks/reports/loadtest-rate-3000-db-acquire-r1.json`
 
 ## 3500 req/s 单轮升档
 
@@ -443,7 +445,7 @@ Worker 平均阶段为 `claim=3.37ms`、`prepare=11.19ms`、`publish=1.60ms`、`
 
 报告：
 
-- `loadtest-rate-3500-db-acquire-r1.json`
+- `benchmarks/reports/loadtest-rate-3500-db-acquire-r1.json`
 
 ## 4000 req/s 单轮升档
 
@@ -466,7 +468,7 @@ Worker 平均阶段为 `claim=3.63ms`、`prepare=11.67ms`、`publish=1.60ms`、`
 
 报告：
 
-- `loadtest-rate-4000-db-acquire-r1.json`
+- `benchmarks/reports/loadtest-rate-4000-db-acquire-r1.json`
 
 ## 5000 req/s 首次明确越界
 
@@ -492,4 +494,4 @@ Realtime 和 Sync 在压测器的 30 秒窗口与单次核验时分别缺少 133
 
 报告：
 
-- `loadtest-rate-5000-db-acquire-r1.json`
+- `benchmarks/reports/loadtest-rate-5000-db-acquire-r1.json`

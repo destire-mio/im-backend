@@ -105,7 +105,7 @@ go run ./cmd/im-loadtest \
   -report ./loadtest-report.json
 ```
 
-压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)；待验证实验见 [TODO.md](./TODO.md)。仓库中命名为 `loadtest-*.json` 的文件是文档所引用的脱敏实验报告，默认临时输出 `loadtest-report*.json` 不进入 Git。
+压测方法、指标解释和实验边界见 [LOAD_TEST.md](./LOAD_TEST.md)；监控与排障顺序见 [OBSERVABILITY.md](./OBSERVABILITY.md)；待验证实验见 [TODO.md](./TODO.md)。已收录的脱敏原始报告和容量阶梯索引见 [benchmarks/README.md](./benchmarks/README.md)；项目根目录的默认临时输出 `loadtest-report*.json` 不进入 Git。
 
 当前本机隔离库证据显示：在 Pool 24、Batch 64、10 个热点用户下，批内 Presence 快照将 3000 req/s A/B 的整批 `publish` 两轮中点从 16.54ms 降到 1.68ms。增加数据库 acquisition 指标后，3000、3500 和 4000 的新鲜隔离库单轮完成全部 HTTP、Realtime 和 Sync；5000 则仅完成 97664/100000 HTTP，Realtime/Sync 未在核验窗口内完整，pending/oldest 峰值达到 `83072/36.738s`。API/Outbox acquisition P95 放大到 `250/50ms`，准备 Lane 约 32.83ms，远超每批 12.80ms 预算，而 `publish` 仍只有 1.16ms。成功写入的消息最终数据库计数完整、pending/dead 为 0；这证明 5000 明确过载但没有证明持久化丢失，精确可重复边界仍需在 4000～5000 之间复测。完整方法和原始报告见 [LOAD_TEST.md](./LOAD_TEST.md)。
 
