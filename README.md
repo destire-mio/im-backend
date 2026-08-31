@@ -10,6 +10,7 @@
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
 - Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 prepare 与当前批 publish，网络发布不占用数据库行锁。
 - Sync cursor 与 Outbox ready 在同一事务提交；`user_message_events` 同时作为断线补拉和 Worker 崩溃恢复时的权威 user/cursor 数据源，正常路径不再重复写 `outbox_recipients`。
+- 提供实验性的按用户准备模式：每条消息拆成参与用户的临时持久化任务，用户固定映射到 256 个逻辑分片，再由可配置的物理 Worker 消费；只有所有参与用户都完成 Sync 投影，Outbox 才会 ready。
 - 为每个用户分配连续 Sync cursor，支持快照分页补拉和设备 ACK；WebSocket 只负责实时通知，Sync API 负责恢复。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
 - Outbox 投递前对同批 recipient 去重，用两段 Redis pipeline 生成仅在本批存活的 Presence 快照，避免热点用户被重复查询。
@@ -31,6 +32,8 @@ POST /messages
   -> 客户端持久化
   -> POST /messages/ack
 ```
+
+当前默认仍是 `OUTBOX_PREPARE_MODE=inline`、`OUTBOX_PREPARE_WORKERS=1`。容量候选使用 `user_sharded/4`；逻辑分片数固定为 256，因此以后调整物理 Worker 数不需要重写已有任务的 shard。
 
 ## 本地运行
 

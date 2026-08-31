@@ -568,3 +568,37 @@ Realtime 和 Sync 在压测器的 30 秒窗口与单次核验时分别缺少 133
 报告：
 
 - `benchmarks/reports/loadtest-rate-5000-sync-events-default-r1.json`
+
+## Prepare Worker 按用户分片候选
+
+5000 req/s 的现有失败轮显示 inline 准备事务在高压下积压，但直接增加整批 Prepare Worker 会让包含相同用户的事务继续争抢同一行 `user_sync_counters`。候选实现改为先拆用户，再并行处理：
+
+```text
+message.created
+  -> dispatcher 写入 sender / receiver 两项临时任务
+  -> user_id % 256 得到固定逻辑 shard
+  -> shard % 4 分配到四个物理 Prepare Worker
+  -> 每个用户独立分配连续 cursor 并写 user_message_events
+  -> 两名参与者都完成后，Outbox 才原子 ready
+  -> 删除已完成事件的临时任务
+  -> 原投递 Worker 只 claim ready 事件并发送通知
+```
+
+固定 256 个逻辑 shard 的目的不是启动 256 个 goroutine，而是让任务归属长期稳定。当前四个物理 Worker 分别负责 `shard % 4 = 0/1/2/3`；以后改成 8 个时不需要更新表内 shard。每个逻辑 shard 还使用 PostgreSQL advisory transaction lock，多个应用实例不会同时处理同一用户 shard。单个热点用户仍必须串行，这是连续 cursor 的正确性约束；收益只来自不同用户之间的并行。
+
+候选配置为：
+
+```text
+OUTBOX_PREPARE_MODE=user_sharded
+OUTBOX_PREPARE_WORKERS=4
+OUTBOX_PROJECTION_MODE=bulk
+OUTBOX_PROJECTION_STORAGE=sync_events
+```
+
+`user_sharded` 当前只接受 `bulk + sync_events`，避免配置看似生效但实际走了不兼容的 JSONB/recipient 路径。默认仍保留 `inline/1`，直到真实压力结果和投影任务 failure policy 完成验收。
+
+压测报告新增 `projection_pending_jobs` 与最老任务年龄峰值，并保存 `outbox_prepare_workers=4`、`outbox_user_sharded_prepare_enabled=1`。阶段 Histogram 使用 `projection_dispatch`、`projection_begin`、`projection_claim`、`projection_project_users`、`projection_store`、`projection_commit` 和 `projection_batch`。判断时先看 projection backlog：若它持续增长，瓶颈仍在用户 Sync 投影；若它保持接近零而 Outbox pending 增长，瓶颈已移动到 ready 后的 claim/publish/mark 或共享数据库资源。
+
+已完成的真实 PostgreSQL 正确性测试证明：一侧用户完成时事件仍不可投递；另一侧完成后才 ready；进程已留下单侧 `user_message_events` 时可幂等恢复；4 Worker 处理 10 个用户、100 条环形消息后，共 200 条 Sync 行完整，每个用户 cursor 都为连续 `1..20`，临时任务为 0。它只证明机制正确，不代表 5000 req/s 容量已经改善。
+
+当前候选边界：投影 SQL 失败会按轮询重试，但尚未有独立 attempt/dead 状态；因此坏数据可能长期保持 unready。它适合本轮容量诊断，不在完成 failure policy 和切换流程验证前作为默认生产路径。

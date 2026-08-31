@@ -556,6 +556,59 @@ func TestMessageOutboxWorkerDefaultsEmptyProjectionStorageToSyncEvents(t *testin
 	}
 }
 
+func TestMessageOutboxWorkerConfiguresUserShardedPreparation(t *testing.T) {
+	config := defaultOutboxWorkerConfig()
+	config.PrepareMode = outboxPrepareModeUserSharded
+	config.PrepareWorkers = 4
+	worker, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config)
+	if err != nil {
+		t.Fatalf("create user-sharded message worker: %v", err)
+	}
+	if !worker.config.claimReadyOnly || worker.config.PrepareWorkers != 4 {
+		t.Fatalf("user-sharded config = %+v", worker.config)
+	}
+}
+
+func TestMessageOutboxWorkerRejectsInvalidPreparationConfig(t *testing.T) {
+	tests := []outboxWorkerConfig{
+		func() outboxWorkerConfig {
+			config := defaultOutboxWorkerConfig()
+			config.PrepareMode = "unsupported"
+			return config
+		}(),
+		func() outboxWorkerConfig {
+			config := defaultOutboxWorkerConfig()
+			config.PrepareWorkers = 4
+			return config
+		}(),
+		func() outboxWorkerConfig {
+			config := defaultOutboxWorkerConfig()
+			config.PrepareMode = outboxPrepareModeUserSharded
+			config.PrepareWorkers = messageProjectionVirtualShards + 1
+			return config
+		}(),
+		func() outboxWorkerConfig {
+			config := defaultOutboxWorkerConfig()
+			config.PrepareMode = outboxPrepareModeUserSharded
+			config.PrepareWorkers = 4
+			config.ProjectionMode = syncProjectionModePerUser
+			return config
+		}(),
+		func() outboxWorkerConfig {
+			config := defaultOutboxWorkerConfig()
+			config.PrepareMode = outboxPrepareModeUserSharded
+			config.PrepareWorkers = 4
+			config.ProjectionStorage = syncProjectionStorageJSONB
+			return config
+		}(),
+	}
+	for index, config := range tests {
+		if _, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
+			t.Fatalf("invalid preparation config %d was accepted", index)
+		}
+	}
+}
+
 func createPendingOutboxEvent(t *testing.T, db *pgxpool.Pool) string {
 	t.Helper()
 	server := httptest.NewServer(newTestApplication(t, db).routes())

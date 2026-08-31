@@ -39,10 +39,14 @@ type outboxBatchPreparer interface {
 }
 
 type outboxExecutionMode string
+type outboxPrepareMode string
 
 const (
 	outboxExecutionModeSerial   outboxExecutionMode = "serial"
 	outboxExecutionModePipeline outboxExecutionMode = "pipeline"
+
+	outboxPrepareModeInline      outboxPrepareMode = "inline"
+	outboxPrepareModeUserSharded outboxPrepareMode = "user_sharded"
 )
 
 type outboxWorkerConfig struct {
@@ -50,6 +54,8 @@ type outboxWorkerConfig struct {
 	BatchSize         int
 	Concurrency       int
 	ExecutionMode     outboxExecutionMode
+	PrepareMode       outboxPrepareMode
+	PrepareWorkers    int
 	ProjectionMode    syncProjectionMode
 	ProjectionStorage syncProjectionStorage
 	LeaseDuration     time.Duration
@@ -59,6 +65,7 @@ type outboxWorkerConfig struct {
 	BaseBackoff       time.Duration
 	MaxBackoff        time.Duration
 	jitter            func(time.Duration) time.Duration
+	claimReadyOnly    bool
 }
 
 type outboxWorker struct {
@@ -116,12 +123,25 @@ func normalizeOutboxExecutionMode(mode outboxExecutionMode) (outboxExecutionMode
 	}
 }
 
+func normalizeOutboxPrepareMode(mode outboxPrepareMode) (outboxPrepareMode, error) {
+	switch mode {
+	case "", outboxPrepareModeInline:
+		return outboxPrepareModeInline, nil
+	case outboxPrepareModeUserSharded:
+		return outboxPrepareModeUserSharded, nil
+	default:
+		return "", fmt.Errorf("unsupported outbox prepare mode %q", mode)
+	}
+}
+
 func defaultOutboxWorkerConfig() outboxWorkerConfig {
 	return outboxWorkerConfig{
 		EventTypes:        []string{"message.created"},
 		BatchSize:         64,
 		Concurrency:       16,
 		ExecutionMode:     outboxExecutionModePipeline,
+		PrepareMode:       outboxPrepareModeInline,
+		PrepareWorkers:    1,
 		ProjectionMode:    syncProjectionModeBulk,
 		ProjectionStorage: syncProjectionStorageSyncEvents,
 		LeaseDuration:     30 * time.Second,
@@ -179,6 +199,21 @@ func newMessageOutboxWorker(
 	config outboxWorkerConfig,
 	metricObservers ...*applicationMetrics,
 ) (*outboxWorker, error) {
+	prepareMode, err := normalizeOutboxPrepareMode(config.PrepareMode)
+	if err != nil {
+		return nil, err
+	}
+	config.PrepareMode = prepareMode
+	if config.PrepareWorkers <= 0 || config.PrepareWorkers > messageProjectionVirtualShards {
+		return nil, fmt.Errorf(
+			"outbox prepare workers must be between 1 and %d",
+			messageProjectionVirtualShards,
+		)
+	}
+	if prepareMode == outboxPrepareModeInline && config.PrepareWorkers != 1 {
+		return nil, errors.New("inline outbox preparation requires exactly one prepare worker")
+	}
+	config.claimReadyOnly = prepareMode == outboxPrepareModeUserSharded
 	projectionMode, err := normalizeSyncProjectionMode(config.ProjectionMode)
 	if err != nil {
 		return nil, err
@@ -189,6 +224,14 @@ func newMessageOutboxWorker(
 		return nil, err
 	}
 	config.ProjectionStorage = projectionStorage
+	if prepareMode == outboxPrepareModeUserSharded {
+		if projectionMode != syncProjectionModeBulk {
+			return nil, errors.New("user-sharded outbox preparation requires bulk projection mode")
+		}
+		if projectionStorage != syncProjectionStorageSyncEvents {
+			return nil, errors.New("user-sharded outbox preparation requires sync_events projection storage")
+		}
+	}
 	worker, err := newOutboxWorker(db, publisher, config, metricObservers...)
 	if err != nil {
 		return nil, err
@@ -448,6 +491,10 @@ func (worker *outboxWorker) completeDeliveryBatch(
 }
 
 func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
+	readyPredicate := ""
+	if worker.config.claimReadyOnly {
+		readyPredicate = " AND ready_at IS NOT NULL"
+	}
 	rows, err := worker.db.Query(
 		ctx,
 		`WITH candidates AS (
@@ -458,6 +505,7 @@ func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 		     AND event_type = ANY($3)
 		     AND next_attempt_at <= CURRENT_TIMESTAMP
 		     AND (locked_until IS NULL OR locked_until <= CURRENT_TIMESTAMP)
+		     `+readyPredicate+`
 		   ORDER BY next_attempt_at, created_at, event_id
 		   FOR UPDATE SKIP LOCKED
 		   LIMIT $1

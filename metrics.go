@@ -35,6 +35,8 @@ type applicationMetrics struct {
 	ackRequests                *prometheus.CounterVec
 	outboxWorkerConcurrency    prometheus.Gauge
 	outboxWorkerBatchSize      prometheus.Gauge
+	outboxPrepareWorkers       prometheus.Gauge
+	outboxUserShardedPrepare   prometheus.Gauge
 	outboxPipelineEnabled      prometheus.Gauge
 	outboxBatchPresenceEnabled prometheus.Gauge
 	outboxBatchPresenceBatches *prometheus.CounterVec
@@ -152,6 +154,16 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Name:      "outbox_worker_batch_size",
 			Help:      "Configured maximum number of Outbox events claimed per batch.",
 		}),
+		outboxPrepareWorkers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_prepare_workers",
+			Help:      "Configured number of user-sharded message projection workers; inline mode reports one.",
+		}),
+		outboxUserShardedPrepare: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_user_sharded_prepare_enabled",
+			Help:      "Whether message Sync projection is executed by the user-sharded preparation pool.",
+		}),
 		outboxPipelineEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_pipeline_enabled",
@@ -227,6 +239,8 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.ackRequests,
 		metrics.outboxWorkerConcurrency,
 		metrics.outboxWorkerBatchSize,
+		metrics.outboxPrepareWorkers,
+		metrics.outboxUserShardedPrepare,
 		metrics.outboxPipelineEnabled,
 		metrics.outboxBatchPresenceEnabled,
 		metrics.outboxBatchPresenceBatches,
@@ -326,6 +340,12 @@ func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConf
 	}
 	metrics.outboxWorkerConcurrency.Set(float64(config.Concurrency))
 	metrics.outboxWorkerBatchSize.Set(float64(config.BatchSize))
+	metrics.outboxPrepareWorkers.Set(float64(config.PrepareWorkers))
+	if config.PrepareMode == outboxPrepareModeUserSharded {
+		metrics.outboxUserShardedPrepare.Set(1)
+	} else {
+		metrics.outboxUserShardedPrepare.Set(0)
+	}
 	if config.ExecutionMode == outboxExecutionModePipeline {
 		metrics.outboxPipelineEnabled.Set(1)
 	} else {
@@ -424,6 +444,8 @@ type databaseStateCollector struct {
 	outboxPending     *prometheus.Desc
 	outboxOldestAge   *prometheus.Desc
 	outboxDead        *prometheus.Desc
+	projectionPending *prometheus.Desc
+	projectionOldest  *prometheus.Desc
 	ackDevices        *prometheus.Desc
 	ackMaxLag         *prometheus.Desc
 }
@@ -538,6 +560,14 @@ func newDatabaseStateCollector(db *pgxpool.Pool) *databaseStateCollector {
 			"im_backend_outbox_dead_events",
 			"Outbox events in the dead terminal state.", nil, nil,
 		),
+		projectionPending: prometheus.NewDesc(
+			"im_backend_outbox_projection_pending_jobs",
+			"User-sharded message projection jobs that have not completed.", nil, nil,
+		),
+		projectionOldest: prometheus.NewDesc(
+			"im_backend_outbox_projection_oldest_pending_job_age_seconds",
+			"Age in seconds of the oldest pending user-sharded message projection job.", nil, nil,
+		),
 		ackDevices: prometheus.NewDesc(
 			"im_backend_device_sync_states",
 			"Number of devices with a recorded ACK state.", nil, nil,
@@ -554,6 +584,8 @@ func (collector *databaseStateCollector) Describe(destination chan<- *prometheus
 	destination <- collector.outboxPending
 	destination <- collector.outboxOldestAge
 	destination <- collector.outboxDead
+	destination <- collector.projectionPending
+	destination <- collector.projectionOldest
 	destination <- collector.ackDevices
 	destination <- collector.ackMaxLag
 }
@@ -577,6 +609,19 @@ func (collector *databaseStateCollector) Collect(destination chan<- prometheus.M
 		return
 	}
 
+	var projectionPending, projectionOldest float64
+	err = collector.db.QueryRow(
+		ctx,
+		`SELECT count(*)::double precision,
+		        COALESCE(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - min(created_at)), 0)::double precision
+		 FROM message_projection_jobs
+		 WHERE projected_at IS NULL`,
+	).Scan(&projectionPending, &projectionOldest)
+	if err != nil {
+		destination <- prometheus.MustNewConstMetric(collector.collectionSuccess, prometheus.GaugeValue, 0)
+		return
+	}
+
 	var devices, maxLag float64
 	err = collector.db.QueryRow(
 		ctx,
@@ -594,6 +639,8 @@ func (collector *databaseStateCollector) Collect(destination chan<- prometheus.M
 	destination <- prometheus.MustNewConstMetric(collector.outboxPending, prometheus.GaugeValue, pending)
 	destination <- prometheus.MustNewConstMetric(collector.outboxOldestAge, prometheus.GaugeValue, oldestAge)
 	destination <- prometheus.MustNewConstMetric(collector.outboxDead, prometheus.GaugeValue, dead)
+	destination <- prometheus.MustNewConstMetric(collector.projectionPending, prometheus.GaugeValue, projectionPending)
+	destination <- prometheus.MustNewConstMetric(collector.projectionOldest, prometheus.GaugeValue, projectionOldest)
 	destination <- prometheus.MustNewConstMetric(collector.ackDevices, prometheus.GaugeValue, devices)
 	destination <- prometheus.MustNewConstMetric(collector.ackMaxLag, prometheus.GaugeValue, maxLag)
 }
