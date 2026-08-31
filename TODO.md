@@ -9,7 +9,9 @@
 - [x] 真实 PostgreSQL 已验证单侧完成不可发布、半完成恢复、自发自收、4 Worker + 10 用户并发，以及每用户连续 cursor。
 - [x] 用新鲜隔离数据库和空 Redis DB 运行 5000 req/s 首轮诊断：HTTP 仅 82173/100000，projection pending/oldest 峰值 `115450/46.373s`；停流后 82173 条消息最终对应 164346 条连续 Sync 事件，jobs/pending/dead 为 0。
 - [x] 修复 ready 门控把 `event_id` 列转成 text 导致的全索引扫描：改成输入 ID 转 UUID。82173 行表上的同形执行计划由扫描 82173 项、38890 个 shared buffer、92.078ms，变为 64 次 UUID 主键点查、239 个 buffer、0.237ms；大表上的投影集成测试通过。
-- [ ] 若 UUID 点查后 `projection_store` 仍由跨 shard 的同一 Outbox 行协调主导，再把 ready finalizer 从四个用户投影事务中拆出；一次只改一个因素。
+- [x] UUID 修复后的同规格轮次把 `projection_store` 从 193.56ms 降到 15.59ms、projection jobs 峰值从 115450 降到 36480，成功写入消息的 Realtime/Sync 全部完整；它已不再是首要阶段，因此暂不拆 ready finalizer。
+- [x] 修复轮仍只完成 85032/100000 HTTP；API acquisition 平均/P95 为 `105.85/250ms`，共享 Pool 空闲等待累计 18370 秒。下一个实测瓶颈是 API 与完整异步链路争用同一 PostgreSQL Pool/写资源，不是 cursor 分配或 publish。
+- [ ] 下一轮保持数据库总连接数 24，单独 A/B shared 24 与 API 18 + Worker 6；若只把积压从 HTTP 转回 projection/Outbox 而不能同时满足完整性与窗口，则不采用分池。
 - [ ] 候选当前保持 `inline/1` 默认；若压测方向成立，采用前补齐投影任务的独立 retry/dead 策略，并验证混合版本部署或明确要求先排空再切换。
 
 ## Sync/Outbox recipient 统一 A/B
@@ -43,7 +45,7 @@
   - [ ] 在 4000～5000 区间内使用新鲜状态复测，找到第一个可重复失败档；单轮 4000 通过不能当作稳定容量上限。
   - [ ] 同时比较 API/Outbox acquisition、`prepare_store`、`prepare_project_users`、HTTP、Realtime 和 pending/oldest，不能从一个平均阶段直接猜原因。
 
-  5000 已出现 API/Outbox acquisition P95 `250/50ms`；在区间内找到可重复失败档后，执行分池 A/B：
+  inline 5000 已出现 API/Outbox acquisition P95 `250/100ms`；用户分片修复轮为 `250/250ms`，且异步链路排空时 HTTP 只完成 85032/100000。执行固定总连接数的分池 A/B：
 
   - A：API 与 Worker 共用 Pool，总连接数固定为 24。
   - B：API 与 Worker 分池，但总连接数仍固定为 24；初始候选为 API 18 + Worker 6，后续只根据 acquisition 指标校准。

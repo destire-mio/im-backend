@@ -628,3 +628,30 @@ OUTBOX_PROJECTION_STORAGE=sync_events
 报告：
 
 - `benchmarks/reports/loadtest-rate-5000-user-sharded-w4-r1.json`
+
+### UUID 点查修复后的同规格重跑
+
+第二轮使用新的隔离数据库与空 Redis DB，只把 ready 门控的 `event_id` 匹配改为输入值转 UUID；Pool 24、4 个 Prepare Worker 和 5000 req/s 等条件保持不变。直接阶段结果确认修复命中：
+
+| 指标 | 首轮 | UUID 修复轮 |
+| --- | ---: | ---: |
+| `projection_store` | 193.56 ms | 15.59 ms |
+| `projection_batch` | 241.24 ms | 32.16 ms |
+| `projection_dispatch` | 155.86 ms | 83.85 ms |
+| projection pending 峰值 | 115450 | 36480 |
+| projection oldest 峰值 | 46.373 s | 18.463 s |
+| Outbox acquisition 平均 | 32.58 ms | 9.74 ms |
+
+修复轮接受的 85032 条消息全部在核验窗口内完成：Realtime `340128/340128`、Sync `170064/170064`，missing、duplicate、unexpected、dead 均为 0，结束时 projection jobs 与 Outbox pending 都为 0。这说明 UUID 全扫描确实是首版 `projection_store` 的主要缺陷，修复后四个用户 Worker 能把已接受消息的异步链路排空。
+
+但整轮仍必须判为失败：HTTP 只有 `85032/100000`，14968 个计划请求未能开始，实际成功吞吐 `4203.5 req/s`，HTTP P95 `280.77ms`。API acquisition 平均/P50/P95 为 `105.85ms / <=250ms / <=250ms`，Outbox 为 `9.74ms / <=0.01ms / <=250ms`；共享 Pool 的 181071 次 acquisition 中有 170996 次遇到空池，所有 goroutine 的等待累计 `18370.20s`。
+
+这轮暴露出的下一个瓶颈不是 cursor 分配：`projection_project_users` 平均只有 3.01ms，publish 只有 1.55ms。问题是更快的异步链路在流量期间同时执行 dispatcher 任务写入、4 个投影事务、ready、投递重建和 published 更新，与 API 共用 24 个连接及同一 PostgreSQL 写资源；异步侧排空了，API 却被反压。`projection_dispatch` 仍达 83.85ms，也说明每条消息额外生成两项持久任务带来明显写放大。
+
+因此不继续增加 Worker，也不立即拆 ready finalizer。下一项受控实验应固定数据库总连接数为 24，只比较 shared 24 与 API 18 + Worker 6：它只能验证资源隔离，不能凭配置本身增加数据库容量。若分池只是让 HTTP 完整、但 projection/Outbox 无法在窗口内排空，则仍不采用用户分片候选。
+
+最终数据库再次核对为 85032 条 message、170064 条唯一 user/message Sync 事件、每用户 cursor 无 gap、85032 个 published Outbox、0 个 projection job、0 个 pending/dead、0 个 `outbox_recipients`。
+
+报告：
+
+- `benchmarks/reports/loadtest-rate-5000-user-sharded-w4-r2.json`
