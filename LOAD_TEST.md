@@ -444,3 +444,26 @@ Worker 平均阶段为 `claim=3.37ms`、`prepare=11.19ms`、`publish=1.60ms`、`
 报告：
 
 - `loadtest-rate-3500-db-acquire-r1.json`
+
+## 4000 req/s 单轮升档
+
+继续使用新鲜隔离数据库和空 Redis DB，只将负载提高为 4000 req/s、80000 条消息，其余条件与 3500 单轮相同。该轮 HTTP `80000/80000`、Realtime `320000/320000`、Sync `160000/160000` 全部完整，dropped、failed、missing、duplicate、unexpected、dead 均为 0；结束时 pending/dead 为 `0/0`。因此 4000 在本轮完整通过，但仍不能据单轮结果宣称可重复容量。
+
+| 指标 | 3500 单轮 | 4000 单轮 |
+| --- | ---: | ---: |
+| HTTP P95 / P99 | 10.20 / 41.46 ms | 37.38 / 85.51 ms |
+| Realtime P95 | 0.625 s | 1.768 s |
+| pending / oldest 峰值 | 2350 / 0.691 s | 7190 / 1.799 s |
+| API acquisition 平均 / P95 | 0.520 / 2.50 ms | 1.944 / 25.00 ms |
+| Outbox acquisition 平均 / P95 | 0.130 / 0.01 ms | 0.466 / 1.00 ms |
+| Pool 空池累计等待 | 74.29 s | 317.76 s |
+
+连接等待已从“预警”变为明显压力：API acquisition P95 增大十倍，Outbox P95 也从 `0.01ms` 升至 `1ms`，且 Pool 空池累计等待约为 3500 单轮的 4.3 倍。它已经实质影响 HTTP 长尾，但本轮没有 canceled acquire，Worker 也没有被饿死或留下最终积压，所以仍不能直接断言“分池就是容量修复”。
+
+Worker 平均阶段为 `claim=3.63ms`、`prepare=11.67ms`、`publish=1.60ms`、`mark=4.21ms`。准备 Lane 约 `15.30ms`，而 4000 req/s 下每 64 条预算为 `16.00ms`，只剩约 `0.70ms` 余量；投递 Lane 约 `5.81ms`。`prepare_store=5.17ms` 和 `prepare_project_users=4.34ms` 没有像 acquisition 一样相对 3500 明显放大，但它们组成的准备 Lane 已接近吞吐预算。
+
+因此 4000 当前同时出现两项边界信号：共享 Pool acquisition 推高 HTTP 长尾，准备 Lane 接近 Worker 吞吐预算。下一步应重复 4000 验证波动，或继续升档捕获第一个失败；若 acquisition 放大可重复，再用固定总连接数的共享/分池 A/B 判断争用因果，不能在单轮通过后直接改架构。
+
+报告：
+
+- `loadtest-rate-4000-db-acquire-r1.json`

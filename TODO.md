@@ -15,10 +15,11 @@
   下一步：
 
   - [x] 按用户要求跳过 3200，使用新鲜隔离状态运行一轮 3500 req/s；70000/70000 HTTP、280000/280000 Realtime、140000/140000 Sync 完整，dropped/missing/dead 为 0。
-  - [ ] 重复 3500 或继续升档，直到出现第一个可重复的正确性、延迟或积压边界；单轮通过不能当作稳定容量上限。
+  - [x] 使用新鲜隔离状态运行一轮 4000 req/s；80000/80000 HTTP、320000/320000 Realtime、160000/160000 Sync 完整，但 API/Outbox acquisition P95 已升到 `25/1ms`，准备 Lane 约 `15.30ms`，接近 `16ms` 预算。
+  - [ ] 重复 4000 或继续升档，直到出现第一个可重复的正确性、延迟或积压边界；单轮通过不能当作稳定容量上限。
   - [ ] 同时比较 API/Outbox acquisition、`prepare_store`、`prepare_project_users`、HTTP、Realtime 和 pending/oldest，不能从一个平均阶段直接猜原因。
 
-  仅当 acquisition 在边界负载下明显放大时，执行分池 A/B：
+  4000 单轮 acquisition 已明显放大；若重复轮方向一致，执行分池 A/B：
 
   - A：API 与 Worker 共用 Pool，总连接数固定为 24。
   - B：API 与 Worker 分池，但总连接数仍固定为 24；初始候选为 API 18 + Worker 6，后续只根据 acquisition 指标校准。
