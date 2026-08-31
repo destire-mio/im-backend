@@ -83,11 +83,13 @@ func newMessageProjectionPool(
 func (pool *messageProjectionPool) Run(ctx context.Context) error {
 	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
 	var waitGroup sync.WaitGroup
-	waitGroup.Add(pool.workers + 1)
-	go func() {
-		defer waitGroup.Done()
-		pool.runDispatcher(ctx)
-	}()
+	waitGroup.Add(pool.workers * 2)
+	for dispatcherIndex := 0; dispatcherIndex < pool.workers; dispatcherIndex++ {
+		go func(index int) {
+			defer waitGroup.Done()
+			pool.runDispatcher(ctx, index)
+		}(dispatcherIndex)
+	}
 	for workerIndex := 0; workerIndex < pool.workers; workerIndex++ {
 		go func(index int) {
 			defer waitGroup.Done()
@@ -98,8 +100,8 @@ func (pool *messageProjectionPool) Run(ctx context.Context) error {
 	return nil
 }
 
-func (pool *messageProjectionPool) runDispatcher(ctx context.Context) {
-	limit := pool.batchSize * pool.workers
+func (pool *messageProjectionPool) runDispatcher(ctx context.Context, dispatcherIndex int) {
+	limit := pool.batchSize
 	for {
 		started := time.Now()
 		attemptContext, cancelAttempt := context.WithTimeout(ctx, pool.attemptTimeout)
@@ -107,7 +109,7 @@ func (pool *messageProjectionPool) runDispatcher(ctx context.Context) {
 		cancelAttempt()
 		pool.metrics.ObserveOutboxStage(outboxStageProjectionDispatch, time.Since(started))
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("message projection dispatch: %v", err)
+			log.Printf("message projection dispatcher %d: %v", dispatcherIndex, err)
 		}
 		if ctx.Err() != nil {
 			return
