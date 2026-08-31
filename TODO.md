@@ -7,7 +7,9 @@
 - [x] 每个逻辑 shard 使用 PostgreSQL advisory transaction lock 保证跨实例单所有者；同一用户的 `user_sync_counters` 仍严格串行，避免 cursor 重复或跳号。
 - [x] 只有参与者任务全部完成才在同一事务中标记 Outbox ready；ready 后删除临时任务，避免按每条消息永久保留两行。
 - [x] 真实 PostgreSQL 已验证单侧完成不可发布、半完成恢复、自发自收、4 Worker + 10 用户并发，以及每用户连续 cursor。
-- [ ] 用新鲜隔离数据库和空 Redis DB 运行 5000 req/s 诊断轮，同时记录 projection pending/oldest、`projection_*` 阶段、API/Outbox acquisition、HTTP、Realtime、Sync 和最终排空计数。
+- [x] 用新鲜隔离数据库和空 Redis DB 运行 5000 req/s 首轮诊断：HTTP 仅 82173/100000，projection pending/oldest 峰值 `115450/46.373s`；停流后 82173 条消息最终对应 164346 条连续 Sync 事件，jobs/pending/dead 为 0。
+- [ ] 修复 ready 门控把 `event_id` 列转成 text 导致的全索引扫描：改成输入 ID 转 UUID，让 PostgreSQL 对每项使用 UUID 主键点查；同规格重跑前先用真实执行计划和集成测试确认。
+- [ ] 若 UUID 点查后 `projection_store` 仍由跨 shard 的同一 Outbox 行协调主导，再把 ready finalizer 从四个用户投影事务中拆出；一次只改一个因素。
 - [ ] 候选当前保持 `inline/1` 默认；若压测方向成立，采用前补齐投影任务的独立 retry/dead 策略，并验证混合版本部署或明确要求先排空再切换。
 
 ## Sync/Outbox recipient 统一 A/B

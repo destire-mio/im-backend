@@ -602,3 +602,29 @@ OUTBOX_PROJECTION_STORAGE=sync_events
 已完成的真实 PostgreSQL 正确性测试证明：一侧用户完成时事件仍不可投递；另一侧完成后才 ready；进程已留下单侧 `user_message_events` 时可幂等恢复；4 Worker 处理 10 个用户、100 条环形消息后，共 200 条 Sync 行完整，每个用户 cursor 都为连续 `1..20`，临时任务为 0。它只证明机制正确，不代表 5000 req/s 容量已经改善。
 
 当前候选边界：投影 SQL 失败会按轮询重试，但尚未有独立 attempt/dead 状态；因此坏数据可能长期保持 unready。它适合本轮容量诊断，不在完成 failure policy 和切换流程验证前作为默认生产路径。
+
+### 5000 req/s 首轮：候选实现失败
+
+使用新鲜隔离数据库、空 Redis DB 15、Pool 24、Batch 64、publish 并发 16、4 个用户分片 Prepare Worker、10 个用户、20 条 WebSocket、100000 条消息、5000 req/s、max-inflight 1000 和 30 秒窗口运行。指标确认 `user_sharded=1 / prepare_workers=4 / bulk=1 / sync_events=1`。
+
+该轮只完成 `82173/100000` HTTP，17827 个计划请求因 in-flight 槽已满而未启动，实际成功吞吐 `4039.4 req/s`，HTTP P95 `317.55ms`。窗口内 Realtime 为 `88972/328692`，Sync 为 `49280/164346`；Outbox pending/oldest 峰值 `77307/46.363s`，projection pending/oldest 峰值 `115450/46.373s`。因此候选明确失败，不能采用，也不能把“4 个 Worker”本身当成吞吐改善。
+
+| 用户分片阶段 | 平均耗时 |
+| --- | ---: |
+| `projection_dispatch` | 155.86 ms |
+| `projection_begin` | 40.77 ms |
+| `projection_claim` | 0.93 ms |
+| `projection_project_users` | 3.92 ms |
+| `projection_store` | 193.56 ms |
+| `projection_commit` | 1.42 ms |
+| `projection_batch` | 241.24 ms |
+
+真正的 cursor 分配与 Sync 写入 `projection_project_users` 只有 3.92ms，最慢的是任务完成与 ready 门控所在的 `projection_store`。同时 API/Outbox acquisition 平均为 `115.36/32.58ms`，P95 桶上界均为 `250ms`，说明低效 store SQL 和四个事务共同占用共享 Pool 后也反压了 HTTP。
+
+检查 SQL 发现首版使用 `event.event_id::text = ANY($1::text[])`。在追赶完成后的 82173 行 Outbox 上，同形只读执行计划扫描整棵 UUID 主键索引，过滤 82109 行，命中 38890 个 shared buffer，耗时 `92.078ms`；改写为 `unnest(text[])` 后把输入项转为 UUID、保持索引列不变，执行计划变成 64 次 UUID 主键点查，只命中 239 个 buffer，耗时 `0.237ms`。这是约束明确的 SQL 缺陷，下一轮先只修这一项；若修后 store 仍慢，再判断两个用户 shard 为同一 Outbox event 会合时的行协调成本，不能把两个改动混在一起。
+
+压测器退出后 Worker 继续追赶，最终数据库为 82173 条 message、164346 条唯一 user/message Sync 事件、每用户 cursor 无 gap、82173 个 published Outbox、0 个 projection job、0 个 pending/dead、0 个 `outbox_recipients`。所以本轮失败仍是时间窗口和容量失败，不是已成功写入数据最终丢失。
+
+报告：
+
+- `benchmarks/reports/loadtest-rate-5000-user-sharded-w4-r1.json`
