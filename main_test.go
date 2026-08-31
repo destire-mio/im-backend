@@ -625,7 +625,56 @@ func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
 	}
 }
 
-func TestStructuredRecipientsRecoverAfterProjectionCommitBeforePublish(t *testing.T) {
+func TestStructuredProjectionRecoversAfterProjectionCommitBeforePublish(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		prepareStorage   syncProjectionStorage
+		restartStorage   syncProjectionStorage
+		storedRecipients int
+	}{
+		{
+			name:             "recipients_to_recipients",
+			prepareStorage:   syncProjectionStorageRecipients,
+			restartStorage:   syncProjectionStorageRecipients,
+			storedRecipients: 2,
+		},
+		{
+			name:             "recipients_to_sync_events",
+			prepareStorage:   syncProjectionStorageRecipients,
+			restartStorage:   syncProjectionStorageSyncEvents,
+			storedRecipients: 2,
+		},
+		{
+			name:             "sync_events_to_sync_events",
+			prepareStorage:   syncProjectionStorageSyncEvents,
+			restartStorage:   syncProjectionStorageSyncEvents,
+			storedRecipients: 0,
+		},
+		{
+			name:             "sync_events_to_recipients",
+			prepareStorage:   syncProjectionStorageSyncEvents,
+			restartStorage:   syncProjectionStorageRecipients,
+			storedRecipients: 0,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testStructuredProjectionRecovery(
+				t,
+				test.prepareStorage,
+				test.restartStorage,
+				test.storedRecipients,
+			)
+		})
+	}
+}
+
+func testStructuredProjectionRecovery(
+	t *testing.T,
+	prepareStorage syncProjectionStorage,
+	restartStorage syncProjectionStorage,
+	storedRecipients int,
+) {
+	t.Helper()
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
@@ -635,6 +684,7 @@ func TestStructuredRecipientsRecoverAfterProjectionCommitBeforePublish(t *testin
 
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
+	config.ProjectionStorage = prepareStorage
 	first := mustMessageTestWorker(t, db, &testPublisher{}, config)
 	claimed, err := first.claim(context.Background())
 	if err != nil || len(claimed) != 1 {
@@ -664,7 +714,7 @@ func TestStructuredRecipientsRecoverAfterProjectionCommitBeforePublish(t *testin
 	).Scan(&storedPayloadVersion, &ready, &published, &syncEvents, &recipients); err != nil {
 		t.Fatalf("read committed projection: %v", err)
 	}
-	if storedPayloadVersion != 3 || !ready || published || syncEvents != 2 || recipients != 2 {
+	if storedPayloadVersion != 3 || !ready || published || syncEvents != 2 || recipients != storedRecipients {
 		t.Fatalf(
 			"committed projection = payload %d ready %v published %v sync %d recipients %d",
 			storedPayloadVersion,
@@ -685,6 +735,7 @@ func TestStructuredRecipientsRecoverAfterProjectionCommitBeforePublish(t *testin
 		t.Fatalf("expire projected event lease: %v", err)
 	}
 	publisher := &testPublisher{}
+	config.ProjectionStorage = restartStorage
 	restarted := mustMessageTestWorker(t, db, publisher, config)
 	processed, err := restarted.RunOnce(context.Background())
 	if err != nil || processed != 1 {
@@ -712,7 +763,7 @@ func TestStructuredRecipientsRecoverAfterProjectionCommitBeforePublish(t *testin
 	).Scan(&published, &syncEvents, &recipients); err != nil {
 		t.Fatalf("read restarted projection: %v", err)
 	}
-	if !published || syncEvents != 2 || recipients != 2 {
+	if !published || syncEvents != 2 || recipients != storedRecipients {
 		t.Fatalf("restart state = published %v sync %d recipients %d", published, syncEvents, recipients)
 	}
 }
@@ -761,32 +812,67 @@ func TestJSONBProjectionStorageRemainsAvailableForRollback(t *testing.T) {
 	}
 }
 
-func TestStructuredProjectionStoresOneRecipientForSelfMessage(t *testing.T) {
-	db := openTestDatabase(t)
-	server := httptest.NewServer(newTestApplication(t, db).routes())
-	t.Cleanup(server.Close)
-	account := registerTestAccount(t, db, server.URL, uniqueUsername("self"), "Self Sender")
-	created := createMessageThroughAPI(t, server.URL, account.Auth.AccessToken, account.User.ID, "note to self")
-	projectPendingMessageEvents(t, db)
+func TestStructuredProjectionStoresOneSyncEventForSelfMessage(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		storage          syncProjectionStorage
+		storedRecipients int
+	}{
+		{name: "recipients", storage: syncProjectionStorageRecipients, storedRecipients: 1},
+		{name: "sync_events", storage: syncProjectionStorageSyncEvents, storedRecipients: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := openTestDatabase(t)
+			server := httptest.NewServer(newTestApplication(t, db).routes())
+			t.Cleanup(server.Close)
+			account := registerTestAccount(t, db, server.URL, uniqueUsername("self"), "Self Sender")
+			created := createMessageThroughAPI(t, server.URL, account.Auth.AccessToken, account.User.ID, "note to self")
+			config := defaultOutboxWorkerConfig()
+			config.BatchSize = 1
+			config.ProjectionStorage = test.storage
+			worker := mustMessageTestWorker(t, db, &testPublisher{}, config)
+			processed, err := worker.RunOnce(context.Background())
+			if err != nil || processed != 1 {
+				t.Fatalf("self-message worker processed %d, err %v", processed, err)
+			}
 
-	var syncEvents, recipients int
-	if err := db.QueryRow(
-		context.Background(),
-		`SELECT (SELECT count(*) FROM user_message_events WHERE message_id = $1),
-		        (SELECT count(*)
-		         FROM outbox_recipients AS recipient
-		         JOIN outbox_events AS event USING (event_id)
-		         WHERE event.message_id = $1)`,
-		created.ID,
-	).Scan(&syncEvents, &recipients); err != nil {
-		t.Fatalf("read self-message projection: %v", err)
-	}
-	if syncEvents != 1 || recipients != 1 {
-		t.Fatalf("self-message projection = sync %d recipients %d, want 1 and 1", syncEvents, recipients)
+			var syncEvents, recipients int
+			if err := db.QueryRow(
+				context.Background(),
+				`SELECT (SELECT count(*) FROM user_message_events WHERE message_id = $1),
+				        (SELECT count(*)
+				         FROM outbox_recipients AS recipient
+				         JOIN outbox_events AS event USING (event_id)
+				         WHERE event.message_id = $1)`,
+				created.ID,
+			).Scan(&syncEvents, &recipients); err != nil {
+				t.Fatalf("read self-message projection: %v", err)
+			}
+			if syncEvents != 1 || recipients != test.storedRecipients {
+				t.Fatalf(
+					"self-message projection = sync %d recipients %d, want 1 and %d",
+					syncEvents,
+					recipients,
+					test.storedRecipients,
+				)
+			}
+		})
 	}
 }
 
 func TestStructuredProjectionRollsBackWhenLeaseIsLost(t *testing.T) {
+	for _, storage := range []syncProjectionStorage{
+		syncProjectionStorageRecipients,
+		syncProjectionStorageSyncEvents,
+	} {
+		t.Run(string(storage), func(t *testing.T) {
+			testStructuredProjectionLeaseLoss(t, storage)
+		})
+	}
+}
+
+func testStructuredProjectionLeaseLoss(t *testing.T, storage syncProjectionStorage) {
+	t.Helper()
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
@@ -796,6 +882,7 @@ func TestStructuredProjectionRollsBackWhenLeaseIsLost(t *testing.T) {
 
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
+	config.ProjectionStorage = storage
 	worker := mustMessageTestWorker(t, db, &testPublisher{}, config)
 	claimed, err := worker.claim(context.Background())
 	if err != nil || len(claimed) != 1 {

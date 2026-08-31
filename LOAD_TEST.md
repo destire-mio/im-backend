@@ -263,6 +263,19 @@ claim 2.18ms + prepare 12.71ms + publish 6.27ms + mark 6.39ms
 
 这说明去掉重复的 `outbox_recipients` 写入仍是减少 prepare 写放大的候选方向，但在继续改变数据模型前，先用执行模式 A/B 验证四个阶段的串行调度本身是否限制批次吞吐。
 
+### Sync event 统一投递恢复候选
+
+为验证 `outbox_recipients` 是否可以由已有的 `user_message_events` 取代，现在保留两种可切换的结构化存储：
+
+```text
+A：OUTBOX_PROJECTION_STORAGE=recipients（当前默认）
+B：OUTBOX_PROJECTION_STORAGE=sync_events（候选）
+```
+
+`sync_events` 在正常路径中只把 `user_message_events` 和 `outbox_events.ready_at` 放在同一事务提交，不再插入 `outbox_recipients`。若在提交后、publish 前崩溃，重启 Worker 通过 `outbox_events.message_id → user_message_events.message_id` 批量重建 user/cursor；该恢复只发生在已 ready 事件的重试路径，正常首次投递仍使用内存中的投影结果。
+
+集成测试已覆盖提交后崩溃恢复、Lease 丢失全事务回滚、自发自收，以及 `recipients`/`sync_events` 双向切换恢复。候选模式尚未切为默认，也尚未删除 `outbox_recipients`；是否采用以新鲜隔离库 A/B 的 `prepare_store`、准备 Lane、pending/oldest 和端到端正确性为准。
+
 报告：
 
 - `benchmarks/reports/loadtest-rate-3500-storage-ab-a1-jsonb.json`

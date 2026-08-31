@@ -41,6 +41,7 @@ type applicationMetrics struct {
 	outboxBatchPresenceUsers   prometheus.Counter
 	outboxProjectionBulk       prometheus.Gauge
 	outboxProjectionRecipients prometheus.Gauge
+	outboxProjectionSyncEvents prometheus.Gauge
 	outboxProjectionBatches    prometheus.Counter
 	outboxProjectionUsers      prometheus.Counter
 	outboxProjectionQueries    prometheus.Histogram
@@ -181,6 +182,11 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Name:      "outbox_projection_recipients_enabled",
 			Help:      "Whether structured Outbox recipients replace the projected JSONB payload rewrite.",
 		}),
+		outboxProjectionSyncEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "im_backend",
+			Name:      "outbox_projection_sync_events_enabled",
+			Help:      "Whether authoritative Sync rows also provide Outbox recipients during recovery.",
+		}),
 		outboxProjectionBatches: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_projection_batches_total",
@@ -227,6 +233,7 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.outboxBatchPresenceUsers,
 		metrics.outboxProjectionBulk,
 		metrics.outboxProjectionRecipients,
+		metrics.outboxProjectionSyncEvents,
 		metrics.outboxProjectionBatches,
 		metrics.outboxProjectionUsers,
 		metrics.outboxProjectionQueries,
@@ -333,6 +340,11 @@ func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConf
 		metrics.outboxProjectionRecipients.Set(1)
 	} else {
 		metrics.outboxProjectionRecipients.Set(0)
+	}
+	if config.ProjectionStorage == syncProjectionStorageSyncEvents {
+		metrics.outboxProjectionSyncEvents.Set(1)
+	} else {
+		metrics.outboxProjectionSyncEvents.Set(0)
 	}
 }
 

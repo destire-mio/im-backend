@@ -34,7 +34,8 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 | `im_backend_outbox_batch_presence_enabled` | `0` 为每 recipient 独立查 Presence，`1` 为同批用户去重并批量预取 | Outbox 配置 |
 | `im_backend_outbox_batch_presence_batches_total` / `users_total` | Presence 快照批次与其唯一用户总数；二者相除得到平均唯一用户数/批 | Redis Presence |
 | `im_backend_outbox_projection_bulk_enabled` | `0` 为逐用户 SQL，`1` 为批量投影实验实现 | Outbox 配置 |
-| `im_backend_outbox_projection_recipients_enabled` | `0` 为 JSONB payload 回写，`1` 为结构化 recipients + ready | Outbox 配置 |
+| `im_backend_outbox_projection_recipients_enabled` | `1` 为结构化 `outbox_recipients` + ready | Outbox 配置 |
+| `im_backend_outbox_projection_sync_events_enabled` | `1` 为复用 `user_message_events` 恢复投递对象，不写 `outbox_recipients` | Outbox 配置 |
 | `im_backend_outbox_projection_batches_total` / `users_total` | 投影批次数与每批涉及的唯一用户总数；二者相除得到平均用户数/批 | Sync 投影 |
 | `im_backend_outbox_projection_query_duration_seconds` | `project_users` 内单次 SQL 的客户端观测耗时；`count / batches` 得到 SQL 次数/批 | PostgreSQL 往返、执行与结果读取 |
 | `im_backend_realtime_routing_total` | 本地 Hub、Presence、Redis 发布/订阅各阶段结果 | Redis/跨实例路由 |
@@ -57,7 +58,7 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 3. 检查 Outbox 待处理数和最老事件年龄；持续增长说明异步发布跟不上。
 4. 用 `outbox_stage_duration_seconds` 区分 claim、Sync 投影、实时 publish 和状态收尾。`outbox_pipeline_enabled=0` 时四阶段串行相加；为 `1` 时分别比较准备 Lane（claim + prepare）和投递 Lane（publish + mark），不能再把四项之和当成批次完成间隔。任一 Lane 超过到达预算，pending age 都会持续增长。
 5. 若 `prepare_project_users` 最大，用 projection 的 batches、users 和 query count 判断是否仍在按用户执行 SQL；该 Histogram 包含服务端执行、锁等待、数据库往返和结果读取，不能单独解释为纯网络 RTT。
-6. 若 `prepare_store` 最大，先看 `outbox_projection_recipients_enabled`：JSONB 模式表示 payload 回写成本，recipients 模式表示结构化 recipient 插入与 ready 更新成本，二者不能混为同一种写入。
+6. 若 `prepare_store` 最大，先看两个 projection storage gauge：两者都为 `0` 时是 JSONB payload 回写；`recipients=1` 时是结构化 recipient 插入与 ready 更新；`sync_events=1` 时只有 ready 更新（Sync 行在 `prepare_project_users` 中写入）。三种成本不能混为同一种写入。
 7. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。
 8. 检查 `batch_presence_enabled`、`publish_prepare` 和平均唯一用户数/批，再检查 Presence 查询与 Redis publish/receive 的 error、no_subscriber。
 9. 检查 Hub 是否没有连接，以及 slow_client 是否增加。

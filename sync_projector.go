@@ -21,6 +21,7 @@ const (
 
 	syncProjectionStorageJSONB      syncProjectionStorage = "jsonb"
 	syncProjectionStorageRecipients syncProjectionStorage = "recipients"
+	syncProjectionStorageSyncEvents syncProjectionStorage = "sync_events"
 )
 
 func normalizeSyncProjectionMode(mode syncProjectionMode) (syncProjectionMode, error) {
@@ -40,13 +41,15 @@ func normalizeSyncProjectionStorage(storage syncProjectionStorage) (syncProjecti
 		return syncProjectionStorageRecipients, nil
 	case syncProjectionStorageJSONB:
 		return syncProjectionStorageJSONB, nil
+	case syncProjectionStorageSyncEvents:
+		return syncProjectionStorageSyncEvents, nil
 	default:
 		return "", fmt.Errorf("unsupported outbox projection storage %q", storage)
 	}
 }
 
 // messageSyncProjector makes durable message.created events publishable only
-// after their Sync rows and realtime recipient mapping commit atomically.
+// after their Sync rows and recoverable realtime routing state commit atomically.
 type messageSyncProjector struct {
 	db      *pgxpool.Pool
 	metrics *applicationMetrics
@@ -77,8 +80,8 @@ func (projector *messageSyncProjector) PrepareBatch(ctx context.Context, events 
 	switch storage {
 	case syncProjectionStorageJSONB:
 		return projector.prepareJSONBBatch(ctx, events)
-	case syncProjectionStorageRecipients:
-		return projector.prepareRecipientBatch(ctx, events)
+	case syncProjectionStorageRecipients, syncProjectionStorageSyncEvents:
+		return projector.prepareStructuredBatch(ctx, events, storage)
 	default:
 		return events, fmt.Errorf("unsupported outbox projection storage %q", storage)
 	}
@@ -221,7 +224,11 @@ func (projector *messageSyncProjector) prepareJSONBBatch(ctx context.Context, ev
 	return preparedEvents, nil
 }
 
-func (projector *messageSyncProjector) prepareRecipientBatch(ctx context.Context, events []outboxEvent) ([]outboxEvent, error) {
+func (projector *messageSyncProjector) prepareStructuredBatch(
+	ctx context.Context,
+	events []outboxEvent,
+	storage syncProjectionStorage,
+) ([]outboxEvent, error) {
 	decodeStarted := time.Now()
 	projections := make([]pendingProjection, 0, len(events))
 	for _, event := range events {
@@ -256,8 +263,26 @@ func (projector *messageSyncProjector) prepareRecipientBatch(ctx context.Context
 			readyEventIDs = append(readyEventIDs, projection.event.EventID)
 		}
 	}
-	if err := projector.loadStructuredRecipients(ctx, tx, projections, readyEventIDs); err != nil {
-		return events, err
+	switch storage {
+	case syncProjectionStorageRecipients:
+		if err := projector.loadStructuredRecipients(ctx, tx, projections, readyEventIDs); err != nil {
+			return events, err
+		}
+		fallbackEventIDs := make([]string, 0, len(readyEventIDs))
+		for _, projection := range projections {
+			if projection.event.ReadyAt != nil && len(projection.recipients) == 0 {
+				fallbackEventIDs = append(fallbackEventIDs, projection.event.EventID)
+			}
+		}
+		if err := projector.loadSyncEventRecipients(ctx, tx, projections, fallbackEventIDs); err != nil {
+			return events, err
+		}
+	case syncProjectionStorageSyncEvents:
+		if err := projector.loadSyncEventRecipients(ctx, tx, projections, readyEventIDs); err != nil {
+			return events, err
+		}
+	default:
+		return events, fmt.Errorf("unsupported structured outbox projection storage %q", storage)
 	}
 
 	itemsByUser := make(map[int64][]projectionItem)
@@ -327,8 +352,17 @@ func (projector *messageSyncProjector) prepareRecipientBatch(ctx context.Context
 	projector.metrics.ObserveOutboxStage(outboxStagePrepareEncode, time.Since(encodeStarted))
 
 	storeStarted := time.Now()
-	if err := projector.storeStructuredProjection(ctx, tx, projections); err != nil {
-		return events, err
+	switch storage {
+	case syncProjectionStorageRecipients:
+		if err := projector.storeStructuredProjection(ctx, tx, projections); err != nil {
+			return events, err
+		}
+	case syncProjectionStorageSyncEvents:
+		if err := projector.storeSyncEventProjection(ctx, tx, projections); err != nil {
+			return events, err
+		}
+	default:
+		return events, fmt.Errorf("unsupported structured outbox projection storage %q", storage)
 	}
 	projector.metrics.ObserveOutboxStage(outboxStagePrepareStore, time.Since(storeStarted))
 
@@ -414,6 +448,60 @@ func (projector *messageSyncProjector) loadStructuredRecipients(
 	return nil
 }
 
+// loadSyncEventRecipients rebuilds the realtime routing payload after a
+// projection committed but the process stopped before publish. The Sync rows
+// are authoritative; normal first-attempt delivery already has the same
+// recipients in memory and does not execute this recovery query.
+func (projector *messageSyncProjector) loadSyncEventRecipients(
+	ctx context.Context,
+	tx pgx.Tx,
+	projections []pendingProjection,
+	eventIDs []string,
+) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	projectionByEventID := make(map[string]int, len(eventIDs))
+	for index, projection := range projections {
+		if projection.event.ReadyAt != nil {
+			projectionByEventID[projection.event.EventID] = index
+		}
+	}
+	rows, err := tx.Query(
+		ctx,
+		`SELECT event.event_id::text, sync_event.user_id, sync_event.seq
+		 FROM unnest($1::text[]) AS requested(event_id)
+		 JOIN outbox_events AS event
+		   ON event.event_id = requested.event_id::uuid
+		 JOIN user_message_events AS sync_event
+		   ON sync_event.message_id = event.message_id
+		 WHERE event.event_type = 'message.created'
+		   AND event.ready_at IS NOT NULL
+		 ORDER BY event.event_id, sync_event.user_id`,
+		eventIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("load sync event outbox recipients: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var eventID string
+		var recipient messageEventRecipient
+		if err := rows.Scan(&eventID, &recipient.UserID, &recipient.Cursor); err != nil {
+			return fmt.Errorf("scan sync event outbox recipient: %w", err)
+		}
+		projectionIndex, found := projectionByEventID[eventID]
+		if !found {
+			return fmt.Errorf("loaded sync event recipient for unexpected event %s", eventID)
+		}
+		projections[projectionIndex].recipients = append(projections[projectionIndex].recipients, recipient)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sync event outbox recipients: %w", err)
+	}
+	return nil
+}
+
 func (projector *messageSyncProjector) storeStructuredProjection(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -482,6 +570,47 @@ func (projector *messageSyncProjector) storeStructuredProjection(
 			recipientCount,
 			len(recipientEventIDs),
 		)
+	}
+	return nil
+}
+
+func (projector *messageSyncProjector) storeSyncEventProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	projections []pendingProjection,
+) error {
+	eventIDs := make([]string, 0, len(projections))
+	lockTokens := make([]string, 0, len(projections))
+	for _, projection := range projections {
+		if projection.event.ReadyAt != nil {
+			continue
+		}
+		eventIDs = append(eventIDs, projection.event.EventID)
+		lockTokens = append(lockTokens, projection.event.LockToken)
+	}
+	if len(eventIDs) == 0 {
+		return nil
+	}
+
+	command, err := tx.Exec(
+		ctx,
+		`UPDATE outbox_events AS event
+		 SET ready_at = CURRENT_TIMESTAMP
+		 FROM unnest($1::text[], $2::text[]) AS claimed(event_id, lock_token)
+		 WHERE event.event_id = claimed.event_id::uuid
+		   AND event.lock_token = claimed.lock_token::uuid
+		   AND event.event_type = 'message.created'
+		   AND event.ready_at IS NULL
+		   AND event.published_at IS NULL
+		   AND event.dead_at IS NULL`,
+		eventIDs,
+		lockTokens,
+	)
+	if err != nil {
+		return fmt.Errorf("store sync event outbox projection: %w", err)
+	}
+	if command.RowsAffected() != int64(len(eventIDs)) {
+		return fmt.Errorf("store sync event outbox projection: %w", errOutboxLeaseLost)
 	}
 	return nil
 }

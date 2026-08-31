@@ -1,5 +1,13 @@
 # TODO
 
+## Sync/Outbox recipient 统一 A/B
+
+- [x] 增加 `OUTBOX_PROJECTION_STORAGE=sync_events` 候选：正常准备事务只写 `user_message_events` 并标记 Outbox ready，已 ready 事件在重试时按 `message_id` 从 Sync 行重建 user/cursor。
+- [x] 用真实 PostgreSQL 验证提交后崩溃恢复、Lease 丢失回滚、自发自收，以及 `recipients ↔ sync_events` 双向切换恢复。
+- [ ] 在同一稳定边界负载上按 `recipients A1 → sync_events B1 → sync_events B2 → recipients A2` 使用四个新鲜隔离库运行。
+- [ ] 同时比较 `prepare_store`、准备 Lane、API/Outbox acquisition、pending/oldest、HTTP/Realtime/Sync 完整性；只有方向在两轮中一致且正确性完整才切默认。
+- [ ] 切换默认后先保留 `outbox_recipients` 回退窗口；只有确认没有旧版 Worker 且已 ready 事件全部排空后，才用独立迁移删表。
+
 ## 下一容量升档：区分 Pool 等待与事务执行
 
 - [x] 恢复 3000 req/s 完整基线，并确认该档共享 Pool 没有形成显著连接等待。
