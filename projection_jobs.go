@@ -170,15 +170,15 @@ func waitForProjectionPoll(ctx context.Context, interval time.Duration) bool {
 }
 
 func (pool *messageProjectionPool) dispatchJobs(ctx context.Context, limit int) (int, error) {
-	var inserted int
-	err := pool.db.QueryRow(
+	tx, err := pool.db.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin message projection dispatch: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(
 		ctx,
-		`WITH candidates AS (
-		   SELECT event.event_id,
-		          event.message_id,
-		          event.created_at,
-		          message.sender_id,
-		          message.receiver_id
+		`SELECT event.event_id::text
 		   FROM outbox_events AS event
 		   JOIN messages AS message ON message.id = event.message_id
 		   WHERE event.event_type = 'message.created'
@@ -201,10 +201,46 @@ func (pool *messageProjectionPool) dispatchJobs(ctx context.Context, limit int) 
 			             AND receiver_job.user_id = message.receiver_id
 			         )
 			       )
-			     )
+		     )
 		   ORDER BY event.created_at, event.event_id
 		   FOR UPDATE OF event SKIP LOCKED
-		   LIMIT $1
+		   LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("lock message projection dispatch candidates: %w", err)
+	}
+	eventIDs := make([]string, 0, limit)
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan message projection dispatch candidate: %w", err)
+		}
+		eventIDs = append(eventIDs, eventID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("iterate message projection dispatch candidates: %w", err)
+	}
+	rows.Close()
+	if len(eventIDs) == 0 {
+		return 0, nil
+	}
+
+	var inserted int
+	err = tx.QueryRow(
+		ctx,
+		`WITH candidates AS (
+		   SELECT event.event_id,
+		          event.message_id,
+		          event.created_at,
+		          message.sender_id,
+		          message.receiver_id
+		   FROM unnest($1::text[]) AS requested(event_id)
+		   JOIN outbox_events AS event
+		     ON event.event_id = requested.event_id::uuid
+		   JOIN messages AS message ON message.id = event.message_id
 		 ), participants AS (
 		   SELECT candidate.event_id,
 		          participant.user_id,
@@ -219,16 +255,25 @@ func (pool *messageProjectionPool) dispatchJobs(ctx context.Context, limit int) 
 		 ), inserted AS (
 		   INSERT INTO message_projection_jobs (event_id, user_id, message_id, shard, created_at)
 		   SELECT event_id, user_id, message_id, shard, created_at
-		   FROM participants
+		   FROM participants AS participant
+		   WHERE NOT EXISTS (
+		     SELECT 1
+		     FROM message_projection_jobs AS existing
+		     WHERE existing.event_id = participant.event_id
+		       AND existing.user_id = participant.user_id
+		   )
 		   ON CONFLICT (event_id, user_id) DO NOTHING
 		   RETURNING 1
 		 )
 		 SELECT count(*) FROM inserted`,
-		limit,
+		eventIDs,
 		messageProjectionVirtualShards,
 	).Scan(&inserted)
 	if err != nil {
 		return 0, fmt.Errorf("dispatch message projection jobs: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit message projection dispatch: %w", err)
 	}
 	return inserted, nil
 }

@@ -160,6 +160,62 @@ func TestUserShardedProjectionRepairsAMissingParticipantJob(t *testing.T) {
 	assertProjectionCounts(t, db, created.ID, 2, 0)
 }
 
+func TestProjectionDispatcherSkipsParticipantJobBeingCompleted(t *testing.T) {
+	db := openTestDatabase(t)
+	users := createProjectionTestUsers(t, db, 2)
+	_, eventID := createProjectionTestMessage(t, db, users[0], users[1])
+	pool := mustProjectionTestPool(t, db, 4, 8)
+	if inserted, err := pool.dispatchJobs(context.Background(), 8); err != nil || inserted != 2 {
+		t.Fatalf("dispatch initial projection jobs = inserted %d, err %v", inserted, err)
+	}
+	if _, err := db.Exec(
+		context.Background(),
+		`DELETE FROM message_projection_jobs WHERE event_id = $1 AND user_id = $2`,
+		eventID,
+		users[1],
+	); err != nil {
+		t.Fatalf("remove receiver projection job: %v", err)
+	}
+
+	completing, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin completing projection job: %v", err)
+	}
+	defer completing.Rollback(context.Background())
+	if _, err := completing.Exec(
+		context.Background(),
+		`UPDATE message_projection_jobs
+		 SET projected_at = CURRENT_TIMESTAMP
+		 WHERE event_id = $1 AND user_id = $2`,
+		eventID,
+		users[0],
+	); err != nil {
+		t.Fatalf("hold completing projection job: %v", err)
+	}
+
+	dispatchContext, cancelDispatch := context.WithTimeout(context.Background(), time.Second)
+	defer cancelDispatch()
+	inserted, err := pool.dispatchJobs(dispatchContext, 8)
+	if err != nil || inserted != 1 {
+		t.Fatalf("dispatch around completing participant = inserted %d, err %v", inserted, err)
+	}
+	if err := completing.Rollback(context.Background()); err != nil {
+		t.Fatalf("rollback completing projection job: %v", err)
+	}
+
+	var jobs int
+	if err := db.QueryRow(
+		context.Background(),
+		`SELECT count(*) FROM message_projection_jobs WHERE event_id = $1`,
+		eventID,
+	).Scan(&jobs); err != nil {
+		t.Fatalf("count repaired projection jobs: %v", err)
+	}
+	if jobs != 2 {
+		t.Fatalf("projection jobs = %d, want 2", jobs)
+	}
+}
+
 func TestUserShardedProjectionCreatesOneJobForSelfMessage(t *testing.T) {
 	db := openTestDatabase(t)
 	users := createProjectionTestUsers(t, db, 1)
