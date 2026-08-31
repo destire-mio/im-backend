@@ -34,8 +34,8 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 | `im_backend_outbox_batch_presence_enabled` | `0` 为每 recipient 独立查 Presence，`1` 为同批用户去重并批量预取 | Outbox 配置 |
 | `im_backend_outbox_batch_presence_batches_total` / `users_total` | Presence 快照批次与其唯一用户总数；二者相除得到平均唯一用户数/批 | Redis Presence |
 | `im_backend_outbox_projection_bulk_enabled` | `0` 为逐用户 SQL，`1` 为批量投影实验实现 | Outbox 配置 |
-| `im_backend_outbox_projection_recipients_enabled` | `1` 为结构化 `outbox_recipients` + ready | Outbox 配置 |
-| `im_backend_outbox_projection_sync_events_enabled` | `1` 为复用 `user_message_events` 恢复投递对象，不写 `outbox_recipients` | Outbox 配置 |
+| `im_backend_outbox_projection_recipients_enabled` | `1` 为回退到结构化 `outbox_recipients` + ready | Outbox 配置 |
+| `im_backend_outbox_projection_sync_events_enabled` | `1` 为当前默认：复用 `user_message_events` 恢复投递对象，不写 `outbox_recipients` | Outbox 配置 |
 | `im_backend_outbox_projection_batches_total` / `users_total` | 投影批次数与每批涉及的唯一用户总数；二者相除得到平均用户数/批 | Sync 投影 |
 | `im_backend_outbox_projection_query_duration_seconds` | `project_users` 内单次 SQL 的客户端观测耗时；`count / batches` 得到 SQL 次数/批 | PostgreSQL 往返、执行与结果读取 |
 | `im_backend_realtime_routing_total` | 本地 Hub、Presence、Redis 发布/订阅各阶段结果 | Redis/跨实例路由 |

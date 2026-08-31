@@ -123,7 +123,7 @@ func defaultOutboxWorkerConfig() outboxWorkerConfig {
 		Concurrency:       16,
 		ExecutionMode:     outboxExecutionModePipeline,
 		ProjectionMode:    syncProjectionModeBulk,
-		ProjectionStorage: syncProjectionStorageRecipients,
+		ProjectionStorage: syncProjectionStorageSyncEvents,
 		LeaseDuration:     30 * time.Second,
 		AttemptTimeout:    10 * time.Second,
 		PollInterval:      500 * time.Millisecond,

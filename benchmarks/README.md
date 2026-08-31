@@ -15,6 +15,10 @@
 
 3500 和 4000 均只是新鲜隔离库上的单轮证据，不等于稳定生产容量。当前可证实的区间是“4000 单轮完成，5000 明确过载”，精确且可重复的边界仍需在两者之间复测。
 
+## 默认存储链路复核
+
+[`loadtest-default-sync-events-smoke.json`](./reports/loadtest-default-sync-events-smoke.json) 是不显式设置 `OUTBOX_PROJECTION_STORAGE` 的默认链路 smoke，用于证明运行时实际选中 `sync_events`、不再写 `outbox_recipients`，且 HTTP、Realtime 和 Sync 核验完整。它不是容量报告。
+
 ## 相关文档
 
 - [`LOAD_TEST.md`](../LOAD_TEST.md)：方法、配置、A/B 结果与证据边界。

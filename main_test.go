@@ -613,7 +613,7 @@ func TestMessageCreationDefersSyncProjectionToOutbox(t *testing.T) {
 	).Scan(&syncEvents, &payloadVersion, &ready, &published, &recipients); err != nil {
 		t.Fatalf("read completed projection: %v", err)
 	}
-	if syncEvents != 2 || payloadVersion != 3 || !ready || !published || recipients != 2 {
+	if syncEvents != 2 || payloadVersion != 3 || !ready || !published || recipients != 0 {
 		t.Fatalf(
 			"after projection: sync events=%d payload version=%d ready=%v published=%v recipients=%d",
 			syncEvents,

@@ -9,7 +9,7 @@
 - 用户注册、Argon2id 密码哈希、短期 Access Token、Refresh Token 轮换及多设备 Session 管理。
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
 - Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 prepare 与当前批 publish，网络发布不占用数据库行锁。
-- Sync cursor 与结构化 `outbox_recipients` 在同一事务提交，Outbox 不再二次回写带 recipients/cursor 的完整 JSONB。
+- Sync cursor 与 Outbox ready 在同一事务提交；`user_message_events` 同时作为断线补拉和 Worker 崩溃恢复时的权威 user/cursor 数据源，正常路径不再重复写 `outbox_recipients`。
 - 为每个用户分配连续 Sync cursor，支持快照分页补拉和设备 ACK；WebSocket 只负责实时通知，Sync API 负责恢复。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
 - Outbox 投递前对同批 recipient 去重，用两段 Redis pipeline 生成仅在本批存活的 Presence 快照，避免热点用户被重复查询。
@@ -22,7 +22,7 @@
 POST /messages
   -> PostgreSQL: message + pending outbox（同一事务）
   -> Outbox 准备 Lane: claim + 分配用户 cursor
-     + 写入 sync event + outbox_recipients + ready（同一事务）
+     + 写入 user_message_events + ready（同一事务）
   -> Outbox 投递 Lane: 批内 Presence 快照 + Redis / 本地 Hub + mark published
   -> WebSocket 实时通知
 

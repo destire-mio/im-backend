@@ -1,0 +1,201 @@
+{
+  "runId": "26083105091022deed",
+  "startedAt": "2026-08-31T05:09:10.221437Z",
+  "finishedAt": "2026-08-31T05:09:13.36756Z",
+  "database": "im_default_sync_smoke_1788152944_79584",
+  "users": 10,
+  "devicesPerUser": 2,
+  "webSocketCount": 20,
+  "concurrency": 200,
+  "loadModel": "fixed-rate",
+  "targetRateRps": 500,
+  "requestTimeout": "10s",
+  "deliveryWait": "30s",
+  "loadDurationMs": 1999.13,
+  "messagesAttempted": 1000,
+  "messagesSucceeded": 1000,
+  "messagesFailed": 0,
+  "droppedStarts": 0,
+  "idempotentRecovered": 0,
+  "httpThroughputRps": 500.2174695448846,
+  "httpLatency": {
+    "count": 1000,
+    "p50Ms": 1.081,
+    "p95Ms": 2.228,
+    "p99Ms": 3.247,
+    "maxMs": 15.979
+  },
+  "realtimeLatency": {
+    "count": 4000,
+    "p50Ms": 244.576,
+    "p95Ms": 489.5,
+    "p99Ms": 509.585,
+    "maxMs": 520.731
+  },
+  "realtime": {
+    "expected": 4000,
+    "observed": 4000,
+    "passed": true
+  },
+  "sync": {
+    "expected": 2000,
+    "observed": 2000,
+    "passed": true
+  },
+  "duplicateRealtime": 0,
+  "unexpectedRealtime": 0,
+  "metricDeltas": {
+    "im_backend_database_pool_acquire_duration_seconds_total": 0.037392626,
+    "im_backend_database_pool_acquires_total": 2107,
+    "im_backend_database_pool_canceled_acquires_total": 0,
+    "im_backend_database_pool_empty_acquire_wait_seconds_total": 0.03723491600000001,
+    "im_backend_database_pool_empty_acquires_total": 5,
+    "im_backend_outbox_batch_presence_batches_total": 19,
+    "im_backend_outbox_batch_presence_users_total": 190,
+    "im_backend_outbox_projection_batches_total": 19,
+    "im_backend_outbox_projection_query_duration_seconds_count": 57,
+    "im_backend_outbox_projection_query_duration_seconds_sum": 0.054859249000000006,
+    "im_backend_outbox_projection_users_total": 190,
+    "im_backend_outbox_publish_duration_seconds_count": 1000,
+    "im_backend_outbox_publish_duration_seconds_sum": 0.16537148400000024,
+    "im_backend_outbox_publish_total": 1000,
+    "im_backend_realtime_routing_total": 2190,
+    "im_backend_sync_events_total": 2000,
+    "im_backend_websocket_deliveries_total": 4000,
+    "im_backend_websocket_io_total": 4000,
+    "im_backend_websocket_send_queue_depth_count": 4000,
+    "im_backend_websocket_send_queue_depth_sum": 7008,
+    "im_backend_websocket_write_duration_seconds_count": 4000,
+    "im_backend_websocket_write_duration_seconds_sum": 0.023795215999999994
+  },
+  "metricEnd": {
+    "go_goroutines": 105,
+    "im_backend_database_metrics_collection_success": 1,
+    "im_backend_database_pool_acquired_connections": 1,
+    "im_backend_database_pool_constructing_connections": 0,
+    "im_backend_database_pool_idle_connections": 5,
+    "im_backend_database_pool_max_connections": 10,
+    "im_backend_database_pool_total_connections": 6,
+    "im_backend_outbox_batch_presence_enabled": 1,
+    "im_backend_outbox_dead_events": 0,
+    "im_backend_outbox_oldest_pending_age_seconds": 0,
+    "im_backend_outbox_pending_events": 0,
+    "im_backend_outbox_pipeline_enabled": 1,
+    "im_backend_outbox_projection_bulk_enabled": 1,
+    "im_backend_outbox_projection_recipients_enabled": 0,
+    "im_backend_outbox_projection_sync_events_enabled": 1,
+    "im_backend_outbox_worker_batch_size": 64,
+    "im_backend_outbox_worker_concurrency": 16,
+    "im_backend_websocket_connections": 20,
+    "im_backend_websocket_send_queue_high_watermark": 13,
+    "process_resident_memory_bytes": 66633728
+  },
+  "outboxStageDurations": {
+    "claim": {
+      "count": 19,
+      "averageMs": 2.2736184736842104,
+      "p50BucketMs": 2.5,
+      "p95BucketMs": 5,
+      "p99BucketMs": 5
+    },
+    "mark_published": {
+      "count": 19,
+      "averageMs": 1.4508399473684208,
+      "p50BucketMs": 2.5,
+      "p95BucketMs": 5,
+      "p99BucketMs": 5
+    },
+    "prepare": {
+      "count": 19,
+      "averageMs": 4.507927631578947,
+      "p50BucketMs": 5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 10
+    },
+    "prepare_begin": {
+      "count": 19,
+      "averageMs": 0.2863685263157894,
+      "p50BucketMs": 0.25,
+      "p95BucketMs": 2.5,
+      "p99BucketMs": 2.5
+    },
+    "prepare_commit": {
+      "count": 19,
+      "averageMs": 0.33225663157894736,
+      "p50BucketMs": 0.5,
+      "p95BucketMs": 1,
+      "p99BucketMs": 1
+    },
+    "prepare_decode": {
+      "count": 19,
+      "averageMs": 0.10249131578947367,
+      "p50BucketMs": 0.25,
+      "p95BucketMs": 0.5,
+      "p99BucketMs": 0.5
+    },
+    "prepare_encode": {
+      "count": 19,
+      "averageMs": 0.05955931578947369,
+      "p50BucketMs": 0.1,
+      "p95BucketMs": 0.25,
+      "p99BucketMs": 0.25
+    },
+    "prepare_project_users": {
+      "count": 19,
+      "averageMs": 2.897188473684211,
+      "p50BucketMs": 5,
+      "p95BucketMs": 10,
+      "p99BucketMs": 10
+    },
+    "prepare_store": {
+      "count": 19,
+      "averageMs": 0.8073902105263159,
+      "p50BucketMs": 1,
+      "p95BucketMs": 2.5,
+      "p99BucketMs": 2.5
+    },
+    "publish": {
+      "count": 19,
+      "averageMs": 1.1702608947368422,
+      "p50BucketMs": 2.5,
+      "p95BucketMs": 5,
+      "p99BucketMs": 5
+    },
+    "publish_prepare": {
+      "count": 19,
+      "averageMs": 0.37621710526315794,
+      "p50BucketMs": 0.5,
+      "p95BucketMs": 1,
+      "p99BucketMs": 1
+    }
+  },
+  "databaseAcquireDurations": {
+    "api": {
+      "success": {
+        "count": 2030,
+        "averageMs": 0.01891434532019669,
+        "p50BucketMs": 0.01,
+        "p95BucketMs": 0.01,
+        "p99BucketMs": 0.01
+      }
+    },
+    "outbox": {
+      "success": {
+        "count": 57,
+        "averageMs": 0.0010606666666666666,
+        "p50BucketMs": 0.01,
+        "p95BucketMs": 0.01,
+        "p99BucketMs": 0.01
+      }
+    }
+  },
+  "metricSampling": {
+    "interval": "250ms",
+    "samples": 11,
+    "errors": 0,
+    "peaks": {
+      "im_backend_outbox_oldest_pending_age_seconds": 0.469403,
+      "im_backend_outbox_pending_events": 235
+    }
+  }
+}

@@ -6,7 +6,7 @@
 - [x] 用真实 PostgreSQL 验证提交后崩溃恢复、Lease 丢失回滚、自发自收，以及 `recipients ↔ sync_events` 双向切换恢复。
 - [x] 在 3500 req/s 稳定负载上按 `recipients A1 → sync_events B1 → sync_events B2 → recipients A2` 使用四个新鲜隔离库运行；每轮重启 PostgreSQL/Redis，四轮 HTTP、Realtime、Sync 都完整。
 - [x] 直接目标指标方向一致：`prepare_store` 两轮中点从 `4.83ms` 降到 `1.81ms`（-62.4%），准备 Lane 从 `13.71ms` 降到 `11.14ms`（-18.7%）；每轮 140000 条重复 recipient 写入降为 0。Realtime/pending 峰值未同步改善，因此不宣称容量提升。
-- [ ] 将 `sync_events` 切为默认，保留 `OUTBOX_PROJECTION_STORAGE=recipients` 回退开关，并跑完整测试与默认链路复核。
+- [x] 将 `sync_events` 切为默认，保留 `OUTBOX_PROJECTION_STORAGE=recipients` 回退开关。全量测试、race、vet 通过；不显式设置存储开关的 1000 条真实链路 smoke 完成 HTTP 1000/1000、Realtime 4000/4000、Sync 2000/2000，且 `outbox_recipients=0`、pending/dead 为 0。
 - [ ] 切换默认后先保留 `outbox_recipients` 回退窗口；只有确认没有旧版 Worker 且已 ready 事件全部排空后，才用独立迁移删表。
 
 ## 下一容量升档：区分 Pool 等待与事务执行

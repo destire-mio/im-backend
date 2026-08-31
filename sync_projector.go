@@ -37,12 +37,12 @@ func normalizeSyncProjectionMode(mode syncProjectionMode) (syncProjectionMode, e
 
 func normalizeSyncProjectionStorage(storage syncProjectionStorage) (syncProjectionStorage, error) {
 	switch storage {
-	case "", syncProjectionStorageRecipients:
-		return syncProjectionStorageRecipients, nil
+	case "", syncProjectionStorageSyncEvents:
+		return syncProjectionStorageSyncEvents, nil
 	case syncProjectionStorageJSONB:
 		return syncProjectionStorageJSONB, nil
-	case syncProjectionStorageSyncEvents:
-		return syncProjectionStorageSyncEvents, nil
+	case syncProjectionStorageRecipients:
+		return syncProjectionStorageRecipients, nil
 	default:
 		return "", fmt.Errorf("unsupported outbox projection storage %q", storage)
 	}

@@ -92,8 +92,8 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 		`im_backend_outbox_batch_presence_batches_total{result="success"} 1`,
 		"im_backend_outbox_batch_presence_users_total 2",
 		"im_backend_outbox_projection_bulk_enabled 1",
-		"im_backend_outbox_projection_recipients_enabled 1",
-		"im_backend_outbox_projection_sync_events_enabled 0",
+		"im_backend_outbox_projection_recipients_enabled 0",
+		"im_backend_outbox_projection_sync_events_enabled 1",
 		"im_backend_outbox_projection_batches_total 1",
 		"im_backend_outbox_projection_users_total 2",
 		"im_backend_outbox_projection_query_duration_seconds_count 3",
@@ -115,16 +115,16 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	}
 }
 
-func TestMetricsExposeSyncEventProjectionStorage(t *testing.T) {
+func TestMetricsExposeRecipientProjectionStorageForRollback(t *testing.T) {
 	metrics := newApplicationMetrics(nil)
 	config := defaultOutboxWorkerConfig()
-	config.ProjectionStorage = syncProjectionStorageSyncEvents
+	config.ProjectionStorage = syncProjectionStorageRecipients
 	metrics.SetOutboxWorkerConfig(config)
 
 	exposition := scrapeMetrics(t, metrics)
 	for _, expected := range []string{
-		"im_backend_outbox_projection_recipients_enabled 0",
-		"im_backend_outbox_projection_sync_events_enabled 1",
+		"im_backend_outbox_projection_recipients_enabled 1",
+		"im_backend_outbox_projection_sync_events_enabled 0",
 	} {
 		if !strings.Contains(exposition, expected) {
 			t.Fatalf("metrics exposition missing %q\n%s", expected, exposition)

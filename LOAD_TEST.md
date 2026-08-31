@@ -9,7 +9,7 @@
 → POST /messages
 → PostgreSQL message + pending Outbox（HTTP 在这里即可返回）
 → Outbox Worker 按用户批量分配连续 seq
-→ user_message_events + outbox_recipients + Outbox ready 原子提交
+→ user_message_events + Outbox ready 原子提交
 → Hub / Channel / WebSocket
 → Sync API 持久性核验
 ```
@@ -229,7 +229,7 @@ Channel 最高水位             5 / 256
 
 ```text
 A：OUTBOX_PROJECTION_STORAGE=jsonb（旧实现，回退开关）
-B：OUTBOX_PROJECTION_STORAGE=recipients（当前默认）
+B：OUTBOX_PROJECTION_STORAGE=recipients（该轮对照后曾采用的默认）
 ```
 
 B 将 `user_message_events`、`outbox_recipients` 和 `outbox_events.ready_at` 放在同一事务提交；Publisher 只在事务提交后运行。若事务提交后、publish 前崩溃，重启 Worker 从结构化 recipients 重建内存 payload；若 Lease 已丢失，带 `lock_token` 的 ready 更新影响 0 行，整个事务回滚。网络发送仍在事务外，发送后、标记前崩溃仍可能产生重复通知，客户端继续按 event/message/cursor 去重。
@@ -263,13 +263,13 @@ claim 2.18ms + prepare 12.71ms + publish 6.27ms + mark 6.39ms
 
 这说明去掉重复的 `outbox_recipients` 写入仍是减少 prepare 写放大的候选方向，但在继续改变数据模型前，先用执行模式 A/B 验证四个阶段的串行调度本身是否限制批次吞吐。
 
-### Sync event 统一投递恢复候选
+### Sync event 统一投递恢复
 
-为验证 `outbox_recipients` 是否可以由已有的 `user_message_events` 取代，现在保留两种可切换的结构化存储：
+为验证 `outbox_recipients` 是否可以由已有的 `user_message_events` 取代，保留两种可切换的结构化存储：
 
 ```text
-A：OUTBOX_PROJECTION_STORAGE=recipients（当前默认）
-B：OUTBOX_PROJECTION_STORAGE=sync_events（候选）
+A：OUTBOX_PROJECTION_STORAGE=recipients（回退开关）
+B：OUTBOX_PROJECTION_STORAGE=sync_events（当前默认）
 ```
 
 `sync_events` 在正常路径中只把 `user_message_events` 和 `outbox_events.ready_at` 放在同一事务提交，不再插入 `outbox_recipients`。若在提交后、publish 前崩溃，重启 Worker 通过 `outbox_events.message_id → user_message_events.message_id` 批量重建 user/cursor；该恢复只发生在已 ready 事件的重试路径，正常首次投递仍使用内存中的投影结果。
@@ -286,6 +286,10 @@ B：OUTBOX_PROJECTION_STORAGE=sync_events（候选）
 | `prepare_project_users` | 4.33 ms | 4.55 ms | 基本持平 |
 
 直接写入指标的两轮区间没有重叠：A 的 `prepare_store` 为 `4.69/4.96ms`，B 为 `1.79/1.84ms`，因此可确认去掉重复 recipient 插入减少了准备写成本。但本档不把它说成端到端容量提升：A 的 Realtime P95 为 `0.510/0.506s`、pending 峰值 `1815/1967`，B 为 `0.510/0.602s` 和 `2256/2347`，端到端峰值没有同步改善。该结果支持为了减少写放大和单一权威数据源而切换默认，不证明 4000 或 5000 容量已提高。
+
+基于上述 3500 有效 A/B，默认已切换为 B。`recipients` 实现和表仍保留作为回退通道；删表必须等确认没有旧 Worker，且切换前已 ready 的事件全部排空后再用独立迁移完成。
+
+切换后在全新隔离库上不设置 `OUTBOX_PROJECTION_STORAGE` 运行默认链路 smoke：1000/1000 HTTP、4000/4000 Realtime、2000/2000 Sync 完整，missing、duplicate、unexpected、dead 均为 0。结束时数据库有 2000 条 `user_message_events`、0 条 `outbox_recipients`，1000 个 Outbox 全部 published；指标为 `sync_events=1 / recipients=0`。该 smoke 只验证默认配置和完整数据链路，不作为新的容量结论。报告为 `benchmarks/reports/loadtest-default-sync-events-smoke.json`。
 
 4000 的四轮在每轮重启依赖后仍有一轮 B 出现 657 个 dropped starts，其余三轮完整；该组只作边界诊断，不进入采用计算。5000 四轮全部未完成目标 HTTP，且同为 recipients 的 A1/A2 `prepare` 从 `20.44ms` 漂移到 `204.01ms`，证明连续极限写入中存在跨轮环境漂移。该组只能说明“仅去掉 recipient 写入未解决 5000 过载”，不能用来比较 A/B 优劣。
 
@@ -429,7 +433,7 @@ B 两轮的平均阶段中点组成为：
 
 ## Presence 优化后的升档诊断
 
-为了继续寻找下一个瓶颈，先尝试 3200 req/s，再用 3000 req/s、Pool 32/24 和重启 PostgreSQL/Redis 后的 Pool 24 做三轮对照。四轮都使用当前默认的 pipeline + bulk + recipients + 批内 Presence 快照、Batch 64、10 个热点用户和 30 秒投递等待。
+为了继续寻找下一个瓶颈，先尝试 3200 req/s，再用 3000 req/s、Pool 32/24 和重启 PostgreSQL/Redis 后的 Pool 24 做三轮对照。四轮都使用当时的默认配置 pipeline + bulk + recipients + 批内 Presence 快照、Batch 64、10 个热点用户和 30 秒投递等待。
 
 这四轮都不能作为新容量证据：每轮都出现大量 `not started: max in-flight requests reached`，即压测器因为 1000 个并发槽已占满而未发出部分目标请求。报告中的 Realtime/Sync `passed` 只证明“已经成功写入的消息”最终完整交付，不代表目标消息总数全部完成。
 

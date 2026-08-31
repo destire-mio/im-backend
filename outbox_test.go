@@ -544,6 +544,18 @@ func TestMessageOutboxWorkerRejectsUnsupportedProjectionStorage(t *testing.T) {
 	}
 }
 
+func TestMessageOutboxWorkerDefaultsEmptyProjectionStorageToSyncEvents(t *testing.T) {
+	config := defaultOutboxWorkerConfig()
+	config.ProjectionStorage = ""
+	worker, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config)
+	if err != nil {
+		t.Fatalf("create worker with empty projection storage: %v", err)
+	}
+	if worker.config.ProjectionStorage != syncProjectionStorageSyncEvents {
+		t.Fatalf("projection storage = %q, want %q", worker.config.ProjectionStorage, syncProjectionStorageSyncEvents)
+	}
+}
+
 func createPendingOutboxEvent(t *testing.T, db *pgxpool.Pool) string {
 	t.Helper()
 	server := httptest.NewServer(newTestApplication(t, db).routes())
