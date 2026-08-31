@@ -646,12 +646,48 @@ OUTBOX_PROJECTION_STORAGE=sync_events
 
 但整轮仍必须判为失败：HTTP 只有 `85032/100000`，14968 个计划请求未能开始，实际成功吞吐 `4203.5 req/s`，HTTP P95 `280.77ms`。API acquisition 平均/P50/P95 为 `105.85ms / <=250ms / <=250ms`，Outbox 为 `9.74ms / <=0.01ms / <=250ms`；共享 Pool 的 181071 次 acquisition 中有 170996 次遇到空池，所有 goroutine 的等待累计 `18370.20s`。
 
-这轮暴露出的下一个瓶颈不是 cursor 分配：`projection_project_users` 平均只有 3.01ms，publish 只有 1.55ms。问题是更快的异步链路在流量期间同时执行 dispatcher 任务写入、4 个投影事务、ready、投递重建和 published 更新，与 API 共用 24 个连接及同一 PostgreSQL 写资源；异步侧排空了，API 却被反压。`projection_dispatch` 仍达 83.85ms，也说明每条消息额外生成两项持久任务带来明显写放大。
+这轮暴露出的下一个瓶颈不是 cursor 分配：`projection_project_users` 平均只有 3.01ms，publish 只有 1.55ms。当时的 Dispatcher 只有一个，每轮最多处理 `64 × 4 = 256` 条消息，平均 83.85ms 对应的满批上限约为 `3053 messages/s`，低于目标 5000。同时，4 个投影 Worker 每批 64 项任务、平均 32.16ms，满批上限约为 `7960 jobs/s`，也低于双人消息所需的 `10000 jobs/s`。API 等待共享 Pool 是这条投影链路持续占用 PostgreSQL 后的结果，不足以单独把“连接池隔离”判为根因修复。
 
-因此不继续增加 Worker，也不立即拆 ready finalizer。下一项受控实验应固定数据库总连接数为 24，只比较 shared 24 与 API 18 + Worker 6：它只能验证资源隔离，不能凭配置本身增加数据库容量。若分池只是让 HTTP 完整、但 projection/Outbox 无法在窗口内排空，则仍不采用用户分片候选。
+因此下一步先只并发 Dispatcher，不同时改连接池、投影 Worker 数或 ready finalizer。
 
 最终数据库再次核对为 85032 条 message、170064 条唯一 user/message Sync 事件、每用户 cursor 无 gap、85032 个 published Outbox、0 个 projection job、0 个 pending/dead、0 个 `outbox_recipients`。
 
 报告：
 
 - `benchmarks/reports/loadtest-rate-5000-user-sharded-w4-r2.json`
+
+### 4 Dispatcher 首轮：吞吐提升但出现死锁
+
+将原来的 1 个 Dispatcher 改为 4 个，每个每次最多取 64 条消息，因此总的同时批量仍为 256；Pool、投影 Worker、publish 并发和压测负载均不变。新鲜隔离轮完成 `92584/100000` HTTP，dropped starts 从 14968 降到 7416，成功吞吐从 4203.5 升到 4588.4 req/s，projection pending 峰值从 36480 降到 18579。所有成功消息的 Realtime `370336/370336`、Sync `185168/185168` 完整。
+
+但该轮 PostgreSQL `pg_stat_database.deadlocks=8`，服务日志同时记录 8 次 `SQLSTATE 40P01`。死锁链路是：Dispatcher 先锁 Outbox 行，然后在 `ON CONFLICT` 上等待 Worker 正在更新的投影任务；Worker 先锁投影任务，又等待同一条 Outbox 行。这轮虽然依靠下一轮重试最终排空、数据也未丢失，但存在明确的可用性和容量风险，不能采用。
+
+报告：
+
+- `benchmarks/reports/loadtest-rate-5000-user-sharded-w4-dispatch4-r3.json`
+
+### 修复 Dispatcher/Worker 锁顺序后重跑
+
+Dispatcher 改为一个短事务内的两步：先 `FOR UPDATE SKIP LOCKED` 锁定候选 Outbox，再用 PostgreSQL `READ COMMITTED` 的新语句快照只插入当时真正缺失的用户任务。针对“一侧任务正在更新、另一侧任务缺失”的回归测试、全量 PostgreSQL 测试、race 和 vet 通过。
+
+第二个新鲜隔离轮的 PostgreSQL deadlock 为 0，成功消息的 Realtime `344732/344732`、Sync `172366/172366` 完整，每用户 cursor 连续，最终 jobs、pending、dead、`outbox_recipients` 均为 0。但整轮仍明确失败：
+
+| 指标 | 串行 Dispatcher R2 | 4 Dispatcher 锁安全 R4 |
+| --- | ---: | ---: |
+| HTTP 完成 | 85032/100000 | 86183/100000 |
+| dropped starts | 14968 | 13817 |
+| 成功吞吐 | 4203.5 req/s | 4258.3 req/s |
+| `projection_dispatch` | 83.85 ms / 256 | 45.80 ms / 64 / Dispatcher |
+| projection pending 峰值 | 36480 | 28168 |
+| `projection_batch` | 32.16 ms | 27.30 ms |
+| `projection_store` | 15.59 ms | 16.32 ms |
+| API acquisition 平均 | 105.85 ms | 107.94 ms |
+| Pool 空闲等待累计 | 18370.20 s | 19006.16 s |
+
+按满批粗略换算，4 个 Dispatcher 的上限约为 `4 × 64 / 45.80ms = 5590 messages/s`，已越过 5000 目标；但 4 个投影 Worker 的乐观上限仍只有 `4 × 64 / 27.30ms = 9377 jobs/s`，低于双人消息所需的 10000 jobs/s，而真实批次还不一定满 64。Worker 内最大子阶段是 `projection_store=16.32ms`，它包含完成任务、锁 Outbox、检查两个用户投影、标记 ready 和删除临时任务。因此下一个已实测的瓶颈仍在投影 Worker，具体是 `projection_store` 的重复事件协调和写放大；API 连接等待仍是该链路占用数据库后的伴随现象。
+
+这只是单轮诊断对比，不足以宣称安全并发 Dispatcher 稳定提升了容量。默认仍保持 `inline/1`，分池实验暂缓；下一步先继续细分 `projection_store` 中的完成、ready 和删除耗时，再只对最慢子步骤做 A/B。
+
+报告：
+
+- `benchmarks/reports/loadtest-rate-5000-user-sharded-w4-dispatch4-lock-safe-r4.json`

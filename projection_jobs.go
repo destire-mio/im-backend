@@ -170,6 +170,9 @@ func waitForProjectionPoll(ctx context.Context, interval time.Duration) bool {
 }
 
 func (pool *messageProjectionPool) dispatchJobs(ctx context.Context, limit int) (int, error) {
+	// Keep candidate locking and missing-job insertion as separate READ COMMITTED
+	// statements. A concurrent dispatcher can otherwise use a stale snapshot and
+	// wait on a job held by a worker that is waiting for the same Outbox row.
 	tx, err := pool.db.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin message projection dispatch: %w", err)

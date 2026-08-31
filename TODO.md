@@ -9,9 +9,14 @@
 - [x] 真实 PostgreSQL 已验证单侧完成不可发布、半完成恢复、自发自收、4 Worker + 10 用户并发，以及每用户连续 cursor。
 - [x] 用新鲜隔离数据库和空 Redis DB 运行 5000 req/s 首轮诊断：HTTP 仅 82173/100000，projection pending/oldest 峰值 `115450/46.373s`；停流后 82173 条消息最终对应 164346 条连续 Sync 事件，jobs/pending/dead 为 0。
 - [x] 修复 ready 门控把 `event_id` 列转成 text 导致的全索引扫描：改成输入 ID 转 UUID。82173 行表上的同形执行计划由扫描 82173 项、38890 个 shared buffer、92.078ms，变为 64 次 UUID 主键点查、239 个 buffer、0.237ms；大表上的投影集成测试通过。
-- [x] UUID 修复后的同规格轮次把 `projection_store` 从 193.56ms 降到 15.59ms、projection jobs 峰值从 115450 降到 36480，成功写入消息的 Realtime/Sync 全部完整；它已不再是首要阶段，因此暂不拆 ready finalizer。
-- [x] 修复轮仍只完成 85032/100000 HTTP；API acquisition 平均/P95 为 `105.85/250ms`，共享 Pool 空闲等待累计 18370 秒。下一个实测瓶颈是 API 与完整异步链路争用同一 PostgreSQL Pool/写资源，不是 cursor 分配或 publish。
-- [ ] 下一轮保持数据库总连接数 24，单独 A/B shared 24 与 API 18 + Worker 6；若只把积压从 HTTP 转回 projection/Outbox 而不能同时满足完整性与窗口，则不采用分池。
+- [x] UUID 修复后的同规格轮次把 `projection_store` 从 193.56ms 降到 15.59ms、projection jobs 峰值从 115450 降到 36480，成功写入消息的 Realtime/Sync 全部完整；UUID 全扫描已不再是首要问题。
+- [x] 确认修复轮的串行 Dispatcher 满批上限约为 3053 messages/s，4 个投影 Worker 满批上限约为 7960 jobs/s，均低于 5000 条双人消息所需的速率。
+- [x] 启动 4 个 Dispatcher，每个每次取 64 条，保持总批量窗口仍为 256。首轮 HTTP 升到 92584/100000、projection pending 峰值降到 18579，但触发 8 次 PostgreSQL deadlock，不能采用该版本。
+- [x] 将 Dispatcher 改为同一短事务内“锁候选→新语句快照只插缺失任务”，消除 Dispatcher/Worker 反向等锁；回归测试、全量 PostgreSQL、race、vet 通过。
+- [x] 锁安全版本的新鲜 5000 req/s 轮 deadlock=0，已接受消息的 Realtime/Sync、cursor 和最终数据均完整；但 HTTP 仍只有 86183/100000，因此候选仍失败。
+- [x] 新瓶颈定位为投影 Worker 的 `projection_store`：本轮平均 16.32ms，整批 27.30ms，4 Worker 的乐观满批上限约 9377 jobs/s，仍小于所需 10000 jobs/s。API acquisition 平均 107.94ms 是投影链路持续占用 PostgreSQL 的伴随现象，不单独当作根因。
+- [ ] 先把 `projection_store` 继续拆成“标记 job 完成 / 锁定并标记 Outbox ready / 删除已完成 job”三类耗时，在不改变事务语义的前提下找出最慢 SQL，再只对它做 A/B。
+- [ ] 分池降为后续诊断：只有投影吞吐已达到至少 10000 jobs/s，但 API 仍明显饥饿时，才固定总连接 24 比较 shared 24 与 API 18 + Worker 6。
 - [ ] 候选当前保持 `inline/1` 默认；若压测方向成立，采用前补齐投影任务的独立 retry/dead 策略，并验证混合版本部署或明确要求先排空再切换。
 
 ## Sync/Outbox recipient 统一 A/B
@@ -45,7 +50,7 @@
   - [ ] 在 4000～5000 区间内使用新鲜状态复测，找到第一个可重复失败档；单轮 4000 通过不能当作稳定容量上限。
   - [ ] 同时比较 API/Outbox acquisition、`prepare_store`、`prepare_project_users`、HTTP、Realtime 和 pending/oldest，不能从一个平均阶段直接猜原因。
 
-  inline 5000 已出现 API/Outbox acquisition P95 `250/100ms`；用户分片修复轮为 `250/250ms`，且异步链路排空时 HTTP 只完成 85032/100000。执行固定总连接数的分池 A/B：
+  inline 5000 已出现 API/Outbox acquisition P95 `250/100ms`；用户分片锁安全轮两侧 P95 均为 `250ms`，且 HTTP 只完成 86183/100000。当前先优化实测不足 10000 jobs/s 的投影链路；达到该门槛后若 API 仍饥饿，再执行固定总连接数的分池 A/B：
 
   - A：API 与 Worker 共用 Pool，总连接数固定为 24。
   - B：API 与 Worker 分池，但总连接数仍固定为 24；初始候选为 API 18 + Worker 6，后续只根据 acquisition 指标校准。

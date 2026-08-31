@@ -19,7 +19,11 @@
 
 [`loadtest-rate-5000-user-sharded-w4-r1.json`](./reports/loadtest-rate-5000-user-sharded-w4-r1.json) 是 4 个按用户分片 Prepare Worker 的首轮诊断。它只完成 82173/100000 HTTP，projection pending 峰值 115450，明确失败且比当前 inline 对照更差；报告用于定位候选实现中的 UUID 匹配全扫描，不能作为容量改善证据。停流追赶后，成功写入的 82173 条消息最终对应 164346 条连续 Sync 事件，projection jobs、Outbox pending/dead 均为 0。
 
-[`loadtest-rate-5000-user-sharded-w4-r2.json`](./reports/loadtest-rate-5000-user-sharded-w4-r2.json) 只修复 UUID 点查。`projection_store` 从 193.56ms 降到 15.59ms，成功消息的 Realtime/Sync 与最终数据库计数完整；但 HTTP 仍仅 85032/100000，API acquisition 平均 105.85ms，共享 Pool 空闲等待累计 18370 秒。因此候选仍不采用，下一步只验证固定总连接数的 API/Worker 分池是否能避免互相饥饿。
+[`loadtest-rate-5000-user-sharded-w4-r2.json`](./reports/loadtest-rate-5000-user-sharded-w4-r2.json) 只修复 UUID 点查。`projection_store` 从 193.56ms 降到 15.59ms，成功消息的 Realtime/Sync 与最终数据库计数完整；但 HTTP 仍仅 85032/100000，API acquisition 平均 105.85ms，共享 Pool 空闲等待累计 18370 秒。该轮当时提出了分池假设，后续 Dispatcher/Worker 实验已将当前顺序改为先继续优化投影吞吐。
+
+[`loadtest-rate-5000-user-sharded-w4-dispatch4-r3.json`](./reports/loadtest-rate-5000-user-sharded-w4-dispatch4-r3.json) 将 Dispatcher 从 1 个增加到 4 个，保持总批量窗口 256 不变。HTTP 提高到 92584/100000，但 PostgreSQL 发生 8 次 Dispatcher/Worker 反向等锁，因此该轮无效，不能作为容量改善证据。
+
+[`loadtest-rate-5000-user-sharded-w4-dispatch4-lock-safe-r4.json`](./reports/loadtest-rate-5000-user-sharded-w4-dispatch4-lock-safe-r4.json) 使用两步短事务消除死锁；新鲜轮 deadlock=0，成功消息的 Realtime/Sync、cursor 和最终数据完整。但 HTTP 仍只有 86183/100000，`projection_store/projection_batch` 平均为 `16.32/27.30ms`，4 Worker 的乐观满批上限仍低于需求。下一步回到投影 Worker 内继续拆分 `projection_store`，分池不再是当前默认方向。
 
 ## 默认存储链路复核
 
