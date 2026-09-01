@@ -11,13 +11,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestUserShardedCompatibilityModePublishesVersionFourWithoutProjectionJobs(t *testing.T) {
+func TestUserShardedCompatibilityModeProjectsCurrentMessagesForRollback(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
-	sender := registerTestAccount(t, db, server.URL, uniqueUsername("v4_shard_s"), "V4 Sender")
-	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("v4_shard_r"), "V4 Receiver")
-	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "skip legacy projection")
+	sender := registerTestAccount(t, db, server.URL, uniqueUsername("cmp_s"), "Compat Sender")
+	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("cmp_r"), "Compat Receiver")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "keep rollback projection")
 
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
@@ -27,18 +27,29 @@ func TestUserShardedCompatibilityModePublishesVersionFourWithoutProjectionJobs(t
 	if err != nil {
 		t.Fatalf("create projection pool: %v", err)
 	}
-	if dispatched, err := pool.dispatchJobs(context.Background(), 10); err != nil || dispatched != 0 {
-		t.Fatalf("version-4 projection dispatch = %d, err %v, want 0", dispatched, err)
+	if dispatched, err := pool.dispatchJobs(context.Background(), 10); err != nil || dispatched != 2 {
+		t.Fatalf("compatibility projection dispatch = %d, err %v, want 2", dispatched, err)
+	}
+	senderShard := int(sender.User.ID % messageProjectionVirtualShards)
+	receiverShard := int(receiver.User.ID % messageProjectionVirtualShards)
+	if senderShard == receiverShard {
+		t.Fatalf("test users unexpectedly share logical shard %d", senderShard)
+	}
+	if projected, err := pool.processShard(context.Background(), senderShard); err != nil || projected != 1 {
+		t.Fatalf("project sender compatibility job = %d, err %v", projected, err)
+	}
+	if projected, err := pool.processShard(context.Background(), receiverShard); err != nil || projected != 1 {
+		t.Fatalf("project receiver compatibility job = %d, err %v", projected, err)
 	}
 
 	publisher := &testPublisher{}
 	worker := mustMessageTestWorker(t, db, publisher, config)
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || processed != 1 {
-		t.Fatalf("version-4 user-sharded publish = %d, err %v", processed, err)
+		t.Fatalf("compatibility user-sharded publish = %d, err %v", processed, err)
 	}
-	if received := publisher.received(); len(received) != 1 || received[0].PayloadVersion != 4 {
-		t.Fatalf("published version-4 events = %+v", received)
+	if received := publisher.received(); len(received) != 1 || received[0].PayloadVersion != 2 {
+		t.Fatalf("published compatibility events = %+v", received)
 	}
 
 	var jobs, syncEvents int
@@ -48,10 +59,10 @@ func TestUserShardedCompatibilityModePublishesVersionFourWithoutProjectionJobs(t
 		        (SELECT count(*) FROM user_message_events WHERE message_id = $1)`,
 		created.ID,
 	).Scan(&jobs, &syncEvents); err != nil {
-		t.Fatalf("read version-4 projection state: %v", err)
+		t.Fatalf("read compatibility projection state: %v", err)
 	}
-	if jobs != 0 || syncEvents != 0 {
-		t.Fatalf("version-4 projection state jobs=%d sync=%d, want 0/0", jobs, syncEvents)
+	if jobs != 0 || syncEvents != 2 {
+		t.Fatalf("compatibility projection state jobs=%d sync=%d, want 0/2", jobs, syncEvents)
 	}
 }
 

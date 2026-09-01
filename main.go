@@ -13,10 +13,9 @@ import (
 	"strconv"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/destire-mio/im-backend/internal/migrate"
+	migrationfiles "github.com/destire-mio/im-backend/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -33,6 +32,7 @@ const (
 
 type application struct {
 	db                   *pgxpool.Pool
+	messageSender        messageSendingService
 	responseCipher       *responseCipher
 	rateLimiter          authRateLimiter
 	rateLimitFailOpen    bool
@@ -96,6 +96,9 @@ func main() {
 	if err := db.Ping(ctx); err != nil {
 		log.Fatalf("connect to database: %v", err)
 	}
+	if err := migrate.CheckReady(ctx, db, migrationfiles.Files); err != nil {
+		log.Fatalf("database schema readiness check failed: %v; run the reviewed migrator or deploy a compatible application version", err)
+	}
 	appMetrics.registerDatabaseCollectors(db)
 
 	outboxDB := db
@@ -152,6 +155,7 @@ func main() {
 
 	app := &application{
 		db:                   db,
+		messageSender:        newMessageService(&messageStore{db: db}),
 		responseCipher:       cipher,
 		rateLimiter:          &redisRateLimiter{client: redisClient},
 		rateLimitFailOpen:    environmentBool("AUTH_RATE_LIMIT_FAIL_OPEN", false),
@@ -339,7 +343,7 @@ func (app *application) routes() http.Handler {
 	if app.metrics != nil {
 		handler = app.metrics.InstrumentHTTP(handler)
 	}
-	return databaseWorkloadHandler(databaseWorkloadAPI, handler)
+	return requestIDMiddleware(databaseWorkloadHandler(databaseWorkloadAPI, handler))
 }
 
 func decodeSingleJSON(w http.ResponseWriter, r *http.Request, destination any) error {
@@ -360,325 +364,8 @@ func decodeSingleJSON(w http.ResponseWriter, r *http.Request, destination any) e
 	return nil
 }
 
-func (app *application) createMessage(w http.ResponseWriter, r *http.Request) {
-	var input createMessageRequest
-	if err := decodeSingleJSON(w, r, &input); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
-		return
-	}
-
-	if !validOpaqueID(input.ClientMessageID) || input.ReceiverID <= 0 || input.Content == nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "clientMessageId, receiverId and content are required"})
-		return
-	}
-	if utf8.RuneCountInString(*input.Content) == 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "content must contain at least one character"})
-		return
-	}
-	if utf8.RuneCountInString(*input.Content) > maxMessageContentRunes {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "content is too long"})
-		return
-	}
-
-	tx, err := app.db.Begin(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-		return
-	}
-	defer tx.Rollback(r.Context())
-
-	senderID := authenticatedUserID(r.Context())
-	var created message
-	err = tx.QueryRow(
-		r.Context(),
-		`SELECT id,
-		        conversation_id,
-		        conversation_seq,
-		        client_message_id,
-		        sender_id,
-		        receiver_id,
-		        content,
-		        created_at
-		 FROM messages
-		 WHERE sender_id = $1 AND client_message_id = $2`,
-		senderID,
-		input.ClientMessageID,
-	).Scan(
-		&created.ID,
-		&created.ConversationID,
-		&created.ConversationSeq,
-		&created.ClientMessageID,
-		&created.SenderID,
-		&created.ReceiverID,
-		&created.Content,
-		&created.CreatedAt,
-	)
-	if err == nil {
-		if created.ReceiverID != input.ReceiverID || created.Content != *input.Content {
-			_ = tx.Rollback(r.Context())
-			writeJSON(w, http.StatusConflict, errorResponse{Error: "clientMessageId was already used with different message data"})
-			return
-		}
-		_ = tx.Rollback(r.Context())
-		writeJSON(w, http.StatusOK, created)
-		return
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		log.Printf("load idempotent message: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-		return
-	}
-
-	lowUserID, highUserID := senderID, input.ReceiverID
-	if lowUserID > highUserID {
-		lowUserID, highUserID = highUserID, lowUserID
-	}
-	conversationID, conversationCreated, err := resolveDirectConversation(
-		r.Context(),
-		tx,
-		lowUserID,
-		highUserID,
-	)
-	if err != nil {
-		var databaseError *pgconn.PgError
-		if errors.As(err, &databaseError) && databaseError.Code == "23503" {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "receiverId does not exist"})
-			return
-		}
-
-		log.Printf("create message: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-		return
-	}
-
-	if conversationCreated {
-		_, err = tx.Exec(
-			r.Context(),
-			`INSERT INTO conversation_members (conversation_id, user_id)
-			 SELECT $1, participant.user_id
-			 FROM (
-			     SELECT DISTINCT user_id
-			     FROM unnest($2::bigint[]) AS users(user_id)
-			 ) AS participant`,
-			conversationID,
-			[]int64{senderID, input.ReceiverID},
-		)
-		if err != nil {
-			log.Printf("create direct conversation members: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-			return
-		}
-	}
-
-	err = tx.QueryRow(
-		r.Context(),
-		`WITH allocated AS (
-		   UPDATE conversations
-		   SET last_seq = last_seq + 1,
-		       updated_at = GREATEST(updated_at, clock_timestamp())
-		   WHERE id = $1
-		   RETURNING last_seq, updated_at
-		 ), inserted AS (
-		   INSERT INTO messages (
-		       conversation_id,
-		       conversation_seq,
-		       sender_id,
-		       receiver_id,
-		       client_message_id,
-		       content,
-		       created_at
-		   )
-		   SELECT $1, allocated.last_seq, $2, $3, $4, $5, allocated.updated_at
-		   FROM allocated
-		   ON CONFLICT (sender_id, client_message_id) DO NOTHING
-		   RETURNING id,
-		             conversation_id,
-		             conversation_seq,
-		             client_message_id,
-		             sender_id,
-		             receiver_id,
-		             content,
-		             created_at
-		 ), created_event AS (
-		   INSERT INTO outbox_events (
-		       event_type,
-		       payload_version,
-		       message_id,
-		       payload,
-		       ready_at
-		   )
-		   SELECT 'message.created',
-		          4,
-		          inserted.id,
-		          jsonb_build_object(
-		              'message', jsonb_build_object(
-		                  'id', inserted.id,
-		                  'conversationId', inserted.conversation_id,
-		                  'conversationSeq', inserted.conversation_seq,
-		                  'clientMessageId', inserted.client_message_id,
-		                  'senderId', inserted.sender_id,
-		                  'receiverId', inserted.receiver_id,
-		                  'content', inserted.content,
-		                  'createdAt', inserted.created_at
-		              ),
-		              'recipients', CASE
-		                  WHEN inserted.sender_id = inserted.receiver_id THEN
-		                      jsonb_build_array(
-		                          jsonb_build_object('userId', inserted.sender_id)
-		                      )
-		                  ELSE
-		                      jsonb_build_array(
-		                          jsonb_build_object('userId', inserted.sender_id),
-		                          jsonb_build_object('userId', inserted.receiver_id)
-		                      )
-		              END
-		          ),
-		          CURRENT_TIMESTAMP
-		   FROM inserted
-		   RETURNING message_id
-		 )
-		 SELECT inserted.id,
-		        inserted.conversation_id,
-		        inserted.conversation_seq,
-		        inserted.client_message_id,
-		        inserted.sender_id,
-		        inserted.receiver_id,
-		        inserted.content,
-		        inserted.created_at
-		 FROM inserted
-		 JOIN created_event ON created_event.message_id = inserted.id`,
-		conversationID,
-		senderID,
-		input.ReceiverID,
-		input.ClientMessageID,
-		*input.Content,
-	).Scan(
-		&created.ID,
-		&created.ConversationID,
-		&created.ConversationSeq,
-		&created.ClientMessageID,
-		&created.SenderID,
-		&created.ReceiverID,
-		&created.Content,
-		&created.CreatedAt,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// A concurrent retry may have inserted the same idempotency key after
-		// our first lookup. Roll back the provisional sequence allocation, then
-		// return the committed winner without leaving a sequence gap.
-		if rollbackErr := tx.Rollback(r.Context()); rollbackErr != nil {
-			log.Printf("roll back duplicate message allocation: %v", rollbackErr)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-			return
-		}
-		err = app.db.QueryRow(
-			r.Context(),
-			`SELECT id,
-			        conversation_id,
-			        conversation_seq,
-			        client_message_id,
-			        sender_id,
-			        receiver_id,
-			        content,
-			        created_at
-			 FROM messages
-			 WHERE sender_id = $1 AND client_message_id = $2`,
-			senderID,
-			input.ClientMessageID,
-		).Scan(
-			&created.ID,
-			&created.ConversationID,
-			&created.ConversationSeq,
-			&created.ClientMessageID,
-			&created.SenderID,
-			&created.ReceiverID,
-			&created.Content,
-			&created.CreatedAt,
-		)
-		if err != nil {
-			log.Printf("load concurrent idempotent message: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-			return
-		}
-		if created.ReceiverID != input.ReceiverID || created.Content != *input.Content {
-			writeJSON(w, http.StatusConflict, errorResponse{Error: "clientMessageId was already used with different message data"})
-			return
-		}
-		writeJSON(w, http.StatusOK, created)
-		return
-	}
-	if err != nil {
-		log.Printf("create message: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-		return
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create message"})
-		return
-	}
-	writeJSON(w, http.StatusCreated, created)
-}
-
-func resolveDirectConversation(
-	ctx context.Context,
-	tx pgx.Tx,
-	lowUserID int64,
-	highUserID int64,
-) (int64, bool, error) {
-	var conversationID int64
-	err := tx.QueryRow(
-		ctx,
-		`SELECT id
-		 FROM conversations
-		 WHERE kind = 'direct'
-		   AND direct_user_low_id = $1
-		   AND direct_user_high_id = $2`,
-		lowUserID,
-		highUserID,
-	).Scan(&conversationID)
-	if err == nil {
-		return conversationID, false, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, err
-	}
-
-	err = tx.QueryRow(
-		ctx,
-		`INSERT INTO conversations (kind, direct_user_low_id, direct_user_high_id)
-		 VALUES ('direct', $1, $2)
-		 ON CONFLICT (direct_user_low_id, direct_user_high_id) DO NOTHING
-		 RETURNING id`,
-		lowUserID,
-		highUserID,
-	).Scan(&conversationID)
-	if err == nil {
-		return conversationID, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, err
-	}
-
-	err = tx.QueryRow(
-		ctx,
-		`SELECT id
-		 FROM conversations
-		 WHERE kind = 'direct'
-		   AND direct_user_low_id = $1
-		   AND direct_user_high_id = $2`,
-		lowUserID,
-		highUserID,
-	).Scan(&conversationID)
-	if err != nil {
-		return 0, false, err
-	}
-	return conversationID, false, nil
-}
-
 func (app *application) syncMessages(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusGone, errorResponse{
-		Error: "user-level message sync was replaced by GET /conversations and GET /conversations/{conversationID}/messages",
-	})
+	writeAPIError(w, r, http.StatusGone, "ENDPOINT_GONE", "user-level message sync was replaced by GET /conversations and GET /conversations/{conversationID}/messages", nil)
 }
 
 func (app *application) health(w http.ResponseWriter, r *http.Request) {
@@ -687,7 +374,7 @@ func (app *application) health(w http.ResponseWriter, r *http.Request) {
 
 	var result int
 	if err := app.db.QueryRow(ctx, "SELECT 1").Scan(&result); err != nil {
-		http.Error(w, `{"status":"error"}`, http.StatusServiceUnavailable)
+		writeAPIError(w, r, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "database is temporarily unavailable", err)
 		return
 	}
 

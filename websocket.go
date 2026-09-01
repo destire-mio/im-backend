@@ -642,7 +642,7 @@ func decodeMessageCreatedEvent(event outboxEvent) (messageCreatedEventPayload, e
 
 func (app *application) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if app.webSocketHub == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "realtime messaging is unavailable"})
+		writeAPIError(w, r, http.StatusServiceUnavailable, "REALTIME_UNAVAILABLE", "realtime messaging is temporarily unavailable", nil)
 		return
 	}
 

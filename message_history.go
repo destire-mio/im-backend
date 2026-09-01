@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 
@@ -92,30 +91,30 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	for key, values := range query {
 		if key != "peerId" && key != "before" && key != "after" && key != "limit" {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "only peerId, before, after and limit are allowed"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_QUERY", "only peerId, before, after and limit are allowed", nil)
 			return
 		}
 		if len(values) != 1 {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: key + " must be provided exactly once"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_QUERY", key+" must be provided exactly once", nil)
 			return
 		}
 	}
 
 	peerValues, found := query["peerId"]
 	if !found || len(peerValues) != 1 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "peerId is required exactly once"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_QUERY", "peerId is required exactly once", nil)
 		return
 	}
 	peerID, err := strconv.ParseInt(peerValues[0], 10, 64)
 	if err != nil || peerID <= 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "peerId must be a positive integer"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_PEER_ID", "peerId must be a positive integer", nil)
 		return
 	}
 
 	_, hasBefore := query["before"]
 	_, hasAfter := query["after"]
 	if hasBefore && hasAfter {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "before and after are mutually exclusive"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_QUERY", "before and after are mutually exclusive", nil)
 		return
 	}
 
@@ -123,7 +122,7 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 	if values, found := query["limit"]; found {
 		parsed, err := strconv.Atoi(values[0])
 		if err != nil || parsed <= 0 || parsed > maxMessageHistoryLimit {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "limit must be between 1 and 200"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_LIMIT", "limit must be between 1 and 200", nil)
 			return
 		}
 		limit = parsed
@@ -135,14 +134,14 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 		direction = messageHistoryBefore
 		cursor, err = decodeMessageHistoryCursor(query.Get("before"))
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "before cursor is invalid"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_CURSOR", "before cursor is invalid", nil)
 			return
 		}
 	} else if hasAfter {
 		direction = messageHistoryAfter
 		cursor, err = decodeMessageHistoryCursor(query.Get("after"))
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "after cursor is invalid"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_CURSOR", "after cursor is invalid", nil)
 			return
 		}
 	}
@@ -151,19 +150,18 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 	conversationID, err := app.resolveDirectConversation(r.Context(), userID, peerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if direction != messageHistoryLatest {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "message cursor does not belong to this conversation"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_CURSOR", "message cursor does not belong to this conversation", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, messageHistoryPage{Messages: make([]message, 0)})
 		return
 	}
 	if err != nil {
-		log.Printf("resolve direct conversation: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list messages"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list messages", err)
 		return
 	}
 	if direction != messageHistoryLatest && cursor.ConversationID != conversationID {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "message cursor does not belong to this conversation"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_CURSOR", "message cursor does not belong to this conversation", nil)
 		return
 	}
 
@@ -178,8 +176,7 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 		rows, err = app.db.Query(r.Context(), afterMessageHistoryQuery, conversationID, cursor.Sequence, queryLimit)
 	}
 	if err != nil {
-		log.Printf("list messages: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list messages"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list messages", err)
 		return
 	}
 	defer rows.Close()
@@ -188,15 +185,13 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var current message
 		if err := scanMessage(rows, &current); err != nil {
-			log.Printf("scan message: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list messages"})
+			writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list messages", err)
 			return
 		}
 		messages = append(messages, current)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("iterate messages: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list messages"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list messages", err)
 		return
 	}
 
@@ -225,8 +220,7 @@ func (app *application) listMessages(w http.ResponseWriter, r *http.Request) {
 			page.AfterCursor, err = encodeMessageHistoryCursor(messages[len(messages)-1])
 		}
 		if err != nil {
-			log.Printf("encode message history cursor: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list messages"})
+			writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list messages", err)
 			return
 		}
 	}

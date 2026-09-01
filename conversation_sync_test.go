@@ -95,13 +95,24 @@ func TestSelfConversationHasOneMemberAndOneRealtimeRecipient(t *testing.T) {
 	if len(page.Conversations) != 1 || page.Conversations[0].Peer.ID != account.User.ID || page.Conversations[0].LastSeq != 1 {
 		t.Fatalf("self conversation page = %+v", page)
 	}
-	event := loadOutboxEventForMessage(t, db, created.ID)
-	payload, err := decodeMessageCreatedEvent(event)
+	publisher := &testPublisher{}
+	config := defaultOutboxWorkerConfig()
+	config.BatchSize = 1
+	worker := mustMessageTestWorker(t, db, publisher, config)
+	processed, err := worker.RunOnce(t.Context())
+	if err != nil || processed != 1 {
+		t.Fatalf("project self compatibility event = %d, err %v", processed, err)
+	}
+	received := publisher.received()
+	if len(received) != 1 || received[0].PayloadVersion != 2 {
+		t.Fatalf("self compatibility events = %+v", received)
+	}
+	payload, err := decodeMessageCreatedEvent(received[0])
 	if err != nil {
-		t.Fatalf("decode self version-4 event: %v", err)
+		t.Fatalf("decode self compatibility event: %v", err)
 	}
 	if len(payload.Recipients) != 1 || payload.Recipients[0].UserID != account.User.ID {
-		t.Fatalf("self version-4 recipients = %+v", payload.Recipients)
+		t.Fatalf("self compatibility recipients = %+v", payload.Recipients)
 	}
 	var members int
 	if err := db.QueryRow(

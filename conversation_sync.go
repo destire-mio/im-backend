@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -55,16 +54,15 @@ func (app *application) listConversations(w http.ResponseWriter, r *http.Request
 		   AND conversation.kind = 'direct'`,
 		userID,
 	).Scan(&currentCursor); err != nil {
-		log.Printf("read conversation list snapshot: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list conversations"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list conversations", err)
 		return
 	}
 	if after > currentCursor {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "after is ahead of the user's current conversation list"})
+		writeAPIError(w, r, http.StatusConflict, "CURSOR_AHEAD", "after is ahead of the user's current conversation list", nil)
 		return
 	}
 
-	snapshotCursor, ok := validateSnapshotCursor(w, rawSnapshot, after, currentCursor, "conversation list")
+	snapshotCursor, ok := validateSnapshotCursor(w, r, rawSnapshot, after, currentCursor, "conversation list")
 	if !ok {
 		return
 	}
@@ -99,8 +97,7 @@ func (app *application) listConversations(w http.ResponseWriter, r *http.Request
 		limit+1,
 	)
 	if err != nil {
-		log.Printf("list conversations: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list conversations"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list conversations", err)
 		return
 	}
 	defer rows.Close()
@@ -118,8 +115,7 @@ func (app *application) listConversations(w http.ResponseWriter, r *http.Request
 			&current.LastSeq,
 			&current.UpdatedAt,
 		); err != nil {
-			log.Printf("scan conversation: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list conversations"})
+			writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list conversations", err)
 			return
 		}
 		if len(conversations) == limit {
@@ -129,8 +125,7 @@ func (app *application) listConversations(w http.ResponseWriter, r *http.Request
 		conversations = append(conversations, current)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("iterate conversations: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list conversations"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list conversations", err)
 		return
 	}
 
@@ -169,20 +164,19 @@ func (app *application) syncConversationMessages(w http.ResponseWriter, r *http.
 		conversationID,
 	).Scan(&currentCursor)
 	if errors.Is(err, pgx.ErrNoRows) {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "conversation not found"})
+		writeAPIError(w, r, http.StatusNotFound, "CONVERSATION_NOT_FOUND", "conversation not found", nil)
 		return
 	}
 	if err != nil {
-		log.Printf("read conversation message snapshot: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not sync conversation"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not sync conversation", err)
 		return
 	}
 	if after > currentCursor {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "after is ahead of the conversation's current stream"})
+		writeAPIError(w, r, http.StatusConflict, "CURSOR_AHEAD", "after is ahead of the conversation's current stream", nil)
 		return
 	}
 
-	snapshotCursor, ok := validateSnapshotCursor(w, rawSnapshot, after, currentCursor, "conversation stream")
+	snapshotCursor, ok := validateSnapshotCursor(w, r, rawSnapshot, after, currentCursor, "conversation stream")
 	if !ok {
 		return
 	}
@@ -209,8 +203,7 @@ func (app *application) syncConversationMessages(w http.ResponseWriter, r *http.
 		limit+1,
 	)
 	if err != nil {
-		log.Printf("sync conversation messages: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not sync conversation"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not sync conversation", err)
 		return
 	}
 	defer rows.Close()
@@ -220,8 +213,7 @@ func (app *application) syncConversationMessages(w http.ResponseWriter, r *http.
 	for rows.Next() {
 		var current message
 		if err := scanMessage(rows, &current); err != nil {
-			log.Printf("scan conversation message: %v", err)
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not sync conversation"})
+			writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not sync conversation", err)
 			return
 		}
 		if len(messages) == limit {
@@ -231,8 +223,7 @@ func (app *application) syncConversationMessages(w http.ResponseWriter, r *http.
 		messages = append(messages, current)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("iterate conversation messages: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not sync conversation"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not sync conversation", err)
 		return
 	}
 
@@ -257,11 +248,11 @@ func parseSnapshotPagination(w http.ResponseWriter, r *http.Request) (int64, int
 	query := r.URL.Query()
 	for key, values := range query {
 		if key != "after" && key != "limit" && key != "snapshotCursor" {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "only after, limit and snapshotCursor are allowed"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_PAGINATION", "only after, limit and snapshotCursor are allowed", nil)
 			return 0, 0, nil, false
 		}
 		if len(values) != 1 {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: key + " must be provided exactly once"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_PAGINATION", key+" must be provided exactly once", nil)
 			return 0, 0, nil, false
 		}
 	}
@@ -270,7 +261,7 @@ func parseSnapshotPagination(w http.ResponseWriter, r *http.Request) (int64, int
 	if values, found := query["after"]; found {
 		parsed, err := strconv.ParseInt(values[0], 10, 64)
 		if err != nil || parsed < 0 {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "after must be a non-negative integer"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_PAGINATION", "after must be a non-negative integer", nil)
 			return 0, 0, nil, false
 		}
 		after = parsed
@@ -280,7 +271,7 @@ func parseSnapshotPagination(w http.ResponseWriter, r *http.Request) (int64, int
 	if values, found := query["limit"]; found {
 		parsed, err := strconv.Atoi(values[0])
 		if err != nil || parsed <= 0 || parsed > maxConversationPageLimit {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "limit must be between 1 and 200"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_PAGINATION", "limit must be between 1 and 200", nil)
 			return 0, 0, nil, false
 		}
 		limit = parsed
@@ -290,7 +281,7 @@ func parseSnapshotPagination(w http.ResponseWriter, r *http.Request) (int64, int
 	if values, found := query["snapshotCursor"]; found {
 		parsed, err := strconv.ParseInt(values[0], 10, 64)
 		if err != nil || parsed < 0 {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "snapshotCursor must be a non-negative integer"})
+			writeAPIError(w, r, http.StatusBadRequest, "INVALID_PAGINATION", "snapshotCursor must be a non-negative integer", nil)
 			return 0, 0, nil, false
 		}
 		snapshot = &parsed
@@ -300,6 +291,7 @@ func parseSnapshotPagination(w http.ResponseWriter, r *http.Request) (int64, int
 
 func validateSnapshotCursor(
 	w http.ResponseWriter,
+	r *http.Request,
 	rawSnapshot *int64,
 	after int64,
 	current int64,
@@ -309,11 +301,11 @@ func validateSnapshotCursor(
 		return current, true
 	}
 	if *rawSnapshot < after {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "snapshotCursor must be greater than or equal to after"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_PAGINATION", "snapshotCursor must be greater than or equal to after", nil)
 		return 0, false
 	}
 	if *rawSnapshot > current {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "snapshotCursor is ahead of the user's current " + streamName})
+		writeAPIError(w, r, http.StatusConflict, "CURSOR_AHEAD", "snapshotCursor is ahead of the user's current "+streamName, nil)
 		return 0, false
 	}
 	return *rawSnapshot, true
@@ -322,7 +314,7 @@ func validateSnapshotCursor(
 func parseConversationID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	conversationID, err := strconv.ParseInt(r.PathValue("conversationID"), 10, 64)
 	if err != nil || conversationID <= 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "conversationID must be a positive integer"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_CONVERSATION_ID", "conversationID must be a positive integer", nil)
 		return 0, false
 	}
 	return conversationID, true

@@ -10,9 +10,9 @@
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
 - Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 prepare 与当前批 publish，网络发布不占用数据库行锁。
 - 单聊双方规范化为一个 `conversation_id`；消息只写一份，并在会话内分配连续 `conversation_seq`。
-- 新消息使用 Outbox payload v4：既有会话先走只读快路径；序号分配、消息写入和 ready Outbox 再由一条 data-modifying CTE 原子完成，不再为每个参与用户复制 `user_message_events`。
+- 回滚窗口内的新消息使用兼容的 Outbox payload v3：会话序号、消息和 Outbox 仍在同一事务中写入；后台投影为双方生成旧用户级 Sync 记录，使 015 前二进制回滚后仍能读取同一批消息。
 - 重连时先分页扫描 `GET /conversations`，再按每个会话的 cursor 调用 `GET /conversations/{id}/messages`；设备 ACK 也按会话保存。WebSocket 只负责实时通知，SQL 仍是恢复权威。
-- v3 用户级 Sync projector、`user_sync_counters`、`user_message_events` 和相关实验模式暂时保留，只用于排空迁移前事件与短期回退；正常 v4 路径会跳过它们。
+- v3 用户级 Sync projector、`user_sync_counters` 和 `user_message_events` 在回滚窗口内仍是正常兼容路径的一部分；等确认不再回滚旧二进制后，才能在后续 contract 迁移中去掉。
 - 普通单聊历史使用绑定 `conversation_id + conversation_seq` 的 `before` / `after` opaque cursor 和单个会话索引，不通过 `OFFSET` 扫描深页。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
 - Outbox 投递前对同批 recipient 去重，用两段 Redis pipeline 生成仅在本批存活的 Presence 快照，避免热点用户被重复查询。
@@ -24,8 +24,8 @@
 ```text
 POST /messages
   -> PostgreSQL: resolve/create conversation（既有会话只读快路径）
-     + allocate conversation_seq + message + ready v4 outbox（同一 SQL、同一事务）
-  -> Outbox 准备 Lane: claim；v4 无用户级投影
+     + allocate conversation_seq + message + pending v3 outbox（同一 SQL、同一事务）
+  -> Outbox 准备 Lane: 为双方投影旧用户级 Sync，然后 ready
   -> Outbox 投递 Lane: 批内 Presence 快照 + Redis / 本地 Hub + mark published
   -> WebSocket 携带 conversationId + conversationSeq 实时通知
 
@@ -35,7 +35,7 @@ POST /messages
   -> 客户端持久化后 POST /conversations/{conversationId}/ack
 ```
 
-当前默认仍是 `OUTBOX_PREPARE_MODE=inline`、`OUTBOX_PREPARE_WORKERS=1`，但 v4 的 prepare 是无数据库写入的兼容步骤。`user_sharded`、projection mode 与 projection storage 开关只影响尚未排空的 v3 事件，不是新消息容量方案。
+当前默认仍是 `OUTBOX_PREPARE_MODE=inline`、`OUTBOX_PREPARE_WORKERS=1`。回滚窗口内，新消息也会执行 v3 用户级投影；`user_sharded`、projection mode 与 projection storage 开关仍只是这条兼容投影的实验实现，不是新的容量结论。
 
 该模型把热点从“同一用户的全局 counter”缩小到“同一会话的 counter”：不同会话可以并行写，同一会话为保证严格顺序仍会串行更新一行。超热点群聊未来仍需单独评估序号分段或其他排序方案，当前单聊实现没有宣称消除所有热点。
 
@@ -58,7 +58,43 @@ POST /messages
    docker compose up -d
    ```
 
-   `schema.sql` 会在首次创建 PostgreSQL volume 时初始化完整 schema。已有数据库请按 `migrations/` 顺序管理变更，不要假设重启容器会重新执行 schema。
+   `schema.sql` 会在首次创建 PostgreSQL volume 时初始化完整 schema。对新建空数据库，也可用正式迁移器
+   从 `001` 安装到当前版本：
+
+   ```bash
+   DATABASE_URL='postgres://...' go run ./cmd/im-migrate up
+   ```
+
+   执行器会获取 PostgreSQL advisory lock，核对 `schema_migrations` 中的版本、名称和 checksum，
+   并将普通迁移与其历史记录放在同一事务中。已有业务表但没有迁移历史的旧库会被拒绝，
+   不会被自动当成空库。
+
+   如果旧库已经是 015 的完整结构，先做备份和变更审批，再显式接管：
+
+   ```bash
+   DATABASE_URL='postgres://...' go run ./cmd/im-migrate baseline -to 15
+   DATABASE_URL='postgres://...' go run ./cmd/im-migrate up
+   ```
+
+   `baseline` 会比较表、字段、默认值、可空性、约束、索引、序列和统计对象的 015 语义指纹。
+   只有完全匹配才会在一个事务中补写 001～015 历史；它不重放 SQL，也不改业务数据。
+   空库、结构漂移或已有迁移历史时都会拒绝。不要假设重启容器会重新执行 schema。
+
+   应用实例本身不会执行迁移；它在连接 PostgreSQL 后会只读核对全部版本、名称和 checksum。
+   数据库缺版本、比当前二进制更新、历史不连续或 checksum 不匹配时，实例会在启动 Worker 和 HTTP 服务前退出。
+   部署顺序因此是：先单独运行 `im-migrate up`，成功后再启动或更新 IM 实例。
+
+   `015_add_conversation_sync_model` 是 expand 迁移：它添加可空的会话 cursor 字段，并回填已有消息。执行前需先停止所有新旧实例的消息写入；有历史消息时还必须显式传入 `-allow-maintenance`。字段暂时可空，是为了让 015 前二进制回滚后仍可以写消息。
+
+   发布和回滚必须遵守以下顺序，不允许新旧写实例混跑：
+
+   ```text
+   首次升级：停所有写实例 -> im-migrate up [-allow-maintenance] -> 启动新实例
+   回滚应用：停新实例 -> 启动 015 前旧实例
+   再次前进：停旧实例 -> im-migrate reconcile-conversations -allow-maintenance -> 启动新实例
+   ```
+
+   旧实例在回滚期间写入的消息没有会话 cursor；`reconcile-conversations` 会在停写期间补建会话、顺序号和 Outbox payload。新应用启动时会检查这些 NULL，只要还有一条未修复就拒绝对外服务。未来确认旧版本回滚窗口结束后，才能新增 contract 迁移：先验证无 NULL、无旧实例和旧事件积压，再收紧 NOT NULL 并切换纯 v4 路径。这个 contract 迁移尚未实现。
 
 3. 加载环境变量并启动服务：
 
@@ -125,9 +161,16 @@ POST /messages
 
 客户端应先建立 WebSocket，再扫描会话列表并逐会话补拉；扫描期间收到的新消息由 WebSocket 覆盖。连接中断时重新开始一轮会话扫描，避免把不完整的一轮当成恢复完成。
 
-已有数据库升级到本模型时，先停止消息写入，再依次执行 `014`、`015`。`015` 会按规范化用户对回填会话和序号，并补全未发布 v1/v2/v3 Outbox payload；它是停写迁移，不是面向超大表的在线分批迁移。
+已有数据库升级到本模型时，先停止消息写入，再依次执行 `014`、`015`。`015` 会按规范化用户对回填会话和序号，并补全未发布 v1/v2/v3 Outbox payload；它是为回滚保留可空字段的停写 expand 迁移，不是面向超大表的在线分批迁移。
 
 ## 测试与压测
+
+当前 HTTP 合同从 [`openapi.yaml`](./openapi.yaml) 开始维护，已覆盖当前全部对外路由：认证与 Session、消息创建与历史分页、会话恢复与 ACK、废弃的用户级 Sync/ACK、health 和 WebSocket HTTP 握手。认证合同包含敏感令牌响应、输入错误、凭证失败、幂等 key 冲突与恢复、限流、依赖故障和内部错误；
+`message_contract_test.go` 使用测试依赖 `kin-openapi` 对真实 Handler、认证中间件和
+PostgreSQL 集成响应进行校验，包括成功响应与 400、401、404、409、410、426、429、500、503。WebSocket 升级后的实时消息协议仍由 WebSocket 集成测试负责，不把 OpenAPI 当成帧协议规范。
+OpenAPI 合同测试负责请求/响应形状，消息与 Outbox 的事务原子性仍由 PostgreSQL 集成测试负责。
+
+GitHub Actions 门禁位于 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，使用独立的 PostgreSQL 应用测试库和破坏性迁移测试库，并启动 Redis。它会检查 gofmt，执行两次幂等 `im-migrate up`、全仓 race、`go vet` 和全包构建。该 workflow 已在本地用同样的双库结构完整复演；在实际 commit/push 前，仍不能声称 GitHub 远程门禁已运行。
 
 运行代码检查：
 

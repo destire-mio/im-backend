@@ -177,13 +177,13 @@ func TestLoginRejectsWrongPasswordWithoutRevealingWhichCredentialFailed(t *testi
 			t.Fatalf("encode login request: %v", err)
 		}
 		response := doRequest(t, http.MethodPost, server.URL+"/auth/login", "", string(body))
-		var failure errorResponse
+		var failure apiErrorResponse
 		if err := json.NewDecoder(response.Body).Decode(&failure); err != nil {
 			response.Body.Close()
 			t.Fatalf("decode login failure: %v", err)
 		}
 		response.Body.Close()
-		if response.StatusCode != http.StatusUnauthorized || failure.Error != "invalid username or password" {
+		if response.StatusCode != http.StatusUnauthorized || failure.Code != "INVALID_CREDENTIALS" || failure.Message != "invalid username or password" || failure.RequestID == "" {
 			t.Fatalf("login failure = status %d, body %+v", response.StatusCode, failure)
 		}
 	}
@@ -454,9 +454,20 @@ func TestCreateMessageIdempotencyCreatesOneMessageAndOneOutboxEvent(t *testing.T
 		Content:         &differentContent,
 	})
 	conflict := doRequest(t, http.MethodPost, server.URL+"/messages", sender.Auth.AccessToken, string(conflictingBody))
+	var conflictError apiErrorResponse
+	if err := json.NewDecoder(conflict.Body).Decode(&conflictError); err != nil {
+		conflict.Body.Close()
+		t.Fatalf("decode conflict error: %v", err)
+	}
 	conflict.Body.Close()
 	if conflict.StatusCode != http.StatusConflict {
 		t.Fatalf("conflicting reuse status = %d, want 409", conflict.StatusCode)
+	}
+	if conflictError.Code != "CLIENT_MESSAGE_ID_CONFLICT" {
+		t.Fatalf("conflicting reuse code = %q, want CLIENT_MESSAGE_ID_CONFLICT", conflictError.Code)
+	}
+	if conflictError.RequestID == "" || conflictError.RequestID != conflict.Header.Get("X-Request-ID") {
+		t.Fatalf("conflict requestId = %q, header = %q", conflictError.RequestID, conflict.Header.Get("X-Request-ID"))
 	}
 }
 
@@ -574,14 +585,14 @@ func TestDatabaseConstraintsProtectDirectWrites(t *testing.T) {
 	assertPostgresCode(t, err, "23514")
 }
 
-func TestMessageCreationMakesConversationOutboxReadyInSendTransaction(t *testing.T) {
+func TestMessageCreationDefersRollbackCompatibleSyncProjectionToOutbox(t *testing.T) {
 	db := openTestDatabase(t)
 	server := httptest.NewServer(newTestApplication(t, db).routes())
 	t.Cleanup(server.Close)
 	sender := registerTestAccount(t, db, server.URL, uniqueUsername("async_s"), "Async Sender")
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("async_r"), "Async Receiver")
 
-	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "ready immediately")
+	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "rollback compatible")
 	var syncEvents, recipients, members int
 	var payloadVersion int
 	var ready bool
@@ -604,7 +615,7 @@ func TestMessageCreationMakesConversationOutboxReadyInSendTransaction(t *testing
 	).Scan(&syncEvents, &payloadVersion, &ready, &recipients, &members); err != nil {
 		t.Fatalf("read conversation Outbox state: %v", err)
 	}
-	if syncEvents != 0 || payloadVersion != 4 || !ready || recipients != 0 || members != 2 {
+	if syncEvents != 0 || payloadVersion != 3 || ready || recipients != 0 || members != 2 {
 		t.Fatalf(
 			"send transaction: sync events=%d payload version=%d ready=%v recipients=%d members=%d",
 			syncEvents,
@@ -644,7 +655,7 @@ func TestMessageCreationMakesConversationOutboxReadyInSendTransaction(t *testing
 	).Scan(&syncEvents, &payloadVersion, &ready, &published, &recipients); err != nil {
 		t.Fatalf("read completed projection: %v", err)
 	}
-	if syncEvents != 0 || payloadVersion != 4 || !ready || !published || recipients != 0 {
+	if syncEvents != 2 || payloadVersion != 3 || !ready || !published || recipients != 0 {
 		t.Fatalf(
 			"after publish: sync events=%d payload version=%d ready=%v published=%v recipients=%d",
 			syncEvents,
@@ -1305,7 +1316,8 @@ func TestOppositeDirectionMessagesAllocateOneConversationCursorWithoutGaps(t *te
 	).Scan(&conversationID); err != nil {
 		t.Fatalf("read direct conversation: %v", err)
 	}
-	var count, minimum, maximum, conversations, lastSeq, readyV4 int64
+	projectPendingMessageEvents(t, db)
+	var count, minimum, maximum, conversations, lastSeq, readyCompatibilityEvents int64
 	if err := db.QueryRow(
 		context.Background(),
 		`SELECT count(*),
@@ -1314,14 +1326,14 @@ func TestOppositeDirectionMessagesAllocateOneConversationCursorWithoutGaps(t *te
 		        count(DISTINCT message.conversation_id),
 		        max(conversation.last_seq),
 		        count(*) FILTER (
-		            WHERE event.payload_version = 4 AND event.ready_at IS NOT NULL
+		            WHERE event.payload_version = 3 AND event.ready_at IS NOT NULL
 		        )
 		 FROM messages AS message
 		 JOIN conversations AS conversation ON conversation.id = message.conversation_id
 		 JOIN outbox_events AS event ON event.message_id = message.id
 		 WHERE message.conversation_id = $1`,
 		conversationID,
-	).Scan(&count, &minimum, &maximum, &conversations, &lastSeq, &readyV4); err != nil {
+	).Scan(&count, &minimum, &maximum, &conversations, &lastSeq, &readyCompatibilityEvents); err != nil {
 		t.Fatalf("read conversation cursor range: %v", err)
 	}
 	wantMessages := int64(messagesPerDirection * 2)
@@ -1354,13 +1366,14 @@ func TestOppositeDirectionMessagesAllocateOneConversationCursorWithoutGaps(t *te
 	).Scan(&legacySync, &timeRegressions); err != nil {
 		t.Fatalf("read conversation projection and timestamp state: %v", err)
 	}
-	if readyV4 != wantMessages || legacySync != 0 || timeRegressions != 0 {
+	if readyCompatibilityEvents != wantMessages || legacySync != wantMessages*2 || timeRegressions != 0 {
 		t.Fatalf(
-			"ready v4 events=%d legacy sync rows=%d timestamp regressions=%d, want %d/0/0",
-			readyV4,
+			"ready compatibility events=%d legacy sync rows=%d timestamp regressions=%d, want %d/%d/0",
+			readyCompatibilityEvents,
 			legacySync,
 			timeRegressions,
 			wantMessages,
+			wantMessages*2,
 		)
 	}
 }
@@ -1371,10 +1384,9 @@ func (discardRealtimeRouter) Publish(context.Context, int64, []byte) (int, error
 	return 0, nil
 }
 
-// createLegacyPendingMessageThroughAPI turns a normal version-4 message into
-// the version-3 shape that may still be waiting when migration 015 deploys.
-// It keeps the legacy projector and rollback path covered without making the
-// production send path write user-level Sync events again.
+// createLegacyPendingMessageThroughAPI recreates the version-3 shape after a
+// test may have changed the durable event. The production transition writer
+// also uses version 3 until the migration-016 contract release.
 func createLegacyPendingMessageThroughAPI(
 	t *testing.T,
 	db *pgxpool.Pool,
@@ -1394,7 +1406,7 @@ func createLegacyPendingMessageThroughAPI(
 		`DELETE FROM outbox_events WHERE message_id = $1`,
 		created.ID,
 	); err != nil {
-		t.Fatalf("remove version-4 test event: %v", err)
+		t.Fatalf("replace compatibility test event: %v", err)
 	}
 	if _, err := db.Exec(
 		context.Background(),

@@ -97,7 +97,7 @@ func TestWebSocketPublisherDeliversToEveryOnlineDevice(t *testing.T) {
 				t.Fatalf("envelope identity = %+v", envelope)
 			}
 			if envelope.Message.ID != created.ID ||
-				envelope.Cursor != 0 ||
+				envelope.Cursor <= 0 ||
 				envelope.ConversationID != created.ConversationID ||
 				envelope.ConversationSeq != created.ConversationSeq {
 				t.Fatalf("envelope message = %+v", envelope)

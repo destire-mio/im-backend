@@ -85,7 +85,14 @@ func (app *application) enforceAuthRateLimit(w http.ResponseWriter, r *http.Requ
 		if app.rateLimitFailOpen {
 			return true
 		}
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "authentication rate limiter is unavailable"})
+		writeAPIError(
+			w,
+			r,
+			http.StatusServiceUnavailable,
+			"AUTH_RATE_LIMIT_UNAVAILABLE",
+			"authentication rate limiter is temporarily unavailable",
+			err,
+		)
 		return false
 	}
 	if !allowed {
@@ -94,7 +101,7 @@ func (app *application) enforceAuthRateLimit(w http.ResponseWriter, r *http.Requ
 			seconds = 1
 		}
 		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-		writeJSON(w, http.StatusTooManyRequests, errorResponse{Error: "too many authentication attempts"})
+		writeAPIError(w, r, http.StatusTooManyRequests, "AUTH_RATE_LIMITED", "too many authentication attempts", nil)
 		return false
 	}
 	return true

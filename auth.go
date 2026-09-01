@@ -101,26 +101,26 @@ const (
 func (app *application) register(w http.ResponseWriter, r *http.Request) {
 	var input registerRequest
 	if err := decodeSingleJSON(w, r, &input); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_JSON", "invalid JSON body", nil)
 		return
 	}
 
 	input.Username = strings.ToLower(strings.TrimSpace(input.Username))
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if !usernamePattern.MatchString(input.Username) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "username must contain 3-32 lowercase letters, numbers or underscores"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_USERNAME", "username must contain 3-32 lowercase letters, numbers or underscores", nil)
 		return
 	}
 	if input.DisplayName == "" || utf8.RuneCountInString(input.DisplayName) > maxDisplayNameRunes {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "displayName must contain 1-100 characters"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_DISPLAY_NAME", "displayName must contain 1-100 characters", nil)
 		return
 	}
 	if !validPassword(input.Password) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "password must contain 8-128 characters"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_PASSWORD", "password must contain 8-128 characters", nil)
 		return
 	}
 	if !validOptionalDeviceID(input.DeviceID) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "deviceId is too long"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_DEVICE_ID", "deviceId is too long", nil)
 		return
 	}
 	if !app.enforceAuthRateLimit(w, r, "register", input.Username, input.DeviceID) {
@@ -129,13 +129,13 @@ func (app *application) register(w http.ResponseWriter, r *http.Request) {
 
 	passwordHash, err := hashPassword(input.Password)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create user"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not create user", err)
 		return
 	}
 
 	tx, err := app.db.Begin(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create user"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not create user", err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -153,20 +153,20 @@ func (app *application) register(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var databaseError *pgconn.PgError
 		if errors.As(err, &databaseError) && databaseError.Code == "23505" {
-			writeJSON(w, http.StatusConflict, errorResponse{Error: "username is already registered"})
+			writeAPIError(w, r, http.StatusConflict, "USERNAME_CONFLICT", "username is already registered", nil)
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create user"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not create user", err)
 		return
 	}
 
 	response, err := app.createSessionResponse(r.Context(), tx, created, input.DeviceID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create user"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not create user", err)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not create user"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not create user", err)
 		return
 	}
 
@@ -176,17 +176,17 @@ func (app *application) register(w http.ResponseWriter, r *http.Request) {
 func (app *application) login(w http.ResponseWriter, r *http.Request) {
 	var input loginRequest
 	if err := decodeSingleJSON(w, r, &input); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_JSON", "invalid JSON body", nil)
 		return
 	}
 
 	input.Username = strings.ToLower(strings.TrimSpace(input.Username))
 	if !validOpaqueID(input.LoginRequestID) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "loginRequestId must contain 16-128 characters"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_LOGIN_REQUEST_ID", "loginRequestId must contain 16-128 characters", nil)
 		return
 	}
 	if !validOptionalDeviceID(input.DeviceID) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "deviceId is too long"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_DEVICE_ID", "deviceId is too long", nil)
 		return
 	}
 	if !app.enforceAuthRateLimit(w, r, "login", input.Username, input.DeviceID) {
@@ -194,7 +194,7 @@ func (app *application) login(w http.ResponseWriter, r *http.Request) {
 	}
 	if !usernamePattern.MatchString(input.Username) || !validPassword(input.Password) {
 		consumePasswordVerificationTime(input.Password)
-		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid username or password"})
+		writeAPIError(w, r, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid username or password", nil)
 		return
 	}
 
@@ -202,26 +202,26 @@ func (app *application) login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			consumePasswordVerificationTime(input.Password)
-			writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid username or password"})
+			writeAPIError(w, r, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid username or password", nil)
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not log in"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not log in", err)
 		return
 	}
 
 	matches, err := verifyPassword(input.Password, passwordHash)
 	if err != nil || !matches {
-		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid username or password"})
+		writeAPIError(w, r, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid username or password", err)
 		return
 	}
 	if app.responseCipher == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "login recovery is unavailable"})
+		writeAPIError(w, r, http.StatusServiceUnavailable, "LOGIN_RECOVERY_UNAVAILABLE", "login recovery is temporarily unavailable", nil)
 		return
 	}
 
 	requestHash := sha256.Sum256([]byte(input.LoginRequestID))
 	if existing, found, err := app.loadLoginResult(r.Context(), requestHash[:], authenticated.ID); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "could not recover login"})
+		writeAPIError(w, r, http.StatusServiceUnavailable, "LOGIN_RECOVERY_UNAVAILABLE", "login recovery is temporarily unavailable", err)
 		return
 	} else if found {
 		writePrivateJSON(w, http.StatusOK, existing)
@@ -230,11 +230,11 @@ func (app *application) login(w http.ResponseWriter, r *http.Request) {
 
 	response, err := app.createIdempotentLogin(r.Context(), authenticated, input.DeviceID, requestHash[:])
 	if errors.Is(err, errIdempotencyConflict) {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "loginRequestId was already used"})
+		writeAPIError(w, r, http.StatusConflict, "LOGIN_REQUEST_ID_CONFLICT", "loginRequestId was already used", nil)
 		return
 	}
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not log in"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not log in", err)
 		return
 	}
 	writePrivateJSON(w, http.StatusOK, response)
@@ -243,34 +243,34 @@ func (app *application) login(w http.ResponseWriter, r *http.Request) {
 func (app *application) refresh(w http.ResponseWriter, r *http.Request) {
 	var input refreshRequest
 	if err := decodeSingleJSON(w, r, &input); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_JSON", "invalid JSON body", nil)
 		return
 	}
 	if !validOpaqueID(input.IdempotencyKey) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "idempotencyKey must contain 16-128 characters"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_IDEMPOTENCY_KEY", "idempotencyKey must contain 16-128 characters", nil)
 		return
 	}
 	_, refreshHash, err := decodeAndHashToken(input.RefreshToken)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "valid refresh token is required"})
+		writeAPIError(w, r, http.StatusUnauthorized, "REFRESH_TOKEN_INVALID", "valid refresh token is required", nil)
 		return
 	}
 	if !app.enforceAuthRateLimit(w, r, "refresh", "", base64.RawURLEncoding.EncodeToString(refreshHash[:8])) {
 		return
 	}
 	if app.responseCipher == nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "refresh recovery is unavailable"})
+		writeAPIError(w, r, http.StatusServiceUnavailable, "REFRESH_RECOVERY_UNAVAILABLE", "refresh recovery is temporarily unavailable", nil)
 		return
 	}
 
 	keyHash := sha256.Sum256([]byte(input.IdempotencyKey))
 	response, status, err := app.rotateRefreshToken(r.Context(), refreshHash, keyHash[:])
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "could not refresh session"})
+		writeAPIError(w, r, http.StatusServiceUnavailable, "REFRESH_RECOVERY_UNAVAILABLE", "refresh recovery is temporarily unavailable", err)
 		return
 	}
 	if status != http.StatusOK {
-		writeJSON(w, status, errorResponse{Error: "refresh token is invalid or has been replayed"})
+		writeAPIError(w, r, status, "REFRESH_TOKEN_INVALID", "refresh token is invalid or has been replayed", nil)
 		return
 	}
 	writePrivateJSON(w, http.StatusOK, response)
@@ -285,7 +285,7 @@ func (app *application) logout(w http.ResponseWriter, r *http.Request) {
 		authenticatedSessionID(r.Context()),
 	)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not log out"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not log out", err)
 		return
 	}
 	app.disconnectSessionWebSockets(r.Context(), authenticatedUserID(r.Context()), authenticatedSessionID(r.Context()))
@@ -301,7 +301,7 @@ func (app *application) logoutAll(w http.ResponseWriter, r *http.Request) {
 		authenticatedUserID(r.Context()),
 	)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not log out all devices"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not log out all devices", err)
 		return
 	}
 	app.disconnectUserWebSockets(r.Context(), authenticatedUserID(r.Context()))
@@ -318,7 +318,7 @@ func (app *application) listSessions(w http.ResponseWriter, r *http.Request) {
 		authenticatedUserID(r.Context()),
 	)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list sessions"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list sessions", err)
 		return
 	}
 	defer rows.Close()
@@ -328,14 +328,14 @@ func (app *application) listSessions(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var current sessionResponse
 		if err := rows.Scan(&current.ID, &current.DeviceID, &current.CreatedAt, &current.IdleExpiresAt, &current.RevokedAt); err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list sessions"})
+			writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list sessions", err)
 			return
 		}
 		current.Current = current.ID == currentID
 		sessions = append(sessions, current)
 	}
-	if rows.Err() != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not list sessions"})
+	if err := rows.Err(); err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list sessions", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sessions)
@@ -344,7 +344,7 @@ func (app *application) listSessions(w http.ResponseWriter, r *http.Request) {
 func (app *application) revokeSession(w http.ResponseWriter, r *http.Request) {
 	sessionID, err := strconv.ParseInt(r.PathValue("sessionID"), 10, 64)
 	if err != nil || sessionID <= 0 {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "sessionID must be a positive integer"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_SESSION_ID", "sessionID must be a positive integer", nil)
 		return
 	}
 	command, err := app.db.Exec(
@@ -356,11 +356,11 @@ func (app *application) revokeSession(w http.ResponseWriter, r *http.Request) {
 		authenticatedUserID(r.Context()),
 	)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not revoke session"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not revoke session", err)
 		return
 	}
 	if command.RowsAffected() == 0 {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "active session was not found"})
+		writeAPIError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "active session was not found", nil)
 		return
 	}
 	app.disconnectSessionWebSockets(r.Context(), authenticatedUserID(r.Context()), sessionID)
@@ -370,37 +370,37 @@ func (app *application) revokeSession(w http.ResponseWriter, r *http.Request) {
 func (app *application) changePassword(w http.ResponseWriter, r *http.Request) {
 	var input changePasswordRequest
 	if err := decodeSingleJSON(w, r, &input); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_JSON", "invalid JSON body", nil)
 		return
 	}
 	if !validPassword(input.NewPassword) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "newPassword must contain 8-128 characters"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_NEW_PASSWORD", "newPassword must contain 8-128 characters", nil)
 		return
 	}
 	if input.CurrentPassword == input.NewPassword {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "newPassword must be different"})
+		writeAPIError(w, r, http.StatusBadRequest, "PASSWORD_UNCHANGED", "newPassword must be different", nil)
 		return
 	}
 
 	var currentHash string
 	if err := app.db.QueryRow(r.Context(), `SELECT password_hash FROM users WHERE id = $1`, authenticatedUserID(r.Context())).Scan(&currentHash); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not change password"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not change password", err)
 		return
 	}
 	matches, err := verifyPassword(input.CurrentPassword, currentHash)
 	if err != nil || !matches {
-		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "current password is invalid"})
+		writeAPIError(w, r, http.StatusUnauthorized, "CURRENT_PASSWORD_INVALID", "current password is invalid", err)
 		return
 	}
 	newHash, err := hashPassword(input.NewPassword)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not change password"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not change password", err)
 		return
 	}
 
 	tx, err := app.db.Begin(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not change password"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not change password", err)
 		return
 	}
 	defer tx.Rollback(r.Context())
@@ -411,8 +411,12 @@ func (app *application) changePassword(w http.ResponseWriter, r *http.Request) {
 		authenticatedUserID(r.Context()),
 		currentHash,
 	)
-	if err != nil || command.RowsAffected() != 1 {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "password changed concurrently; retry"})
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not change password", err)
+		return
+	}
+	if command.RowsAffected() != 1 {
+		writeAPIError(w, r, http.StatusConflict, "PASSWORD_CHANGE_CONFLICT", "password changed concurrently; retry", nil)
 		return
 	}
 	if _, err := tx.Exec(
@@ -420,11 +424,11 @@ func (app *application) changePassword(w http.ResponseWriter, r *http.Request) {
 		`UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND revoked_at IS NULL`,
 		authenticatedUserID(r.Context()),
 	); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not change password"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not change password", err)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not change password"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not change password", err)
 		return
 	}
 	app.disconnectUserWebSockets(r.Context(), authenticatedUserID(r.Context()))
@@ -435,12 +439,26 @@ func (app *application) requireAuthentication(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fields := strings.Fields(r.Header.Get("Authorization"))
 		if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
-			writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "valid bearer token is required"})
+			writeAPIError(
+				w,
+				r,
+				http.StatusUnauthorized,
+				"AUTHENTICATION_REQUIRED",
+				"valid bearer token is required",
+				nil,
+			)
 			return
 		}
 		_, tokenHash, err := decodeAndHashToken(fields[1])
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "valid bearer token is required"})
+			writeAPIError(
+				w,
+				r,
+				http.StatusUnauthorized,
+				"AUTHENTICATION_REQUIRED",
+				"valid bearer token is required",
+				nil,
+			)
 			return
 		}
 
@@ -460,10 +478,24 @@ func (app *application) requireAuthentication(next http.Handler) http.Handler {
 		).Scan(&userID, &sessionID, &deviceID, &tokenExpiresAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "valid bearer token is required"})
+				writeAPIError(
+					w,
+					r,
+					http.StatusUnauthorized,
+					"AUTHENTICATION_REQUIRED",
+					"valid bearer token is required",
+					nil,
+				)
 				return
 			}
-			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "could not authenticate request"})
+			writeAPIError(
+				w,
+				r,
+				http.StatusServiceUnavailable,
+				"AUTHENTICATION_UNAVAILABLE",
+				"authentication service is temporarily unavailable",
+				err,
+			)
 			return
 		}
 

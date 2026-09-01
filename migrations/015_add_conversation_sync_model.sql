@@ -3,8 +3,11 @@
 -- Run this migration with message writers stopped. The backfill rewrites the
 -- existing messages table to assign a stable sequence inside every direct
 -- conversation. Version-3 Outbox and user-level Sync tables are deliberately
--- retained so the new binary can drain pre-deployment events; a later contract
--- migration may remove them after the operational rollback window closes.
+-- retained so the new binary can drain pre-deployment events. This does not
+-- make pre-015 data immediately visible in the conversation stream. The new
+-- cursor columns intentionally remain nullable during the rollback window so a
+-- pre-015 writer can still insert messages. Before the conversation-aware
+-- binary is started again, reconcile those rows with im-migrate.
 
 BEGIN;
 
@@ -141,14 +144,19 @@ WHERE event.message_id = message.id
   AND event.dead_at IS NULL;
 
 ALTER TABLE messages
-    ALTER COLUMN conversation_id SET NOT NULL,
-    ALTER COLUMN conversation_seq SET NOT NULL,
     ADD CONSTRAINT messages_conversation_fk
         FOREIGN KEY (conversation_id) REFERENCES conversations(id),
     ADD CONSTRAINT messages_conversation_seq_valid
         CHECK (conversation_seq > 0),
     ADD CONSTRAINT messages_conversation_seq_unique
         UNIQUE (conversation_id, conversation_seq);
+
+-- Keeps the application startup gate and rollback reconciliation bounded even
+-- when the messages table is large. The index is empty during normal operation
+-- and receives only rows written by a pre-015 binary.
+CREATE INDEX messages_missing_conversation_cursor_idx
+    ON messages (id)
+    WHERE conversation_id IS NULL OR conversation_seq IS NULL;
 
 CREATE TABLE device_conversation_sync_states (
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

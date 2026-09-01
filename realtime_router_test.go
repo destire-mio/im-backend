@@ -413,7 +413,7 @@ func TestTwoApplicationInstancesDeliverOutboxEventToRemoteWebSocket(t *testing.T
 	if envelope.Message.ID != created.ID ||
 		envelope.ConversationID != created.ConversationID ||
 		envelope.ConversationSeq != created.ConversationSeq ||
-		envelope.Cursor != 0 {
+		envelope.Cursor <= 0 {
 		t.Fatalf("cross-instance websocket envelope = %+v", envelope)
 	}
 }

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Go, PostgreSQL, Redis, migrations, and contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: im
+          POSTGRES_PASSWORD: im
+          POSTGRES_DB: im_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U im -d im_ci"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://im:im@localhost:5432/im_ci?sslmode=disable
+      TEST_DATABASE_URL: postgres://im:im@localhost:5432/im_ci?sslmode=disable
+      TEST_MIGRATION_DATABASE_URL: postgres://im:im@localhost:5432/im_migration_test_ci?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Create destructive migration-test database
+        shell: bash
+        run: >-
+          docker exec "${{ job.services.postgres.id }}"
+          psql -U im -d postgres -v ON_ERROR_STOP=1
+          -c "CREATE DATABASE im_migration_test_ci"
+
+      - name: Install application schema through migrations
+        run: go run ./cmd/im-migrate up
+
+      - name: Verify migration rerun is idempotent
+        run: go run ./cmd/im-migrate up
+
+      - name: Run tests with race detection
+        run: go test -race -count=1 ./...
+
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Build all packages
+        run: go build ./...

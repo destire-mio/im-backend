@@ -128,8 +128,11 @@ CREATE INDEX conversation_members_user_conversation_idx
 
 CREATE TABLE messages (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    conversation_id BIGINT NOT NULL REFERENCES conversations(id),
-    conversation_seq BIGINT NOT NULL,
+    -- Nullable through the migration-015 rollback window. The current writer
+    -- always fills both fields; a pre-015 writer may leave them NULL and must
+    -- be followed by im-migrate reconcile-conversations before roll-forward.
+    conversation_id BIGINT REFERENCES conversations(id),
+    conversation_seq BIGINT,
     sender_id BIGINT NOT NULL REFERENCES users(id),
     receiver_id BIGINT NOT NULL REFERENCES users(id),
     client_message_id TEXT NOT NULL,
@@ -148,6 +151,10 @@ CREATE TABLE messages (
 
 CREATE INDEX messages_direction_history_idx
     ON messages (sender_id, receiver_id, created_at DESC, id DESC);
+
+CREATE INDEX messages_missing_conversation_cursor_idx
+    ON messages (id)
+    WHERE conversation_id IS NULL OR conversation_seq IS NULL;
 
 CREATE STATISTICS messages_sender_receiver_stats (dependencies, mcv)
     ON sender_id, receiver_id
@@ -186,9 +193,9 @@ CREATE TABLE device_sync_states (
     CONSTRAINT device_sync_states_applied_seq_valid CHECK (applied_seq >= 0)
 );
 
--- Legacy device_sync_states remains during the expand/contract rollout so an
--- old binary can drain version-3 Outbox events. New clients ACK per
--- conversation in this table.
+-- Legacy device_sync_states remains so the new binary can drain version-3
+-- Outbox events created before migration 015. This compatibility data does not
+-- make a pre-015 writer rollback-safe.
 CREATE TABLE device_conversation_sync_states (
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     device_id TEXT NOT NULL,

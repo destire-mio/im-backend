@@ -63,7 +63,7 @@ func TestTwoProcessesDeliverOutboxEventToRemoteWebSocket(t *testing.T) {
 	if envelope.Message.ID != created.ID ||
 		envelope.ConversationID != created.ConversationID ||
 		envelope.ConversationSeq != created.ConversationSeq ||
-		envelope.Cursor != 0 {
+		envelope.Cursor <= 0 {
 		t.Fatalf("cross-process websocket envelope = %+v", envelope)
 	}
 }

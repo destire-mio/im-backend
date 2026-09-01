@@ -1,0 +1,2005 @@
+openapi: 3.0.3
+info:
+  title: IM Backend API
+  version: 0.1.0
+paths:
+  /auth/register:
+    post:
+      operationId: registerUser
+      summary: Register a user and create the first device session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User and first device session created
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Malformed JSON or invalid registration data
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterBadRequest'
+        '409':
+          description: Username is already registered
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterConflict'
+        '429':
+          description: Registration rate limit exceeded
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+            Retry-After:
+              description: Whole seconds until another attempt is allowed
+              required: true
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthRateLimited'
+        '500':
+          description: Unexpected registration failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication rate limiter is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthRateLimitUnavailable'
+  /auth/login:
+    post:
+      operationId: login
+      summary: Authenticate and idempotently create or recover a device session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated session created or recovered
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Malformed JSON or invalid login request metadata
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginBadRequest'
+        '401':
+          description: Username or password is invalid
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidCredentials'
+        '409':
+          description: loginRequestId belongs to another login
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginConflict'
+        '429':
+          description: Login rate limit exceeded
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+            Retry-After:
+              description: Whole seconds until another attempt is allowed
+              required: true
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthRateLimited'
+        '500':
+          description: Unexpected login failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Login recovery or authentication rate limiter is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginUnavailable'
+  /auth/refresh:
+    post:
+      operationId: refreshSession
+      summary: Rotate a refresh token or recover the same rotation result
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Session tokens rotated or idempotently recovered
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+            Cache-Control:
+              $ref: '#/components/headers/PrivateNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Malformed JSON or invalid idempotency key
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshBadRequest'
+        '401':
+          description: Refresh token is invalid, expired, revoked, or replayed with a different key
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenInvalid'
+        '429':
+          description: Refresh rate limit exceeded
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+            Retry-After:
+              description: Whole seconds until another attempt is allowed
+              required: true
+              schema:
+                type: string
+                pattern: '^[1-9][0-9]*$'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthRateLimited'
+        '503':
+          description: Refresh recovery or authentication rate limiter is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshUnavailable'
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Revoke the current device session
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Current session revoked
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '500':
+          description: Unexpected logout failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /auth/logout-all:
+    post:
+      operationId: logoutAll
+      summary: Revoke all sessions for the authenticated user
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: All sessions revoked
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '500':
+          description: Unexpected logout failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /auth/sessions:
+    get:
+      operationId: listSessions
+      summary: List all device sessions for the authenticated user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Device sessions, including revoked sessions
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Session'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '500':
+          description: Unexpected session listing failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /auth/sessions/{sessionID}:
+    delete:
+      operationId: revokeSession
+      summary: Revoke one active device session owned by the authenticated user
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: sessionID
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '204':
+          description: Session revoked
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '400':
+          description: sessionID is not a positive integer
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSessionID'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '404':
+          description: Active owned session was not found
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionNotFound'
+        '500':
+          description: Unexpected session revocation failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /auth/password:
+    post:
+      operationId: changePassword
+      summary: Change the password and revoke all device sessions
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: Password changed and all sessions revoked
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '400':
+          description: Malformed JSON or invalid new password
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePasswordBadRequest'
+        '401':
+          description: Access token or current password is invalid
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePasswordUnauthorized'
+        '409':
+          description: Password changed concurrently
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordChangeConflict'
+        '500':
+          description: Unexpected password change failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /messages:
+    post:
+      operationId: createMessage
+      summary: Create or idempotently replay a direct message
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMessageRequest'
+      responses:
+        '200':
+          description: Existing message returned for an idempotent replay
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '201':
+          description: Message created
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Malformed JSON, invalid message data, or unknown receiver
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMessageBadRequest'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '409':
+          description: The idempotency key was reused with different message data
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMessageConflict'
+        '503':
+          description: The message service dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMessageUnavailable'
+        '500':
+          description: Unexpected message creation failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageInternalError'
+    get:
+      operationId: listDirectMessageHistory
+      summary: Page through direct-message history with one peer
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: peerId
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: before
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Chronologically ordered message-history page
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageHistoryPage'
+        '400':
+          description: Invalid peer, query shape, limit, or cursor
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageHistoryBadRequest'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '500':
+          description: Unexpected message-history failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /conversations:
+    get:
+      operationId: listConversations
+      summary: List a stable snapshot of the authenticated user's conversations
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/After'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/SnapshotCursor'
+      responses:
+        '200':
+          description: Conversation snapshot page
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationListResponse'
+        '400':
+          description: Invalid pagination parameters
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidPagination'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '409':
+          description: A cursor is ahead of the current conversation list
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CursorAhead'
+        '500':
+          description: Unexpected conversation listing failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageInternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /conversations/{conversationID}/messages:
+    get:
+      operationId: syncConversationMessages
+      summary: Read a stable page from one conversation stream
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ConversationID'
+        - $ref: '#/components/parameters/After'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/SnapshotCursor'
+      responses:
+        '200':
+          description: Conversation message page
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationMessagePage'
+        '400':
+          description: Invalid conversation identifier or pagination parameters
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationSyncBadRequest'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '404':
+          description: Conversation is not visible to the authenticated user
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationNotFound'
+        '409':
+          description: A cursor is ahead of the current conversation stream
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CursorAhead'
+        '500':
+          description: Unexpected conversation synchronization failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageInternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /conversations/{conversationID}/ack:
+    post:
+      operationId: acknowledgeConversation
+      summary: Advance one device's durable cursor for a conversation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ConversationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcknowledgeConversationRequest'
+      responses:
+        '200':
+          description: Current durable device cursor
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceConversationSyncState'
+        '400':
+          description: Invalid conversation identifier, JSON, or cursor
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationAckBadRequest'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '404':
+          description: Conversation is not visible to the authenticated user
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationNotFound'
+        '409':
+          description: Cursor is ahead of the current conversation stream
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CursorAhead'
+        '500':
+          description: Unexpected acknowledgement failure
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageInternalError'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /messages/sync:
+    get:
+      deprecated: true
+      operationId: deprecatedUserMessageSync
+      summary: Deprecated user-level message Sync endpoint
+      security:
+        - bearerAuth: []
+      responses:
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '410':
+          description: Use conversation-scoped recovery endpoints
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointGone'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /messages/ack:
+    post:
+      deprecated: true
+      operationId: deprecatedUserMessageAck
+      summary: Deprecated user-level message acknowledgement endpoint
+      security:
+        - bearerAuth: []
+      responses:
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '410':
+          description: Use conversation-scoped acknowledgement
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointGone'
+        '503':
+          description: Authentication dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationUnavailable'
+  /health:
+    get:
+      operationId: health
+      summary: Check whether the application can query PostgreSQL
+      responses:
+        '200':
+          description: Application database dependency is ready
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: PostgreSQL is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DependencyUnavailable'
+  /ws:
+    get:
+      operationId: connectWebSocket
+      summary: Upgrade an authenticated HTTP connection to the realtime WebSocket
+      security:
+        - bearerAuth: []
+      responses:
+        '101':
+          description: WebSocket protocol selected
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '401':
+          description: A valid access token is required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationRequired'
+        '426':
+          description: Valid WebSocket upgrade headers are required
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '503':
+          description: Authentication or realtime dependency is temporarily unavailable
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebSocketUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-token
+  headers:
+    RequestID:
+      description: Server-generated identifier used to correlate the response with logs
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    PrivateNoStore:
+      description: Prevent storage of token-bearing authentication responses
+      required: true
+      schema:
+        type: string
+        enum:
+          - no-store
+  parameters:
+    ConversationID:
+      name: conversationID
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    After:
+      name: after
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        default: 0
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+    SnapshotCursor:
+      name: snapshotCursor
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - username
+        - displayName
+        - password
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Normalized to lowercase and trimmed before server validation
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 100
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 8
+          maxLength: 128
+        deviceId:
+          type: string
+          maxLength: 128
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - username
+        - password
+        - loginRequestId
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Normalized to lowercase and trimmed before credential lookup
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 128
+        loginRequestId:
+          type: string
+          minLength: 16
+          maxLength: 128
+        deviceId:
+          type: string
+          maxLength: 128
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - refreshToken
+        - idempotencyKey
+      properties:
+        refreshToken:
+          type: string
+          minLength: 1
+        idempotencyKey:
+          type: string
+          minLength: 16
+          maxLength: 128
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - currentPassword
+        - newPassword
+      properties:
+        currentPassword:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 128
+        newPassword:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 128
+    AuthResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - user
+        - sessionId
+        - deviceId
+        - accessToken
+        - accessTokenExpiresAt
+        - refreshToken
+        - refreshTokenExpiresAt
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        sessionId:
+          type: integer
+          format: int64
+          minimum: 1
+        deviceId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        accessToken:
+          type: string
+          minLength: 1
+        accessTokenExpiresAt:
+          type: string
+          format: date-time
+        refreshToken:
+          type: string
+          minLength: 1
+        refreshTokenExpiresAt:
+          type: string
+          format: date-time
+    Session:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - deviceId
+        - createdAt
+        - idleExpiresAt
+        - current
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        deviceId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        createdAt:
+          type: string
+          format: date-time
+        idleExpiresAt:
+          type: string
+          format: date-time
+        revokedAt:
+          type: string
+          format: date-time
+          nullable: true
+        current:
+          type: boolean
+    RegisterBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_JSON
+            - INVALID_USERNAME
+            - INVALID_DISPLAY_NAME
+            - INVALID_PASSWORD
+            - INVALID_DEVICE_ID
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    RegisterConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - USERNAME_CONFLICT
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    LoginBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_JSON
+            - INVALID_LOGIN_REQUEST_ID
+            - INVALID_DEVICE_ID
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    InvalidCredentials:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_CREDENTIALS
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    LoginConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - LOGIN_REQUEST_ID_CONFLICT
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    AuthRateLimited:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTH_RATE_LIMITED
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    AuthRateLimitUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTH_RATE_LIMIT_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    LoginUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - LOGIN_RECOVERY_UNAVAILABLE
+            - AUTH_RATE_LIMIT_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    RefreshBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_JSON
+            - INVALID_IDEMPOTENCY_KEY
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    RefreshTokenInvalid:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - REFRESH_TOKEN_INVALID
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    RefreshUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - REFRESH_RECOVERY_UNAVAILABLE
+            - AUTH_RATE_LIMIT_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    InvalidSessionID:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_SESSION_ID
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    SessionNotFound:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - SESSION_NOT_FOUND
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    ChangePasswordBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_JSON
+            - INVALID_NEW_PASSWORD
+            - PASSWORD_UNCHANGED
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    ChangePasswordUnauthorized:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTHENTICATION_REQUIRED
+            - CURRENT_PASSWORD_INVALID
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    PasswordChangeConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - PASSWORD_CHANGE_CONFLICT
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    InternalError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INTERNAL_ERROR
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    CreateMessageRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - clientMessageId
+        - receiverId
+        - content
+      properties:
+        clientMessageId:
+          type: string
+          minLength: 16
+          maxLength: 128
+        receiverId:
+          type: integer
+          format: int64
+          minimum: 1
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+    Message:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - conversationId
+        - conversationSeq
+        - clientMessageId
+        - senderId
+        - receiverId
+        - content
+        - createdAt
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        conversationId:
+          type: integer
+          format: int64
+          minimum: 1
+        conversationSeq:
+          type: integer
+          format: int64
+          minimum: 1
+        clientMessageId:
+          type: string
+          minLength: 16
+          maxLength: 128
+        senderId:
+          type: integer
+          format: int64
+          minimum: 1
+        receiverId:
+          type: integer
+          format: int64
+          minimum: 1
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+        createdAt:
+          type: string
+          format: date-time
+    MessageHistoryPage:
+      type: object
+      additionalProperties: false
+      required:
+        - messages
+        - hasMoreBefore
+        - hasMoreAfter
+      properties:
+        conversationId:
+          type: integer
+          format: int64
+          minimum: 1
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        beforeCursor:
+          type: string
+          minLength: 1
+        afterCursor:
+          type: string
+          minLength: 1
+        hasMoreBefore:
+          type: boolean
+        hasMoreAfter:
+          type: boolean
+    MessageHistoryBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_QUERY
+            - INVALID_PEER_ID
+            - INVALID_LIMIT
+            - INVALID_CURSOR
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    CreateMessageBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_JSON
+            - INVALID_MESSAGE
+            - RECEIVER_NOT_FOUND
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    CreateMessageConflict:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - CLIENT_MESSAGE_ID_CONFLICT
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    AuthenticationRequired:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTHENTICATION_REQUIRED
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    CreateMessageUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - SERVICE_UNAVAILABLE
+            - AUTHENTICATION_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    MessageInternalError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INTERNAL_ERROR
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    User:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - username
+        - displayName
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        username:
+          type: string
+          minLength: 1
+        displayName:
+          type: string
+          minLength: 1
+    ConversationSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - kind
+        - peer
+        - lastSeq
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+          enum:
+            - direct
+        peer:
+          $ref: '#/components/schemas/User'
+        lastSeq:
+          type: integer
+          format: int64
+          minimum: 0
+        updatedAt:
+          type: string
+          format: date-time
+    ConversationListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - conversations
+        - nextCursor
+        - snapshotCursor
+        - hasMore
+      properties:
+        conversations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationSummary'
+        nextCursor:
+          type: integer
+          format: int64
+          minimum: 0
+        snapshotCursor:
+          type: integer
+          format: int64
+          minimum: 0
+        hasMore:
+          type: boolean
+    ConversationMessagePage:
+      type: object
+      additionalProperties: false
+      required:
+        - conversationId
+        - messages
+        - nextCursor
+        - snapshotCursor
+        - hasMore
+      properties:
+        conversationId:
+          type: integer
+          format: int64
+          minimum: 1
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        nextCursor:
+          type: integer
+          format: int64
+          minimum: 0
+        snapshotCursor:
+          type: integer
+          format: int64
+          minimum: 0
+        hasMore:
+          type: boolean
+    AcknowledgeConversationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - cursor
+      properties:
+        cursor:
+          type: integer
+          format: int64
+          minimum: 0
+    DeviceConversationSyncState:
+      type: object
+      additionalProperties: false
+      required:
+        - conversationId
+        - appliedCursor
+        - updatedAt
+      properties:
+        conversationId:
+          type: integer
+          format: int64
+          minimum: 1
+        appliedCursor:
+          type: integer
+          format: int64
+          minimum: 0
+        updatedAt:
+          type: string
+          format: date-time
+    InvalidPagination:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_PAGINATION
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    ConversationSyncBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_CONVERSATION_ID
+            - INVALID_PAGINATION
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    ConversationAckBadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - INVALID_CONVERSATION_ID
+            - INVALID_JSON
+            - INVALID_ACK
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    ConversationNotFound:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - CONVERSATION_NOT_FOUND
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    CursorAhead:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - CURSOR_AHEAD
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    AuthenticationUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTHENTICATION_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    EndpointGone:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - ENDPOINT_GONE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+    DependencyUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - DEPENDENCY_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1
+    WebSocketUnavailable:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - requestId
+      properties:
+        code:
+          type: string
+          enum:
+            - AUTHENTICATION_UNAVAILABLE
+            - REALTIME_UNAVAILABLE
+        message:
+          type: string
+          minLength: 1
+        requestId:
+          type: string
+          minLength: 1

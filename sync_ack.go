@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"log"
 	"net/http"
 	"time"
 
@@ -15,9 +14,7 @@ type acknowledgeMessagesRequest struct {
 
 func (app *application) acknowledgeMessages(w http.ResponseWriter, r *http.Request) {
 	app.observeACK("gone")
-	writeJSON(w, http.StatusGone, errorResponse{
-		Error: "user-level ACK was replaced by POST /conversations/{conversationID}/ack",
-	})
+	writeAPIError(w, r, http.StatusGone, "ENDPOINT_GONE", "user-level ACK was replaced by POST /conversations/{conversationID}/ack", nil)
 }
 
 type deviceConversationSyncState struct {
@@ -36,12 +33,12 @@ func (app *application) acknowledgeConversation(w http.ResponseWriter, r *http.R
 	var input acknowledgeMessagesRequest
 	if err := decodeSingleJSON(w, r, &input); err != nil {
 		app.observeACK("invalid")
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_JSON", "invalid JSON body", nil)
 		return
 	}
 	if input.Cursor == nil || *input.Cursor < 0 {
 		app.observeACK("invalid")
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "cursor must be a non-negative integer"})
+		writeAPIError(w, r, http.StatusBadRequest, "INVALID_ACK", "cursor must be a non-negative integer", nil)
 		return
 	}
 
@@ -59,18 +56,17 @@ func (app *application) acknowledgeConversation(w http.ResponseWriter, r *http.R
 	).Scan(&currentCursor)
 	if errors.Is(err, pgx.ErrNoRows) {
 		app.observeACK("not_found")
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "conversation not found"})
+		writeAPIError(w, r, http.StatusNotFound, "CONVERSATION_NOT_FOUND", "conversation not found", nil)
 		return
 	}
 	if err != nil {
 		app.observeACK("error")
-		log.Printf("read conversation for acknowledgement: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not acknowledge conversation"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not acknowledge conversation", err)
 		return
 	}
 	if *input.Cursor > currentCursor {
 		app.observeACK("ahead")
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "cursor is ahead of the conversation's current stream"})
+		writeAPIError(w, r, http.StatusConflict, "CURSOR_AHEAD", "cursor is ahead of the conversation's current stream", nil)
 		return
 	}
 
@@ -101,8 +97,7 @@ func (app *application) acknowledgeConversation(w http.ResponseWriter, r *http.R
 	).Scan(&state.AppliedCursor, &state.UpdatedAt)
 	if err != nil {
 		app.observeACK("error")
-		log.Printf("acknowledge conversation: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "could not acknowledge conversation"})
+		writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not acknowledge conversation", err)
 		return
 	}
 
