@@ -173,7 +173,7 @@ POST /messages
 PostgreSQL 集成响应进行校验，包括成功响应与 400、401、404、409、410、426、429、500、503。WebSocket 升级后的实时消息协议仍由 WebSocket 集成测试负责，不把 OpenAPI 当成帧协议规范。
 OpenAPI 合同测试负责请求/响应形状，消息与 Outbox 的事务原子性仍由 PostgreSQL 集成测试负责。
 
-GitHub Actions 门禁位于 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，使用独立的 PostgreSQL 应用测试库和破坏性迁移测试库，并启动 Redis。它会检查 gofmt，执行两次幂等 `im-migrate up`、全仓 race、`go vet` 和全包构建。API 与迁移合同提交已在远程 `main@33985c3` 的 GitHub Actions 运行 `33485421843` 通过；本分支新增的客户端恢复与认证生命周期改动仍需在合并推送后取得新的远程运行证据。
+GitHub Actions 门禁位于 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，使用独立的 PostgreSQL 应用测试库和破坏性迁移测试库，并启动 Redis。它会检查 gofmt，执行两次幂等 `im-migrate up`、全仓 race、`go vet` 和全包构建。客户端恢复与认证生命周期提交已在远程 `main@1e7606d` 的 GitHub Actions 运行 `33510855000` 通过全部门禁。
 
 运行代码检查：
 
