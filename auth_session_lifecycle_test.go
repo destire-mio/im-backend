@@ -69,7 +69,7 @@ func TestRefreshLifetimeIsCappedBySessionAbsoluteExpiry(t *testing.T) {
 	t.Cleanup(server.Close)
 	account := registerTestAccount(t, db, server.URL, uniqueUsername("abs_cap"), "Absolute Cap")
 	now := time.Now().UTC()
-	createdAt := now.Add(-sessionAbsoluteLifetime + 24*time.Hour)
+	createdAt := now.Add(-sessionAbsoluteLifetime + 24*time.Hour).Truncate(time.Microsecond)
 	absoluteExpiresAt := createdAt.Add(sessionAbsoluteLifetime)
 	if _, err := db.Exec(
 		context.Background(),
