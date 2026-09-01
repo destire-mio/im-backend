@@ -133,7 +133,11 @@ func main() {
 		log.Printf("outbox database pool isolated with max connections %d", outboxDatabaseConfig.MaxConns)
 	}
 
-	cipher, err := newResponseCipher(os.Getenv("IDEMPOTENCY_KEY"), environmentInt("IDEMPOTENCY_KEY_VERSION", 1))
+	cipher, err := newResponseCipherKeyring(
+		os.Getenv("IDEMPOTENCY_KEY"),
+		environmentInt("IDEMPOTENCY_KEY_VERSION", 1),
+		os.Getenv("IDEMPOTENCY_PREVIOUS_KEYS"),
+	)
 	if err != nil {
 		log.Fatalf("configure idempotency encryption: %v", err)
 	}

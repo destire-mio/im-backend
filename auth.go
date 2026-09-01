@@ -22,12 +22,13 @@ import (
 )
 
 const (
-	maxDisplayNameRunes = 100
-	minPasswordRunes    = 8
-	maxPasswordRunes    = 128
-	accessTokenLifetime = 15 * time.Minute
-	sessionIdleLifetime = 90 * 24 * time.Hour
-	idempotencyLifetime = 10 * time.Minute
+	maxDisplayNameRunes     = 100
+	minPasswordRunes        = 8
+	maxPasswordRunes        = 128
+	accessTokenLifetime     = 15 * time.Minute
+	sessionIdleLifetime     = 90 * 24 * time.Hour
+	sessionAbsoluteLifetime = 365 * 24 * time.Hour
+	idempotencyLifetime     = 10 * time.Minute
 
 	argonMemory      = 19 * 1024
 	argonIterations  = 2
@@ -69,6 +70,7 @@ type authResponse struct {
 	User                  user      `json:"user"`
 	SessionID             int64     `json:"sessionId"`
 	DeviceID              string    `json:"deviceId"`
+	SessionExpiresAt      time.Time `json:"sessionExpiresAt"`
 	AccessToken           string    `json:"accessToken"`
 	AccessTokenExpiresAt  time.Time `json:"accessTokenExpiresAt"`
 	RefreshToken          string    `json:"refreshToken"`
@@ -76,12 +78,13 @@ type authResponse struct {
 }
 
 type sessionResponse struct {
-	ID            int64      `json:"id"`
-	DeviceID      string     `json:"deviceId"`
-	CreatedAt     time.Time  `json:"createdAt"`
-	IdleExpiresAt time.Time  `json:"idleExpiresAt"`
-	RevokedAt     *time.Time `json:"revokedAt,omitempty"`
-	Current       bool       `json:"current"`
+	ID                int64      `json:"id"`
+	DeviceID          string     `json:"deviceId"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	IdleExpiresAt     time.Time  `json:"idleExpiresAt"`
+	AbsoluteExpiresAt time.Time  `json:"absoluteExpiresAt"`
+	RevokedAt         *time.Time `json:"revokedAt,omitempty"`
+	Current           bool       `json:"current"`
 }
 
 type generatedToken struct {
@@ -331,6 +334,7 @@ func (app *application) listSessions(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "could not list sessions", err)
 			return
 		}
+		current.AbsoluteExpiresAt = current.CreatedAt.Add(sessionAbsoluteLifetime)
 		current.Current = current.ID == currentID
 		sessions = append(sessions, current)
 	}
@@ -473,8 +477,10 @@ func (app *application) requireAuthentication(next http.Handler) http.Handler {
 			 WHERE a.token_hash = $1
 			   AND a.expires_at > CURRENT_TIMESTAMP
 			   AND s.revoked_at IS NULL
-			   AND s.idle_expires_at > CURRENT_TIMESTAMP`,
+			   AND s.idle_expires_at > CURRENT_TIMESTAMP
+			   AND s.created_at > $2`,
 			tokenHash,
+			app.currentTime().Add(-sessionAbsoluteLifetime),
 		).Scan(&userID, &sessionID, &deviceID, &tokenExpiresAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -526,6 +532,7 @@ func (app *application) createSessionResponse(ctx context.Context, tx pgx.Tx, ac
 	}
 	accessExpiresAt := now.Add(accessTokenLifetime)
 	refreshExpiresAt := now.Add(sessionIdleLifetime)
+	absoluteExpiresAt := now.Add(sessionAbsoluteLifetime)
 
 	var sessionID int64
 	if err := tx.QueryRow(
@@ -562,6 +569,7 @@ func (app *application) createSessionResponse(ctx context.Context, tx pgx.Tx, ac
 		User:                  account,
 		SessionID:             sessionID,
 		DeviceID:              deviceID,
+		SessionExpiresAt:      absoluteExpiresAt,
 		AccessToken:           accessToken.raw,
 		AccessTokenExpiresAt:  accessExpiresAt,
 		RefreshToken:          refreshToken.raw,
@@ -621,31 +629,34 @@ func (app *application) createIdempotentLogin(ctx context.Context, account user,
 func (app *application) loadLoginResult(ctx context.Context, requestHash []byte, userID int64) (authResponse, bool, error) {
 	var encrypted, nonce []byte
 	var keyVersion int
+	var sessionCreatedAt time.Time
 	err := app.db.QueryRow(
 		ctx,
-		`SELECT result.encrypted_response, result.nonce, result.key_version
+		`SELECT result.encrypted_response, result.nonce, result.key_version, session.created_at
 		 FROM login_idempotency_results AS result
 		 JOIN sessions AS session ON session.id = result.session_id
 		 WHERE request_id_hash = $1
 		   AND result.user_id = $2
 		   AND result.expires_at > CURRENT_TIMESTAMP
 		   AND session.revoked_at IS NULL
-		   AND session.idle_expires_at > CURRENT_TIMESTAMP`,
+		   AND session.idle_expires_at > CURRENT_TIMESTAMP
+		   AND session.created_at > $3`,
 		requestHash,
 		userID,
-	).Scan(&encrypted, &nonce, &keyVersion)
+		app.currentTime().Add(-sessionAbsoluteLifetime),
+	).Scan(&encrypted, &nonce, &keyVersion, &sessionCreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return authResponse{}, false, nil
 	}
 	if err != nil {
 		return authResponse{}, false, err
 	}
-	if keyVersion != app.responseCipher.keyVersion {
-		return authResponse{}, false, errors.New("idempotency encryption key version is unavailable")
-	}
 	var response authResponse
-	if err := app.responseCipher.decrypt("login", requestHash, nonce, encrypted, &response); err != nil {
+	if err := app.responseCipher.decrypt(keyVersion, "login", requestHash, nonce, encrypted, &response); err != nil {
 		return authResponse{}, false, err
+	}
+	if response.SessionExpiresAt.IsZero() {
+		response.SessionExpiresAt = sessionCreatedAt.Add(sessionAbsoluteLifetime)
 	}
 	return response, true, nil
 }
@@ -659,6 +670,7 @@ func (app *application) rotateRefreshToken(ctx context.Context, oldTokenHash, ke
 
 	var oldTokenID, sessionID, userID int64
 	var deviceID string
+	var sessionCreatedAt time.Time
 	err = tx.QueryRow(
 		ctx,
 		`UPDATE refresh_tokens AS rt
@@ -670,9 +682,11 @@ func (app *application) rotateRefreshToken(ctx context.Context, oldTokenHash, ke
 		   AND rt.expires_at > CURRENT_TIMESTAMP
 		   AND s.revoked_at IS NULL
 		   AND s.idle_expires_at > CURRENT_TIMESTAMP
-		 RETURNING rt.id, rt.session_id, s.user_id, s.device_id`,
+		   AND s.created_at > $2
+		 RETURNING rt.id, rt.session_id, s.user_id, s.device_id, s.created_at`,
 		oldTokenHash,
-	).Scan(&oldTokenID, &sessionID, &userID, &deviceID)
+		app.currentTime().Add(-sessionAbsoluteLifetime),
+	).Scan(&oldTokenID, &sessionID, &userID, &deviceID, &sessionCreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app.handleUsedOrInvalidRefresh(ctx, tx, oldTokenHash, keyHash)
 	}
@@ -690,6 +704,7 @@ func (app *application) rotateRefreshToken(ctx context.Context, oldTokenHash, ke
 	}
 
 	now := app.currentTime()
+	absoluteExpiresAt := sessionCreatedAt.Add(sessionAbsoluteLifetime)
 	accessToken, err := newToken()
 	if err != nil {
 		return authResponse{}, 0, err
@@ -698,8 +713,8 @@ func (app *application) rotateRefreshToken(ctx context.Context, oldTokenHash, ke
 	if err != nil {
 		return authResponse{}, 0, err
 	}
-	accessExpiresAt := now.Add(accessTokenLifetime)
-	refreshExpiresAt := now.Add(sessionIdleLifetime)
+	accessExpiresAt := minTime(now.Add(accessTokenLifetime), absoluteExpiresAt)
+	refreshExpiresAt := minTime(now.Add(sessionIdleLifetime), absoluteExpiresAt)
 	if _, err := tx.Exec(
 		ctx,
 		`INSERT INTO access_tokens (session_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
@@ -733,6 +748,7 @@ func (app *application) rotateRefreshToken(ctx context.Context, oldTokenHash, ke
 		User:                  account,
 		SessionID:             sessionID,
 		DeviceID:              deviceID,
+		SessionExpiresAt:      absoluteExpiresAt,
 		AccessToken:           accessToken.raw,
 		AccessTokenExpiresAt:  accessExpiresAt,
 		RefreshToken:          refreshToken.raw,
@@ -767,21 +783,23 @@ func (app *application) handleUsedOrInvalidRefresh(ctx context.Context, tx pgx.T
 	var consumedAt *time.Time
 	var revokedAt *time.Time
 	var idleExpiresAt time.Time
+	var sessionCreatedAt time.Time
 	err := tx.QueryRow(
 		ctx,
-		`SELECT rt.id, rt.session_id, s.user_id, rt.consumed_at, s.revoked_at, s.idle_expires_at
+		`SELECT rt.id, rt.session_id, s.user_id, rt.consumed_at, s.revoked_at, s.idle_expires_at, s.created_at
 		 FROM refresh_tokens AS rt
 		 JOIN sessions AS s ON s.id = rt.session_id
 		 WHERE rt.token_hash = $1`,
 		tokenHash,
-	).Scan(&tokenID, &sessionID, &userID, &consumedAt, &revokedAt, &idleExpiresAt)
+	).Scan(&tokenID, &sessionID, &userID, &consumedAt, &revokedAt, &idleExpiresAt, &sessionCreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return authResponse{}, http.StatusUnauthorized, nil
 	}
 	if err != nil {
 		return authResponse{}, 0, err
 	}
-	if consumedAt == nil || revokedAt != nil || !idleExpiresAt.After(app.currentTime()) {
+	if consumedAt == nil || revokedAt != nil || !idleExpiresAt.After(app.currentTime()) ||
+		!sessionCreatedAt.Add(sessionAbsoluteLifetime).After(app.currentTime()) {
 		return authResponse{}, http.StatusUnauthorized, nil
 	}
 
@@ -796,12 +814,12 @@ func (app *application) handleUsedOrInvalidRefresh(ctx context.Context, tx pgx.T
 		tokenID,
 	).Scan(&storedKeyHash, &encrypted, &nonce, &keyVersion, &expiresAt)
 	if err == nil && subtle.ConstantTimeCompare(storedKeyHash, keyHash) == 1 && expiresAt.After(app.currentTime()) {
-		if keyVersion != app.responseCipher.keyVersion {
-			return authResponse{}, 0, errors.New("idempotency encryption key version is unavailable")
-		}
 		var response authResponse
-		if err := app.responseCipher.decrypt("refresh", int64Bytes(tokenID), nonce, encrypted, &response); err != nil {
+		if err := app.responseCipher.decrypt(keyVersion, "refresh", int64Bytes(tokenID), nonce, encrypted, &response); err != nil {
 			return authResponse{}, 0, err
+		}
+		if response.SessionExpiresAt.IsZero() {
+			response.SessionExpiresAt = sessionCreatedAt.Add(sessionAbsoluteLifetime)
 		}
 		return response, http.StatusOK, nil
 	}
@@ -925,6 +943,13 @@ func (app *application) currentTime() time.Time {
 		return app.now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func minTime(first, second time.Time) time.Time {
+	if first.Before(second) {
+		return first
+	}
+	return second
 }
 
 func int64Bytes(value int64) []byte {

@@ -7,7 +7,7 @@
 
 ## 核心能力
 
-- 用户注册、Argon2id 密码哈希、短期 Access Token、Refresh Token 轮换及多设备 Session 管理。
+- 用户注册、Argon2id 密码哈希、短期 Access Token、Refresh Token 轮换及多设备 Session 管理；Session 同时受 90 天空闲期和自登录起 365 天绝对期限约束。
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
 - Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 prepare 与当前批 publish，网络发布不占用数据库行锁。
 - 单聊双方规范化为一个 `conversation_id`；消息只写一份，并在会话内分配连续 `conversation_seq`。
@@ -51,7 +51,7 @@ POST /messages
    openssl rand -base64 32 | tr -d '\n='
    ```
 
-   把第二条命令生成的值填入 `.env` 的 `IDEMPOTENCY_KEY`。这个密钥用于加密幂等响应；已使用后不要随意更换，部署环境必须单独生成并安全保存。
+   把第二条命令生成的值填入 `.env` 的 `IDEMPOTENCY_KEY`。这个密钥用于加密幂等响应，部署环境必须单独生成并安全保存。轮换时先提高 `IDEMPOTENCY_KEY_VERSION` 并把新密钥设为活动密钥，同时通过 `IDEMPOTENCY_PREVIOUS_KEYS=旧版本:旧密钥` 保留旧密钥至少 10 分钟；新记录只使用活动密钥，旧恢复记录按数据库中的 `key_version` 选择旧密钥解密。确认旧记录全部过期后才能删除旧密钥。
 
 2. 启动 PostgreSQL 和 Redis：
 
@@ -162,6 +162,8 @@ POST /messages
 
 客户端应先建立 WebSocket，再扫描会话列表并逐会话补拉；扫描期间收到的新消息由 WebSocket 覆盖。连接中断时重新开始一轮会话扫描，避免把不完整的一轮当成恢复完成。
 
+`internal/headlessclient` 提供仅用于故障验证的最小 Headless 客户端。它先持久化 Refresh 幂等操作，再发网络请求；消息和会话 cursor 使用加密原子文件一起提交；WebSocket 序号出现缺口时保持原 cursor 并转 SQL Sync；本地提交后才发送累计 ACK。集成测试覆盖 Refresh 与 ACK 成功但响应丢失、进程重建、WebSocket 乱序、Sync 去重和多设备进度隔离。加密密钥由外部注入，磁盘文件不含明文 Token；这验证了状态机和密钥边界，但不冒充 Android Room/Keystore 的平台实现。
+
 已有数据库升级到本模型时，先停止消息写入，再依次执行 `014`、`015`。`015` 会按规范化用户对回填会话和序号，并补全未发布 v1/v2/v3 Outbox payload；它是为回滚保留可空字段的停写 expand 迁移，不是面向超大表的在线分批迁移。
 
 ## 测试与压测
@@ -171,7 +173,7 @@ POST /messages
 PostgreSQL 集成响应进行校验，包括成功响应与 400、401、404、409、410、426、429、500、503。WebSocket 升级后的实时消息协议仍由 WebSocket 集成测试负责，不把 OpenAPI 当成帧协议规范。
 OpenAPI 合同测试负责请求/响应形状，消息与 Outbox 的事务原子性仍由 PostgreSQL 集成测试负责。
 
-GitHub Actions 门禁位于 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，使用独立的 PostgreSQL 应用测试库和破坏性迁移测试库，并启动 Redis。它会检查 gofmt，执行两次幂等 `im-migrate up`、全仓 race、`go vet` 和全包构建。该 workflow 已在本地用同样的双库结构完整复演；在实际 commit/push 前，仍不能声称 GitHub 远程门禁已运行。
+GitHub Actions 门禁位于 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)，使用独立的 PostgreSQL 应用测试库和破坏性迁移测试库，并启动 Redis。它会检查 gofmt，执行两次幂等 `im-migrate up`、全仓 race、`go vet` 和全包构建。API 与迁移合同提交已在远程 `main@33985c3` 的 GitHub Actions 运行 `33485421843` 通过；本分支新增的客户端恢复与认证生命周期改动仍需在合并推送后取得新的远程运行证据。
 
 运行代码检查：
 
