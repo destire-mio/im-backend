@@ -228,10 +228,11 @@ func (tx *messageStoreTransaction) insertMessageAndOutbox(
 		       event_type,
 		       payload_version,
 		       message_id,
-		       payload
+		       payload,
+		       ready_at
 		   )
 		   SELECT 'message.created',
-		          3,
+		          4,
 		          inserted.id,
 		          jsonb_build_object(
 		              'message', jsonb_build_object(
@@ -243,8 +244,16 @@ func (tx *messageStoreTransaction) insertMessageAndOutbox(
 		                  'receiverId', inserted.receiver_id,
 		                  'content', inserted.content,
 		                  'createdAt', inserted.created_at
-		              )
-		          )
+		              ),
+		              'recipients', CASE WHEN inserted.sender_id = inserted.receiver_id
+		                  THEN jsonb_build_array(jsonb_build_object('userId', inserted.sender_id))
+		                  ELSE jsonb_build_array(
+		                      jsonb_build_object('userId', inserted.sender_id),
+		                      jsonb_build_object('userId', inserted.receiver_id)
+		                  )
+		              END
+		          ),
+		          inserted.created_at
 		   FROM inserted
 		   RETURNING message_id
 		 )

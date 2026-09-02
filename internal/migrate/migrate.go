@@ -134,10 +134,10 @@ func (runner *Runner) Up(ctx context.Context) error {
 		if _, exists := applied[migration.Version]; exists {
 			continue
 		}
-		if migration.Version == 15 && !runner.AllowMaintenance {
+		if (migration.Version == 15 || migration.Version == 16) && !runner.AllowMaintenance {
 			hasMessages, err := runner.hasRows(ctx, "messages")
 			if err != nil {
-				return fmt.Errorf("check migration 015 maintenance requirement: %w", err)
+				return fmt.Errorf("check migration %03d maintenance requirement: %w", migration.Version, err)
 			}
 			if hasMessages {
 				return fmt.Errorf("migration %03d_%s: %w", migration.Version, migration.Name, ErrMaintenanceRequired)
@@ -161,8 +161,9 @@ func (runner *Runner) Baseline(ctx context.Context, target int) error {
 	if err != nil {
 		return err
 	}
-	if target != 15 || target > len(migrations) {
-		return fmt.Errorf("baseline target %03d is unsupported; only 015 has a reviewed schema fingerprint", target)
+	expectedFingerprint := map[int]string{15: ExpectedSchemaFingerprint015, 16: ExpectedSchemaFingerprint016}[target]
+	if expectedFingerprint == "" || target > len(migrations) {
+		return fmt.Errorf("baseline target %03d is unsupported; reviewed schema fingerprints: 015, 016", target)
 	}
 
 	if err := runner.acquireLock(ctx); err != nil {
@@ -205,12 +206,13 @@ func (runner *Runner) Baseline(ctx context.Context, target int) error {
 	if err != nil {
 		return err
 	}
-	if fingerprint != ExpectedSchemaFingerprint015 {
+	if fingerprint != expectedFingerprint {
 		return fmt.Errorf(
-			"baseline 015 fingerprint mismatch (objects=%d actual=%s expected=%s): %w",
+			"baseline %03d fingerprint mismatch (objects=%d actual=%s expected=%s): %w",
+			target,
 			objectCount,
 			fingerprint,
-			ExpectedSchemaFingerprint015,
+			expectedFingerprint,
 			ErrBaselineMismatch,
 		)
 	}

@@ -46,25 +46,6 @@ func CheckReady(ctx context.Context, queryer migrationQueryer, files fs.FS) erro
 	if err := validateReady(migrations, applied); err != nil {
 		return fmt.Errorf("%w: %v", ErrSchemaNotReady, err)
 	}
-	if migrations[len(migrations)-1].Version >= 15 {
-		var unreconciledMessagesExist bool
-		if err := queryer.QueryRow(
-			ctx,
-			`SELECT EXISTS (
-			     SELECT 1
-			     FROM messages
-			     WHERE conversation_id IS NULL OR conversation_seq IS NULL
-			 )`,
-		).Scan(&unreconciledMessagesExist); err != nil {
-			return fmt.Errorf("%w: inspect conversation cursor reconciliation: %v", ErrSchemaNotReady, err)
-		}
-		if unreconciledMessagesExist {
-			return fmt.Errorf(
-				"%w: messages written during rollback require im-migrate reconcile-conversations",
-				ErrSchemaNotReady,
-			)
-		}
-	}
 	return nil
 }
 

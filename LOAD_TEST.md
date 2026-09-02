@@ -8,14 +8,14 @@
 → 建立 WebSocket
 → POST /messages
 → PostgreSQL conversation_seq + message + ready v4 Outbox 原子提交
-→ Outbox Worker claim；v4 prepare 不再写用户级 Sync 投影
+→ Outbox Worker claim → 批内 Presence → publish → mark published（无用户级投影阶段）
 → Hub / Channel / WebSocket
 → 扫描会话列表并逐会话调用 Sync API 做持久性核验
 ```
 
 实时链路诊断同时记录每条连接的 `send Channel` 深度、历史最高水位和 WebSocket 写耗时。压测客户端还会验证 WebSocket 外层和消息内层的 `conversationId/conversationSeq` 一致。收件跟踪表按消息 ID 分成 64 个锁分片，避免多个 WebSocket reader 因一把全局锁被误判为服务端慢连接。
 
-> `benchmarks/reports/` 中原有 3000～5000 req/s 报告均生成于 v3 用户级 cursor 投影模型。以下保留的历史 A/B 结论用于解释改造动机，不是 v4 当前容量；v4 的新鲜隔离库容量阶梯见“当前 v4 容量证据”。
+> 016 后只有 ready v4 + 有界流水线 + 批内 Presence 一条运行链。本文已有 A/B 表格及 benchmarks/reports 报告均对应改造前的实验版本，不能作为当前实现的容量结论。serial、user_sharded、projection mode/storage 和 Presence 回退开关已移除；复现实验请检出对应 Git 历史版本。
 
 ## 它会写入什么
 
@@ -117,7 +117,7 @@ go run ./cmd/im-loadtest \
 
 测容量时必须同时观察成功率、P95/P99、`droppedStarts`、Realtime 延迟、Outbox 堆积与数据库连接池等待。只看吞吐量会上报一个看似更高、但已经积压或丢弃计划请求的数字。
 
-## 当前 v4 容量证据
+## 历史 v4 实验容量证据（016 之前）
 
 2026-08-31 在每轮全新 PostgreSQL 数据库和隔离 Redis DB 上使用 API Pool 24、Outbox Batch 64、publish 并发 16、pipeline 模式运行 20 秒固定速率。每条成功消息都验证发送方与接收方各 2 个设备的 Realtime 投递，以及双方的会话 Sync；下列各轮已提交消息均为零 missing、duplicate、unexpected、dead，结束时 Outbox pending 为 0。
 
@@ -149,9 +149,9 @@ go run ./cmd/im-loadtest \
 - Login 仍经过生产限流链路。默认 20 次 Login 低于当前每 IP 30 次/分钟的上限；如果同一 Redis 近期已有 Login 请求，工具会显示 `Retry-After` 并停止，不会绕过限流。
 - 脚本不发送按会话 ACK：它只能证明 Sync API 返回数据，不能伪装真实手机已将数据落盘。ACK 需要在真实客户端或单独的客户端持久化故障实验中验证。
 
-## Outbox 并发 A/B
+## Outbox 资源参数与历史 A/B
 
-服务端支持通过 `DATABASE_MAX_CONNECTIONS`、`OUTBOX_CONCURRENCY` 和 `OUTBOX_BATCH_SIZE` 设置连接池、推送并发与单次 claim 批量。`OUTBOX_PROJECTION_MODE`、`OUTBOX_PROJECTION_STORAGE` 和 `OUTBOX_PREPARE_MODE=user_sharded` 现在只用于迁移前 v3 事件的排空/回退验证；v4 新消息不会进入这些用户级投影路径。A/B 时一次只改一个参数：
+当前仍可用 `DATABASE_MAX_CONNECTIONS`、`OUTBOX_CONCURRENCY` 和 `OUTBOX_BATCH_SIZE` 设置资源预算。算法模式开关不再支持；以下历史对照只用于解释参数来源。新一轮参数验证应一次只改一个参数：
 
 ```text
 对照组：DATABASE_MAX_CONNECTIONS=24 OUTBOX_CONCURRENCY=8
@@ -160,7 +160,7 @@ go run ./cmd/im-loadtest \
 
 两组必须使用相同的 `users`、`devices`、`messages`、`concurrency` 和 `delivery-wait`。报告会保存 Worker 并发、批量、连接池上限，以及空池等待次数和累计等待时间。
 
-`OUTBOX_BATCH_SIZE` 不是越大越好。批次越大，单个用户计数器的更新次数越少，但一次事务写入的同步记录和 Outbox payload 越多，会形成更明显的 WAL/索引写入突刺，并扩大 Lease 内需要完成的工作。
+`OUTBOX_BATCH_SIZE` 不是越大越好。批次越大，同时持有的租约与待推送工作越多，需要在 Lease 内完成；当前已经没有用户计数器或旧同步记录写入。
 
 当前默认 Batch 为 `64`。在两个同 schema、初始为空的隔离库上，保持 Pool 24、Worker 8、10 个热点用户、20 条 WebSocket 和 3000 req/s 不变时，Batch 64 相比 32 将 Realtime P95 从约 19.84 秒降到 5.29 秒，过程 pending 峰值从 37467 降到 16028，数据库空池累计等待从约 132.30 秒降到 8.75 秒；HTTP、Realtime、Sync 均完整，missing、duplicate、dead 为 0。报告为 `benchmarks/reports/loadtest-rate-3000-outbox-b32-fresh.json` 与 `benchmarks/reports/loadtest-rate-3000-outbox-b64-fresh.json`。
 
@@ -168,7 +168,7 @@ go run ./cmd/im-loadtest \
 
 这个结果只证明 `64` 优于本次热点模型中的 `32`，不证明继续放大仍会改善；历史上的 `256` 曾显著恶化。3000 req/s 下 Batch 64 仍有约 5.34 秒的 oldest-age 峰值，因此容量边界尚未消失。
 
-## 当前下一容量边界
+## 历史下一容量边界（已归档）
 
 采用 Batch 64、publish 并发 16 后，Pool 24 在 3000 req/s 下可以完整处理 60000 条消息；细分后的平均 prepare 阶段为：
 

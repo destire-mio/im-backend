@@ -36,18 +36,8 @@ type applicationMetrics struct {
 	ackRequests                *prometheus.CounterVec
 	outboxWorkerConcurrency    prometheus.Gauge
 	outboxWorkerBatchSize      prometheus.Gauge
-	outboxPrepareWorkers       prometheus.Gauge
-	outboxUserShardedPrepare   prometheus.Gauge
-	outboxPipelineEnabled      prometheus.Gauge
-	outboxBatchPresenceEnabled prometheus.Gauge
 	outboxBatchPresenceBatches *prometheus.CounterVec
 	outboxBatchPresenceUsers   prometheus.Counter
-	outboxProjectionBulk       prometheus.Gauge
-	outboxProjectionRecipients prometheus.Gauge
-	outboxProjectionSyncEvents prometheus.Gauge
-	outboxProjectionBatches    prometheus.Counter
-	outboxProjectionUsers      prometheus.Counter
-	outboxProjectionQueries    prometheus.Histogram
 }
 
 func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
@@ -155,26 +145,6 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Name:      "outbox_worker_batch_size",
 			Help:      "Configured maximum number of Outbox events claimed per batch.",
 		}),
-		outboxPrepareWorkers: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_prepare_workers",
-			Help:      "Configured number of user-sharded message projection workers; inline mode reports one.",
-		}),
-		outboxUserShardedPrepare: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_user_sharded_prepare_enabled",
-			Help:      "Whether message Sync projection is executed by the user-sharded preparation pool.",
-		}),
-		outboxPipelineEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_pipeline_enabled",
-			Help:      "Whether preparation of the next Outbox batch overlaps delivery of the current batch.",
-		}),
-		outboxBatchPresenceEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_batch_presence_enabled",
-			Help:      "Whether each Outbox batch resolves duplicate recipient Presence records once.",
-		}),
 		outboxBatchPresenceBatches: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_batch_presence_batches_total",
@@ -184,37 +154,6 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 			Namespace: "im_backend",
 			Name:      "outbox_batch_presence_users_total",
 			Help:      "Distinct recipient users included in Outbox batch Presence snapshot attempts.",
-		}),
-		outboxProjectionBulk: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_projection_bulk_enabled",
-			Help:      "Whether the set-based bulk sync projection implementation is enabled.",
-		}),
-		outboxProjectionRecipients: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_projection_recipients_enabled",
-			Help:      "Whether structured Outbox recipients replace the projected JSONB payload rewrite.",
-		}),
-		outboxProjectionSyncEvents: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_projection_sync_events_enabled",
-			Help:      "Whether authoritative Sync rows also provide Outbox recipients during recovery.",
-		}),
-		outboxProjectionBatches: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_projection_batches_total",
-			Help:      "Attempts to project one non-empty Outbox batch.",
-		}),
-		outboxProjectionUsers: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_projection_users_total",
-			Help:      "Distinct user streams included in attempted Outbox projection batches.",
-		}),
-		outboxProjectionQueries: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "im_backend",
-			Name:      "outbox_projection_query_duration_seconds",
-			Help:      "Client-observed duration of one SQL query in the sync projection stage.",
-			Buckets:   []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		}),
 	}
 
@@ -240,18 +179,8 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		metrics.ackRequests,
 		metrics.outboxWorkerConcurrency,
 		metrics.outboxWorkerBatchSize,
-		metrics.outboxPrepareWorkers,
-		metrics.outboxUserShardedPrepare,
-		metrics.outboxPipelineEnabled,
-		metrics.outboxBatchPresenceEnabled,
 		metrics.outboxBatchPresenceBatches,
 		metrics.outboxBatchPresenceUsers,
-		metrics.outboxProjectionBulk,
-		metrics.outboxProjectionRecipients,
-		metrics.outboxProjectionSyncEvents,
-		metrics.outboxProjectionBatches,
-		metrics.outboxProjectionUsers,
-		metrics.outboxProjectionQueries,
 	)
 	if db != nil {
 		metrics.registerDatabaseCollectors(db)
@@ -320,14 +249,6 @@ func (metrics *applicationMetrics) ObserveOutboxStage(stage string, duration tim
 	}
 }
 
-func (metrics *applicationMetrics) ObserveOutboxProjectionBatch(users int) {
-	if metrics == nil {
-		return
-	}
-	metrics.outboxProjectionBatches.Inc()
-	metrics.outboxProjectionUsers.Add(float64(users))
-}
-
 func (metrics *applicationMetrics) ObserveOutboxBatchPresence(users int, result string) {
 	if metrics == nil {
 		return
@@ -336,55 +257,12 @@ func (metrics *applicationMetrics) ObserveOutboxBatchPresence(users int, result 
 	metrics.outboxBatchPresenceUsers.Add(float64(users))
 }
 
-func (metrics *applicationMetrics) ObserveOutboxProjectionQuery(duration time.Duration) {
-	if metrics != nil {
-		metrics.outboxProjectionQueries.Observe(duration.Seconds())
-	}
-}
-
 func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConfig) {
 	if metrics == nil {
 		return
 	}
 	metrics.outboxWorkerConcurrency.Set(float64(config.Concurrency))
 	metrics.outboxWorkerBatchSize.Set(float64(config.BatchSize))
-	metrics.outboxPrepareWorkers.Set(float64(config.PrepareWorkers))
-	if config.PrepareMode == outboxPrepareModeUserSharded {
-		metrics.outboxUserShardedPrepare.Set(1)
-	} else {
-		metrics.outboxUserShardedPrepare.Set(0)
-	}
-	if config.ExecutionMode == outboxExecutionModePipeline {
-		metrics.outboxPipelineEnabled.Set(1)
-	} else {
-		metrics.outboxPipelineEnabled.Set(0)
-	}
-	if config.ProjectionMode == syncProjectionModeBulk {
-		metrics.outboxProjectionBulk.Set(1)
-	} else {
-		metrics.outboxProjectionBulk.Set(0)
-	}
-	if config.ProjectionStorage == syncProjectionStorageRecipients {
-		metrics.outboxProjectionRecipients.Set(1)
-	} else {
-		metrics.outboxProjectionRecipients.Set(0)
-	}
-	if config.ProjectionStorage == syncProjectionStorageSyncEvents {
-		metrics.outboxProjectionSyncEvents.Set(1)
-	} else {
-		metrics.outboxProjectionSyncEvents.Set(0)
-	}
-}
-
-func (metrics *applicationMetrics) SetOutboxBatchPresenceEnabled(enabled bool) {
-	if metrics == nil {
-		return
-	}
-	if enabled {
-		metrics.outboxBatchPresenceEnabled.Set(1)
-	} else {
-		metrics.outboxBatchPresenceEnabled.Set(0)
-	}
 }
 
 func (metrics *applicationMetrics) Handler() http.Handler {
@@ -452,8 +330,6 @@ type databaseStateCollector struct {
 	outboxPending     *prometheus.Desc
 	outboxOldestAge   *prometheus.Desc
 	outboxDead        *prometheus.Desc
-	projectionPending *prometheus.Desc
-	projectionOldest  *prometheus.Desc
 	ackDevices        *prometheus.Desc
 	ackMaxLag         *prometheus.Desc
 }
@@ -576,14 +452,6 @@ func newDatabaseStateCollector(db *pgxpool.Pool) *databaseStateCollector {
 			"im_backend_outbox_dead_events",
 			"Outbox events in the dead terminal state.", nil, nil,
 		),
-		projectionPending: prometheus.NewDesc(
-			"im_backend_outbox_projection_pending_jobs",
-			"User-sharded message projection jobs that have not completed.", nil, nil,
-		),
-		projectionOldest: prometheus.NewDesc(
-			"im_backend_outbox_projection_oldest_pending_job_age_seconds",
-			"Age in seconds of the oldest pending user-sharded message projection job.", nil, nil,
-		),
 		ackDevices: prometheus.NewDesc(
 			"im_backend_device_sync_states",
 			"Number of device and conversation pairs with a recorded ACK state.", nil, nil,
@@ -600,8 +468,6 @@ func (collector *databaseStateCollector) Describe(destination chan<- *prometheus
 	destination <- collector.outboxPending
 	destination <- collector.outboxOldestAge
 	destination <- collector.outboxDead
-	destination <- collector.projectionPending
-	destination <- collector.projectionOldest
 	destination <- collector.ackDevices
 	destination <- collector.ackMaxLag
 }
@@ -625,19 +491,6 @@ func (collector *databaseStateCollector) Collect(destination chan<- prometheus.M
 		return
 	}
 
-	var projectionPending, projectionOldest float64
-	err = collector.db.QueryRow(
-		ctx,
-		`SELECT count(*)::double precision,
-		        COALESCE(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - min(created_at)), 0)::double precision
-		 FROM message_projection_jobs
-		 WHERE projected_at IS NULL`,
-	).Scan(&projectionPending, &projectionOldest)
-	if err != nil {
-		destination <- prometheus.MustNewConstMetric(collector.collectionSuccess, prometheus.GaugeValue, 0)
-		return
-	}
-
 	var devices, maxLag float64
 	err = collector.db.QueryRow(
 		ctx,
@@ -655,8 +508,6 @@ func (collector *databaseStateCollector) Collect(destination chan<- prometheus.M
 	destination <- prometheus.MustNewConstMetric(collector.outboxPending, prometheus.GaugeValue, pending)
 	destination <- prometheus.MustNewConstMetric(collector.outboxOldestAge, prometheus.GaugeValue, oldestAge)
 	destination <- prometheus.MustNewConstMetric(collector.outboxDead, prometheus.GaugeValue, dead)
-	destination <- prometheus.MustNewConstMetric(collector.projectionPending, prometheus.GaugeValue, projectionPending)
-	destination <- prometheus.MustNewConstMetric(collector.projectionOldest, prometheus.GaugeValue, projectionOldest)
 	destination <- prometheus.MustNewConstMetric(collector.ackDevices, prometheus.GaugeValue, devices)
 	destination <- prometheus.MustNewConstMetric(collector.ackMaxLag, prometheus.GaugeValue, maxLag)
 }

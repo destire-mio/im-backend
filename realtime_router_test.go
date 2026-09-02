@@ -401,9 +401,8 @@ func TestTwoApplicationInstancesDeliverOutboxEventToRemoteWebSocket(t *testing.T
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
 	config.Concurrency = 1
-	worker := mustMessageTestWorker(t, db, &webSocketOutboxPublisher{
-		router:        appA.realtimeRouter,
-		batchPresence: true,
+	worker := mustTestWorker(t, db, &webSocketOutboxPublisher{
+		router: appA.realtimeRouter,
 	}, config)
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || processed != 1 {
@@ -413,7 +412,7 @@ func TestTwoApplicationInstancesDeliverOutboxEventToRemoteWebSocket(t *testing.T
 	if envelope.Message.ID != created.ID ||
 		envelope.ConversationID != created.ConversationID ||
 		envelope.ConversationSeq != created.ConversationSeq ||
-		envelope.Cursor <= 0 {
+		envelope.Cursor != 0 {
 		t.Fatalf("cross-instance websocket envelope = %+v", envelope)
 	}
 }

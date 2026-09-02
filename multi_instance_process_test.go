@@ -63,7 +63,7 @@ func TestTwoProcessesDeliverOutboxEventToRemoteWebSocket(t *testing.T) {
 	if envelope.Message.ID != created.ID ||
 		envelope.ConversationID != created.ConversationID ||
 		envelope.ConversationSeq != created.ConversationSeq ||
-		envelope.Cursor <= 0 {
+		envelope.Cursor != 0 {
 		t.Fatalf("cross-process websocket envelope = %+v", envelope)
 	}
 }
@@ -375,9 +375,8 @@ func TestMultiInstanceProcessHelper(t *testing.T) {
 	workerDone := make(chan struct{})
 	if role == "a" {
 		config := defaultOutboxWorkerConfig()
-		worker := mustMessageTestWorker(t, db, &webSocketOutboxPublisher{
-			router:        app.realtimeRouter,
-			batchPresence: true,
+		worker := mustTestWorker(t, db, &webSocketOutboxPublisher{
+			router: app.realtimeRouter,
 		}, config)
 		go func() {
 			defer close(workerDone)

@@ -13,12 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type testBatchPreparerFunc func(context.Context, []outboxEvent) ([]outboxEvent, error)
-
-func (prepare testBatchPreparerFunc) PrepareBatch(ctx context.Context, events []outboxEvent) ([]outboxEvent, error) {
-	return prepare(ctx, events)
-}
-
 func TestDatabaseAcquireTracerPartitionsAPIAndOutboxWait(t *testing.T) {
 	metrics := newApplicationMetrics(nil)
 	now := time.Unix(100, 0)
@@ -91,7 +85,6 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	app.metrics = newApplicationMetrics(db)
 	workerConfig := defaultOutboxWorkerConfig()
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
-	app.metrics.SetOutboxBatchPresenceEnabled(true)
 	app.metrics.ObserveOutboxBatchPresence(2, "success")
 	server := httptest.NewServer(app.routes())
 	t.Cleanup(server.Close)
@@ -99,7 +92,7 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	receiver := registerTestAccount(t, db, server.URL, uniqueUsername("metrics_r"), "Metrics Receiver")
 
 	created := createMessageThroughAPI(t, server.URL, sender.Auth.AccessToken, receiver.User.ID, "observable message")
-	projectPendingMessageEvents(t, db, app.metrics)
+	publishPendingMessageEvents(t, db, app.metrics)
 	page := syncConversationMessagesThroughAPI(
 		t,
 		server.URL,
@@ -124,21 +117,10 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 		"im_backend_database_pool_acquires_total",
 		"im_backend_database_pool_empty_acquire_wait_seconds_total",
 		"im_backend_outbox_pending_events",
-		"im_backend_outbox_projection_pending_jobs 0",
 		"im_backend_outbox_worker_concurrency 16",
 		"im_backend_outbox_worker_batch_size 64",
-		"im_backend_outbox_prepare_workers 1",
-		"im_backend_outbox_user_sharded_prepare_enabled 0",
-		"im_backend_outbox_pipeline_enabled 1",
-		"im_backend_outbox_batch_presence_enabled 1",
 		`im_backend_outbox_batch_presence_batches_total{result="success"} 1`,
 		"im_backend_outbox_batch_presence_users_total 2",
-		"im_backend_outbox_projection_bulk_enabled 1",
-		"im_backend_outbox_projection_recipients_enabled 0",
-		"im_backend_outbox_projection_sync_events_enabled 1",
-		"im_backend_outbox_projection_batches_total 1",
-		"im_backend_outbox_projection_users_total 2",
-		"im_backend_outbox_projection_query_duration_seconds_count 3",
 		"im_backend_http_requests_total",
 		`route="POST /messages"`,
 		`status="201"`,
@@ -157,23 +139,6 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 	}
 }
 
-func TestMetricsExposeRecipientProjectionStorageForRollback(t *testing.T) {
-	metrics := newApplicationMetrics(nil)
-	config := defaultOutboxWorkerConfig()
-	config.ProjectionStorage = syncProjectionStorageRecipients
-	metrics.SetOutboxWorkerConfig(config)
-
-	exposition := scrapeMetrics(t, metrics)
-	for _, expected := range []string{
-		"im_backend_outbox_projection_recipients_enabled 1",
-		"im_backend_outbox_projection_sync_events_enabled 0",
-	} {
-		if !strings.Contains(exposition, expected) {
-			t.Fatalf("metrics exposition missing %q\n%s", expected, exposition)
-		}
-	}
-}
-
 func TestOutboxAndSlowClientResultsAreObservable(t *testing.T) {
 	db := openTestDatabase(t)
 	metrics := newApplicationMetrics(db)
@@ -182,9 +147,6 @@ func TestOutboxAndSlowClientResultsAreObservable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create observed worker: %v", err)
 	}
-	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
-		return events, nil
-	})
 	if _, err := worker.RunOnce(context.Background()); err != nil {
 		t.Fatalf("run observed worker: %v", err)
 	}
@@ -216,7 +178,6 @@ func TestOutboxAndSlowClientResultsAreObservable(t *testing.T) {
 		`im_backend_outbox_publish_total{event_type="test.outbox",result="published"} 1`,
 		`im_backend_outbox_publish_duration_seconds_count{event_type="test.outbox"} 1`,
 		`im_backend_outbox_stage_duration_seconds_count{stage="claim"} 1`,
-		`im_backend_outbox_stage_duration_seconds_count{stage="prepare"} 1`,
 		`im_backend_outbox_stage_duration_seconds_count{stage="publish"} 1`,
 		`im_backend_outbox_stage_duration_seconds_count{stage="mark_published"} 1`,
 		`im_backend_websocket_deliveries_total{result="slow_client"} 1`,

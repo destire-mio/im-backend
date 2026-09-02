@@ -1199,8 +1199,6 @@ type metricPeakSampler struct {
 var peakMetricNames = []string{
 	"im_backend_outbox_pending_events",
 	"im_backend_outbox_oldest_pending_age_seconds",
-	"im_backend_outbox_projection_pending_jobs",
-	"im_backend_outbox_projection_oldest_pending_job_age_seconds",
 }
 
 func startMetricPeakSampler(
@@ -1282,10 +1280,6 @@ var deltaMetricNames = []string{
 	"im_backend_outbox_publish_total",
 	"im_backend_outbox_publish_duration_seconds_count",
 	"im_backend_outbox_publish_duration_seconds_sum",
-	"im_backend_outbox_projection_batches_total",
-	"im_backend_outbox_projection_users_total",
-	"im_backend_outbox_projection_query_duration_seconds_count",
-	"im_backend_outbox_projection_query_duration_seconds_sum",
 	"im_backend_outbox_batch_presence_batches_total",
 	"im_backend_outbox_batch_presence_users_total",
 	"im_backend_realtime_routing_total",
@@ -1314,8 +1308,6 @@ var endMetricNames = []string{
 	"im_backend_outbox_pending_events",
 	"im_backend_outbox_oldest_pending_age_seconds",
 	"im_backend_outbox_dead_events",
-	"im_backend_outbox_projection_pending_jobs",
-	"im_backend_outbox_projection_oldest_pending_job_age_seconds",
 	"im_backend_database_metrics_collection_success",
 	"im_backend_database_pool_acquired_connections",
 	"im_backend_database_pool_idle_connections",
@@ -1329,13 +1321,6 @@ var endMetricNames = []string{
 	"im_backend_outbox_database_pool_max_connections",
 	"im_backend_outbox_worker_concurrency",
 	"im_backend_outbox_worker_batch_size",
-	"im_backend_outbox_prepare_workers",
-	"im_backend_outbox_user_sharded_prepare_enabled",
-	"im_backend_outbox_pipeline_enabled",
-	"im_backend_outbox_batch_presence_enabled",
-	"im_backend_outbox_projection_bulk_enabled",
-	"im_backend_outbox_projection_recipients_enabled",
-	"im_backend_outbox_projection_sync_events_enabled",
 	"im_backend_websocket_send_queue_high_watermark",
 	"go_goroutines",
 	"process_resident_memory_bytes",
@@ -1489,7 +1474,7 @@ func printReport(result report) {
 		result.RealtimeLatency.P95MS, result.Realtime.Expected-result.Realtime.Observed, result.DuplicateRealtime, result.UnexpectedRealtime)
 	fmt.Printf("Sync durability: %s observed=%d/%d missing=%d\n",
 		passLabel(result.Sync.Passed), result.Sync.Observed, result.Sync.Expected, result.Sync.Expected-result.Sync.Observed)
-	for _, stage := range []string{"claim", "prepare", "publish", "mark_published"} {
+	for _, stage := range []string{"claim", "publish_prepare", "publish", "mark_published"} {
 		if value, exists := result.OutboxStageDurations[stage]; exists {
 			fmt.Printf("Outbox stage %-14s batches=%d avg=%.2fms p50<=%.2fms p95<=%.2fms p99<=%.2fms\n",
 				stage, value.Count, value.AverageMS, value.P50BucketMS, value.P95BucketMS, value.P99BucketMS)
@@ -1511,10 +1496,6 @@ func printReport(result report) {
 		result.MetricSampling.Errors,
 		result.MetricSampling.Peaks["im_backend_outbox_pending_events"],
 		result.MetricSampling.Peaks["im_backend_outbox_oldest_pending_age_seconds"],
-	)
-	fmt.Printf("Projection jobs: peak_pending=%.0f peak_oldest_age=%.3fs\n",
-		result.MetricSampling.Peaks["im_backend_outbox_projection_pending_jobs"],
-		result.MetricSampling.Peaks["im_backend_outbox_projection_oldest_pending_job_age_seconds"],
 	)
 	for _, name := range endMetricNames {
 		if value, exists := result.MetricEnd[name]; exists {

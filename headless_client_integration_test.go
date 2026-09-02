@@ -91,7 +91,7 @@ func TestHeadlessClientRecoversRefreshSyncAndACKAfterLostResponses(t *testing.T)
 		))
 	}
 	conversationID := created[0].ConversationID
-	worker := mustMessageTestWorker(t, db, &webSocketOutboxPublisher{router: app.webSocketHub}, defaultOutboxWorkerConfig())
+	worker := mustTestWorker(t, db, &webSocketOutboxPublisher{router: app.webSocketHub}, defaultOutboxWorkerConfig())
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || processed != 3 {
 		t.Fatalf("publish realtime messages = %d, %v", processed, err)

@@ -84,7 +84,7 @@ func TestWebSocketPublisherDeliversToEveryOnlineDevice(t *testing.T) {
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
 	config.Concurrency = 1
-	worker := mustMessageTestWorker(t, db, publisher, config)
+	worker := mustTestWorker(t, db, publisher, config)
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || processed != 1 {
 		t.Fatalf("run websocket outbox worker = processed %d, err %v", processed, err)
@@ -97,7 +97,7 @@ func TestWebSocketPublisherDeliversToEveryOnlineDevice(t *testing.T) {
 				t.Fatalf("envelope identity = %+v", envelope)
 			}
 			if envelope.Message.ID != created.ID ||
-				envelope.Cursor <= 0 ||
+				envelope.Cursor != 0 ||
 				envelope.ConversationID != created.ConversationID ||
 				envelope.ConversationSeq != created.ConversationSeq {
 				t.Fatalf("envelope message = %+v", envelope)
@@ -108,13 +108,13 @@ func TestWebSocketPublisherDeliversToEveryOnlineDevice(t *testing.T) {
 
 func TestWebSocketPublisherDeduplicatesBatchPresenceUsers(t *testing.T) {
 	router := &testBatchDeliveryRouter{}
-	publisher := &webSocketOutboxPublisher{router: router, batchPresence: true}
+	publisher := &webSocketOutboxPublisher{router: router}
 	first := testMessageCreatedOutboxEvent(t, "event-1", 101, []int64{7, 9})
 	second := testMessageCreatedOutboxEvent(t, "event-2", 102, []int64{9, 11})
 	malformed := outboxEvent{
 		EventID:        "event-malformed",
 		EventType:      "message.created",
-		PayloadVersion: 2,
+		PayloadVersion: 4,
 		Payload:        json.RawMessage(`{"message":`),
 	}
 
@@ -146,14 +146,16 @@ func testMessageCreatedOutboxEvent(
 ) outboxEvent {
 	t.Helper()
 	recipients := make([]messageEventRecipient, 0, len(userIDs))
-	for index, userID := range userIDs {
-		recipients = append(recipients, messageEventRecipient{UserID: userID, Cursor: int64(index + 1)})
+	for _, userID := range userIDs {
+		recipients = append(recipients, messageEventRecipient{UserID: userID})
 	}
 	payload, err := json.Marshal(messageCreatedEventPayload{
 		Message: message{
-			ID:         messageID,
-			SenderID:   userIDs[0],
-			ReceiverID: userIDs[len(userIDs)-1],
+			ID:              messageID,
+			ConversationID:  messageID,
+			ConversationSeq: 1,
+			SenderID:        userIDs[0],
+			ReceiverID:      userIDs[len(userIDs)-1],
 		},
 		Recipients: recipients,
 	})
@@ -163,7 +165,7 @@ func testMessageCreatedOutboxEvent(
 	return outboxEvent{
 		EventID:        eventID,
 		EventType:      "message.created",
-		PayloadVersion: 2,
+		PayloadVersion: 4,
 		MessageID:      messageID,
 		Payload:        payload,
 	}
@@ -183,7 +185,7 @@ func TestOfflineRecipientCanSyncAfterOutboxCompletes(t *testing.T) {
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
 	config.Concurrency = 1
-	worker := mustMessageTestWorker(t, db, &webSocketOutboxPublisher{router: app.webSocketHub}, config)
+	worker := mustTestWorker(t, db, &webSocketOutboxPublisher{router: app.webSocketHub}, config)
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || processed != 1 {
 		t.Fatalf("run offline outbox worker = processed %d, err %v", processed, err)
@@ -278,27 +280,6 @@ func TestFullClientQueueRemovesOnlySlowClient(t *testing.T) {
 	}
 }
 
-func TestLegacyMessageCreatedPayloadRemainsReadable(t *testing.T) {
-	event := outboxEvent{
-		PayloadVersion: 1,
-		Payload: json.RawMessage(`{
-			"messageId": 88,
-			"clientMessageId": "legacy-client-id-88",
-			"senderId": 3,
-			"receiverId": 4,
-			"content": "legacy",
-			"createdAt": "2026-08-29T00:00:00Z"
-		}`),
-	}
-	payload, err := decodeMessageCreatedEvent(event)
-	if err != nil {
-		t.Fatalf("decode legacy payload: %v", err)
-	}
-	if payload.Message.ID != 88 || payload.Message.ReceiverID != 4 || len(payload.Recipients) != 1 {
-		t.Fatalf("legacy payload = %+v", payload)
-	}
-}
-
 func newWebSocketTestApplication(t *testing.T, db *pgxpool.Pool) (*application, func()) {
 	t.Helper()
 	app := newTestApplication(t, db)
@@ -355,11 +336,11 @@ func loadOutboxEventForMessage(t *testing.T, db *pgxpool.Pool, messageID int64) 
 	var event outboxEvent
 	if err := db.QueryRow(
 		context.Background(),
-		`SELECT event_id::text, event_type, payload_version, message_id, payload
+		`SELECT event_id::text, event_type, payload_version, message_id, payload, ready_at
 		 FROM outbox_events
 		 WHERE message_id = $1`,
 		messageID,
-	).Scan(&event.EventID, &event.EventType, &event.PayloadVersion, &event.MessageID, &event.Payload); err != nil {
+	).Scan(&event.EventID, &event.EventType, &event.PayloadVersion, &event.MessageID, &event.Payload, &event.ReadyAt); err != nil {
 		t.Fatalf("load outbox event: %v", err)
 	}
 	return event

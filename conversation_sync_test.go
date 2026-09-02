@@ -98,21 +98,21 @@ func TestSelfConversationHasOneMemberAndOneRealtimeRecipient(t *testing.T) {
 	publisher := &testPublisher{}
 	config := defaultOutboxWorkerConfig()
 	config.BatchSize = 1
-	worker := mustMessageTestWorker(t, db, publisher, config)
+	worker := mustTestWorker(t, db, publisher, config)
 	processed, err := worker.RunOnce(t.Context())
 	if err != nil || processed != 1 {
-		t.Fatalf("project self compatibility event = %d, err %v", processed, err)
+		t.Fatalf("publish self v4 event = %d, err %v", processed, err)
 	}
 	received := publisher.received()
-	if len(received) != 1 || received[0].PayloadVersion != 2 {
-		t.Fatalf("self compatibility events = %+v", received)
+	if len(received) != 1 || received[0].PayloadVersion != 4 {
+		t.Fatalf("self v4 events = %+v", received)
 	}
 	payload, err := decodeMessageCreatedEvent(received[0])
 	if err != nil {
-		t.Fatalf("decode self compatibility event: %v", err)
+		t.Fatalf("decode self v4 event: %v", err)
 	}
 	if len(payload.Recipients) != 1 || payload.Recipients[0].UserID != account.User.ID {
-		t.Fatalf("self compatibility recipients = %+v", payload.Recipients)
+		t.Fatalf("self v4 recipients = %+v", payload.Recipients)
 	}
 	var members int
 	if err := db.QueryRow(

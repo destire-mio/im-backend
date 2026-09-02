@@ -39,20 +39,20 @@ func TestCheckReadyAgainstPostgres(t *testing.T) {
 		},
 		{
 			name:      "behind application",
-			mutateSQL: `DELETE FROM schema_migrations WHERE version = 15`,
-			want:      "at migration 014",
+			mutateSQL: `DELETE FROM schema_migrations WHERE version = 16`,
+			want:      "at migration 015",
 		},
 		{
 			name:      "checksum changed",
-			mutateSQL: `UPDATE schema_migrations SET checksum = decode(repeat('11', 32), 'hex') WHERE version = 15`,
+			mutateSQL: `UPDATE schema_migrations SET checksum = decode(repeat('11', 32), 'hex') WHERE version = 16`,
 			want:      "checksum does not match",
 		},
 		{
 			name: "newer than application",
 			mutateSQL: `INSERT INTO schema_migrations (
 			                version, name, checksum, execution_milliseconds
-			            ) VALUES (16, 'future', decode(repeat('00', 32), 'hex'), 0)`,
-			want: "unknown migration version 016",
+			            ) VALUES (17, 'future', decode(repeat('00', 32), 'hex'), 0)`,
+			want: "unknown migration version 017",
 		},
 	}
 

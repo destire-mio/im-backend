@@ -128,11 +128,8 @@ CREATE INDEX conversation_members_user_conversation_idx
 
 CREATE TABLE messages (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    -- Nullable through the migration-015 rollback window. The current writer
-    -- always fills both fields; a pre-015 writer may leave them NULL and must
-    -- be followed by im-migrate reconcile-conversations before roll-forward.
-    conversation_id BIGINT REFERENCES conversations(id),
-    conversation_seq BIGINT,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id),
+    conversation_seq BIGINT NOT NULL,
     sender_id BIGINT NOT NULL REFERENCES users(id),
     receiver_id BIGINT NOT NULL REFERENCES users(id),
     client_message_id TEXT NOT NULL,
@@ -149,53 +146,6 @@ CREATE TABLE messages (
     CONSTRAINT messages_sender_client_id_unique UNIQUE (sender_id, client_message_id)
 );
 
-CREATE INDEX messages_direction_history_idx
-    ON messages (sender_id, receiver_id, created_at DESC, id DESC);
-
-CREATE INDEX messages_missing_conversation_cursor_idx
-    ON messages (id)
-    WHERE conversation_id IS NULL OR conversation_seq IS NULL;
-
-CREATE STATISTICS messages_sender_receiver_stats (dependencies, mcv)
-    ON sender_id, receiver_id
-    FROM messages;
-
-ALTER STATISTICS messages_sender_receiver_stats SET STATISTICS 1000;
-
-CREATE TABLE user_sync_counters (
-    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    last_seq BIGINT NOT NULL DEFAULT 0,
-    CONSTRAINT user_sync_counters_last_seq_valid CHECK (last_seq >= 0)
-);
-
-CREATE TABLE user_message_events (
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    seq BIGINT NOT NULL,
-    message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, seq),
-    CONSTRAINT user_message_events_seq_valid CHECK (seq > 0),
-    CONSTRAINT user_message_events_message_unique UNIQUE (user_id, message_id)
-);
-
-CREATE INDEX user_message_events_message_id_idx
-    ON user_message_events (message_id);
-
-CREATE TABLE device_sync_states (
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    device_id TEXT NOT NULL,
-    applied_seq BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, device_id),
-    CONSTRAINT device_sync_states_device_id_valid CHECK (
-        char_length(device_id) BETWEEN 1 AND 128
-    ),
-    CONSTRAINT device_sync_states_applied_seq_valid CHECK (applied_seq >= 0)
-);
-
--- Legacy device_sync_states remains so the new binary can drain version-3
--- Outbox events created before migration 015. This compatibility data does not
--- make a pre-015 writer rollback-safe.
 CREATE TABLE device_conversation_sync_states (
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     device_id TEXT NOT NULL,
@@ -240,6 +190,11 @@ CREATE TABLE outbox_events (
     CONSTRAINT outbox_message_publish_requires_ready CHECK (
         event_type <> 'message.created' OR published_at IS NULL OR ready_at IS NOT NULL
     ),
+    CONSTRAINT outbox_message_pending_v4_ready CHECK (
+        event_type <> 'message.created'
+        OR published_at IS NOT NULL OR dead_at IS NOT NULL
+        OR (payload_version = 4 AND ready_at IS NOT NULL)
+    ),
     CONSTRAINT outbox_last_error_valid CHECK (last_error IS NULL OR char_length(last_error) <= 2000),
     CONSTRAINT outbox_message_event_unique UNIQUE (message_id, event_type)
 );
@@ -247,39 +202,3 @@ CREATE TABLE outbox_events (
 CREATE INDEX outbox_pending_idx
     ON outbox_events (next_attempt_at, created_at, event_id)
     WHERE published_at IS NULL AND dead_at IS NULL;
-
-CREATE TABLE message_projection_jobs (
-    event_id UUID NOT NULL REFERENCES outbox_events(event_id) ON DELETE CASCADE,
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    shard SMALLINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    projected_at TIMESTAMPTZ,
-    PRIMARY KEY (event_id, user_id),
-    CONSTRAINT message_projection_jobs_shard_valid CHECK (shard BETWEEN 0 AND 255),
-    CONSTRAINT message_projection_jobs_user_message_unique UNIQUE (user_id, message_id)
-);
-
-CREATE INDEX message_projection_jobs_pending_shard_idx
-    ON message_projection_jobs (shard, created_at, message_id, user_id)
-    WHERE projected_at IS NULL;
-
-CREATE INDEX outbox_unready_message_projection_idx
-    ON outbox_events (created_at, event_id)
-    WHERE event_type = 'message.created'
-      AND ready_at IS NULL
-      AND published_at IS NULL
-      AND dead_at IS NULL;
-
-CREATE TABLE outbox_recipients (
-    event_id UUID NOT NULL REFERENCES outbox_events(event_id) ON DELETE CASCADE,
-    user_id BIGINT NOT NULL,
-    cursor BIGINT NOT NULL,
-    PRIMARY KEY (event_id, user_id),
-    CONSTRAINT outbox_recipients_cursor_valid CHECK (cursor > 0),
-    CONSTRAINT outbox_recipients_user_cursor_unique UNIQUE (user_id, cursor),
-    CONSTRAINT outbox_recipients_sync_event_fk
-        FOREIGN KEY (user_id, cursor)
-        REFERENCES user_message_events(user_id, seq)
-        ON DELETE CASCADE
-);

@@ -34,38 +34,17 @@ type outboxBatchPublishPreparer interface {
 	PreparePublishBatch(context.Context, []outboxEvent) (outboxPublisher, error)
 }
 
-type outboxBatchPreparer interface {
-	PrepareBatch(context.Context, []outboxEvent) ([]outboxEvent, error)
-}
-
-type outboxExecutionMode string
-type outboxPrepareMode string
-
-const (
-	outboxExecutionModeSerial   outboxExecutionMode = "serial"
-	outboxExecutionModePipeline outboxExecutionMode = "pipeline"
-
-	outboxPrepareModeInline      outboxPrepareMode = "inline"
-	outboxPrepareModeUserSharded outboxPrepareMode = "user_sharded"
-)
-
 type outboxWorkerConfig struct {
-	EventTypes        []string
-	BatchSize         int
-	Concurrency       int
-	ExecutionMode     outboxExecutionMode
-	PrepareMode       outboxPrepareMode
-	PrepareWorkers    int
-	ProjectionMode    syncProjectionMode
-	ProjectionStorage syncProjectionStorage
-	LeaseDuration     time.Duration
-	AttemptTimeout    time.Duration
-	PollInterval      time.Duration
-	MaxAttempts       int
-	BaseBackoff       time.Duration
-	MaxBackoff        time.Duration
-	jitter            func(time.Duration) time.Duration
-	claimReadyOnly    bool
+	EventTypes     []string
+	BatchSize      int
+	Concurrency    int
+	LeaseDuration  time.Duration
+	AttemptTimeout time.Duration
+	PollInterval   time.Duration
+	MaxAttempts    int
+	BaseBackoff    time.Duration
+	MaxBackoff     time.Duration
+	jitter         func(time.Duration) time.Duration
 }
 
 type outboxWorker struct {
@@ -73,7 +52,6 @@ type outboxWorker struct {
 	publisher outboxPublisher
 	config    outboxWorkerConfig
 	metrics   *applicationMetrics
-	preparer  outboxBatchPreparer
 }
 
 type outboxPublishOutcome struct {
@@ -83,13 +61,6 @@ type outboxPublishOutcome struct {
 
 const (
 	outboxStageClaim          = "claim"
-	outboxStagePrepare        = "prepare"
-	outboxStagePrepareDecode  = "prepare_decode"
-	outboxStagePrepareBegin   = "prepare_begin"
-	outboxStagePrepareUsers   = "prepare_project_users"
-	outboxStagePrepareEncode  = "prepare_encode"
-	outboxStagePrepareStore   = "prepare_store"
-	outboxStagePrepareCommit  = "prepare_commit"
 	outboxStagePublish        = "publish"
 	outboxStagePublishPrepare = "publish_prepare"
 	outboxStageMarkPublished  = "mark_published"
@@ -112,45 +83,18 @@ func retryablePublishError(err error, retryAfter time.Duration) error {
 	return &publishFailure{err: err, retryAfter: retryAfter}
 }
 
-func normalizeOutboxExecutionMode(mode outboxExecutionMode) (outboxExecutionMode, error) {
-	switch mode {
-	case "", outboxExecutionModePipeline:
-		return outboxExecutionModePipeline, nil
-	case outboxExecutionModeSerial:
-		return outboxExecutionModeSerial, nil
-	default:
-		return "", fmt.Errorf("unsupported outbox execution mode %q", mode)
-	}
-}
-
-func normalizeOutboxPrepareMode(mode outboxPrepareMode) (outboxPrepareMode, error) {
-	switch mode {
-	case "", outboxPrepareModeInline:
-		return outboxPrepareModeInline, nil
-	case outboxPrepareModeUserSharded:
-		return outboxPrepareModeUserSharded, nil
-	default:
-		return "", fmt.Errorf("unsupported outbox prepare mode %q", mode)
-	}
-}
-
 func defaultOutboxWorkerConfig() outboxWorkerConfig {
 	return outboxWorkerConfig{
-		EventTypes:        []string{"message.created"},
-		BatchSize:         64,
-		Concurrency:       16,
-		ExecutionMode:     outboxExecutionModePipeline,
-		PrepareMode:       outboxPrepareModeInline,
-		PrepareWorkers:    1,
-		ProjectionMode:    syncProjectionModeBulk,
-		ProjectionStorage: syncProjectionStorageSyncEvents,
-		LeaseDuration:     30 * time.Second,
-		AttemptTimeout:    10 * time.Second,
-		PollInterval:      500 * time.Millisecond,
-		MaxAttempts:       10,
-		BaseBackoff:       time.Second,
-		MaxBackoff:        5 * time.Minute,
-		jitter:            equalJitter,
+		EventTypes:     []string{"message.created"},
+		BatchSize:      64,
+		Concurrency:    16,
+		LeaseDuration:  30 * time.Second,
+		AttemptTimeout: 10 * time.Second,
+		PollInterval:   500 * time.Millisecond,
+		MaxAttempts:    10,
+		BaseBackoff:    time.Second,
+		MaxBackoff:     5 * time.Minute,
+		jitter:         equalJitter,
 	}
 }
 
@@ -178,11 +122,6 @@ func newOutboxWorker(
 	if config.BaseBackoff > config.MaxBackoff {
 		return nil, errors.New("outbox base backoff cannot exceed max backoff")
 	}
-	executionMode, err := normalizeOutboxExecutionMode(config.ExecutionMode)
-	if err != nil {
-		return nil, err
-	}
-	config.ExecutionMode = executionMode
 	if config.jitter == nil {
 		config.jitter = equalJitter
 	}
@@ -193,93 +132,17 @@ func newOutboxWorker(
 	return &outboxWorker{db: db, publisher: publisher, config: config, metrics: metrics}, nil
 }
 
-func newMessageOutboxWorker(
-	db *pgxpool.Pool,
-	publisher outboxPublisher,
-	config outboxWorkerConfig,
-	metricObservers ...*applicationMetrics,
-) (*outboxWorker, error) {
-	prepareMode, err := normalizeOutboxPrepareMode(config.PrepareMode)
-	if err != nil {
-		return nil, err
-	}
-	config.PrepareMode = prepareMode
-	if config.PrepareWorkers <= 0 || config.PrepareWorkers > messageProjectionVirtualShards {
-		return nil, fmt.Errorf(
-			"outbox prepare workers must be between 1 and %d",
-			messageProjectionVirtualShards,
-		)
-	}
-	if prepareMode == outboxPrepareModeInline && config.PrepareWorkers != 1 {
-		return nil, errors.New("inline outbox preparation requires exactly one prepare worker")
-	}
-	config.claimReadyOnly = prepareMode == outboxPrepareModeUserSharded
-	projectionMode, err := normalizeSyncProjectionMode(config.ProjectionMode)
-	if err != nil {
-		return nil, err
-	}
-	config.ProjectionMode = projectionMode
-	projectionStorage, err := normalizeSyncProjectionStorage(config.ProjectionStorage)
-	if err != nil {
-		return nil, err
-	}
-	config.ProjectionStorage = projectionStorage
-	if prepareMode == outboxPrepareModeUserSharded {
-		if projectionMode != syncProjectionModeBulk {
-			return nil, errors.New("user-sharded outbox preparation requires bulk projection mode")
-		}
-		if projectionStorage != syncProjectionStorageSyncEvents {
-			return nil, errors.New("user-sharded outbox preparation requires sync_events projection storage")
-		}
-	}
-	worker, err := newOutboxWorker(db, publisher, config, metricObservers...)
-	if err != nil {
-		return nil, err
-	}
-	worker.preparer = &messageSyncProjector{
-		db:      db,
-		metrics: worker.metrics,
-		mode:    projectionMode,
-		storage: projectionStorage,
-	}
-	return worker, nil
-}
-
 func (worker *outboxWorker) Run(ctx context.Context) error {
 	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
-	switch worker.config.ExecutionMode {
-	case outboxExecutionModeSerial:
-		return worker.runSerial(ctx)
-	case outboxExecutionModePipeline:
-		return worker.runPipeline(ctx)
-	default:
-		return fmt.Errorf("unsupported outbox execution mode %q", worker.config.ExecutionMode)
-	}
-}
-
-func (worker *outboxWorker) runSerial(ctx context.Context) error {
-	for {
-		processed, err := worker.RunOnce(ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("outbox worker batch: %v", err)
-		}
-		if !worker.continueAfterBatch(ctx, processed) {
-			return nil
-		}
-	}
-}
-
-// runPipeline overlaps database preparation for batch N+1 with realtime
-// delivery and durable completion for batch N. The unbuffered handoff keeps at
-// most one batch in each stage, so a slow publisher cannot accumulate leases.
-func (worker *outboxWorker) runPipeline(ctx context.Context) error {
-	preparedBatches := make(chan []outboxEvent)
+	// Claim batch N+1 while delivering batch N. The unbuffered handoff
+	// bounds outstanding work to one batch in each stage.
+	claimedBatches := make(chan []outboxEvent)
 	go func() {
-		defer close(preparedBatches)
-		worker.prepareBatches(ctx, preparedBatches)
+		defer close(claimedBatches)
+		worker.claimBatches(ctx, claimedBatches)
 	}()
 
-	for events := range preparedBatches {
+	for events := range claimedBatches {
 		if err := worker.deliverBatch(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("outbox worker delivery batch: %v", err)
 		}
@@ -287,17 +150,17 @@ func (worker *outboxWorker) runPipeline(ctx context.Context) error {
 	return nil
 }
 
-func (worker *outboxWorker) prepareBatches(ctx context.Context, preparedBatches chan<- []outboxEvent) {
+func (worker *outboxWorker) claimBatches(ctx context.Context, claimedBatches chan<- []outboxEvent) {
 	for {
-		processed, events, err := worker.claimAndPrepare(ctx)
+		processed, events, err := worker.claimBatch(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("outbox worker preparation batch: %v", err)
+			log.Printf("outbox worker claim batch: %v", err)
 		}
 		if len(events) > 0 {
 			// Always hand an already-claimed batch to the delivery stage. On
 			// shutdown, delivery observes the canceled context and releases each
 			// lease through the normal retry path instead of abandoning it.
-			preparedBatches <- events
+			claimedBatches <- events
 		}
 		if !worker.continueAfterBatch(ctx, processed) {
 			return
@@ -322,19 +185,17 @@ func (worker *outboxWorker) continueAfterBatch(ctx context.Context, processed in
 	}
 }
 
-// RunOnce deliberately remains a complete serial batch operation. Production
-// Run can pipeline consecutive batches, while tests and maintenance callers can
-// still execute one deterministic claim -> prepare -> publish -> mark cycle.
+// RunOnce executes one claim -> publish -> mark cycle using the same stages as Run.
 func (worker *outboxWorker) RunOnce(ctx context.Context) (int, error) {
 	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
-	processed, events, err := worker.claimAndPrepare(ctx)
+	processed, events, err := worker.claimBatch(ctx)
 	if err != nil || len(events) == 0 {
 		return processed, err
 	}
 	return processed, worker.deliverBatch(ctx, events)
 }
 
-func (worker *outboxWorker) claimAndPrepare(ctx context.Context) (int, []outboxEvent, error) {
+func (worker *outboxWorker) claimBatch(ctx context.Context) (int, []outboxEvent, error) {
 	claimStarted := time.Now()
 	events, err := worker.claim(ctx)
 	if len(events) > 0 {
@@ -342,26 +203,6 @@ func (worker *outboxWorker) claimAndPrepare(ctx context.Context) (int, []outboxE
 	}
 	if err != nil || len(events) == 0 {
 		return len(events), nil, err
-	}
-	if worker.preparer != nil {
-		prepareStarted := time.Now()
-		prepareContext, cancelPrepare := context.WithTimeout(ctx, worker.config.AttemptTimeout)
-		events, err = worker.preparer.PrepareBatch(prepareContext, events)
-		cancelPrepare()
-		worker.metrics.ObserveOutboxStage(outboxStagePrepare, time.Since(prepareStarted))
-		if err != nil {
-			failure := retryablePublishError(fmt.Errorf("prepare outbox batch: %w", err), 0)
-			var stateErrors []error
-			for _, event := range events {
-				stateContext, cancelState := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				stateErr := worker.markFailed(stateContext, event, failure)
-				cancelState()
-				if stateErr != nil {
-					stateErrors = append(stateErrors, fmt.Errorf("event %s: %w", event.EventID, stateErr))
-				}
-			}
-			return len(events), nil, errors.Join(append([]error{err}, stateErrors...)...)
-		}
 	}
 	return len(events), events, nil
 }
@@ -491,10 +332,6 @@ func (worker *outboxWorker) completeDeliveryBatch(
 }
 
 func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
-	readyPredicate := ""
-	if worker.config.claimReadyOnly {
-		readyPredicate = " AND ready_at IS NOT NULL"
-	}
 	rows, err := worker.db.Query(
 		ctx,
 		`WITH candidates AS (
@@ -505,7 +342,6 @@ func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 		     AND event_type = ANY($3)
 		     AND next_attempt_at <= CURRENT_TIMESTAMP
 		     AND (locked_until IS NULL OR locked_until <= CURRENT_TIMESTAMP)
-		     `+readyPredicate+`
 		   ORDER BY next_attempt_at, created_at, event_id
 		   FOR UPDATE SKIP LOCKED
 		   LIMIT $1

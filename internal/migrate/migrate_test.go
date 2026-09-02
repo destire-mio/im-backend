@@ -14,8 +14,8 @@ func TestLoadEmbeddedMigrationChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 15 {
-		t.Fatalf("migration count = %d, want 15", len(migrations))
+	if len(migrations) != 16 {
+		t.Fatalf("migration count = %d, want 16", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "create_messages" || !migrations[0].Transactional {
 		t.Fatalf("first migration = %+v", migrations[0])

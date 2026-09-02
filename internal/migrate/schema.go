@@ -174,6 +174,10 @@ ORDER BY signature`
 // migrations 001 through 015. A later migration needs its own reviewed target.
 const ExpectedSchemaFingerprint015 = "a7cf0ed182ff73a68fdfac8c90dce4138d91c2ebfb03f313c91556abd8ed7462"
 
+// ExpectedSchemaFingerprint016 is verified against both the migration chain and
+// schema.sql by the isolated PostgreSQL contract tests.
+const ExpectedSchemaFingerprint016 = "40b2748d060733a1a2178259c0191597cf5666a1389dddbcbef8242c714e2926"
+
 func SchemaFingerprint(ctx context.Context, queryer interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }) (string, int, error) {

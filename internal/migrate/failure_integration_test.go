@@ -84,7 +84,7 @@ WHERE first_user.username = 'fault_user_one'
 		}).Up(ctx); err != nil {
 			t.Fatalf("migration 015 in maintenance mode: %v", err)
 		}
-		assertHistoryCount(t, ctx, conn, 15)
+		assertHistoryCount(t, ctx, conn, 16)
 		var conversationID, conversationSeq int64
 		if err := conn.QueryRow(
 			ctx,
@@ -129,15 +129,15 @@ ON messages (sender_id, receiver_id, created_at DESC, id DESC)`); err != nil {
 		if err := (&Runner{Conn: conn, Files: migrationfiles.Files}).Up(ctx); err != nil {
 			t.Fatalf("resume repaired migration: %v", err)
 		}
-		assertHistoryCount(t, ctx, conn, 15)
+		assertHistoryCount(t, ctx, conn, 16)
 		if err := CheckReady(ctx, conn, migrationfiles.Files); err != nil {
 			t.Fatalf("repaired schema is not ready: %v", err)
 		}
 	})
 
-	t.Run("rollback messages reconcile before roll forward", func(t *testing.T) {
+	t.Run("contract migration repairs rollback messages once", func(t *testing.T) {
 		resetPublicSchema(t, ctx, conn)
-		if err := (&Runner{Conn: conn, Files: migrationfiles.Files}).Up(ctx); err != nil {
+		if err := (&Runner{Conn: conn, Files: migrationSubset(t, 15)}).Up(ctx); err != nil {
 			t.Fatalf("prepare schema through 015: %v", err)
 		}
 		if _, err := conn.Exec(ctx, `
@@ -168,18 +168,18 @@ SELECT 'message.created', 3, inserted.id,
 FROM inserted`); err != nil {
 			t.Fatalf("simulate pre-015 writer: %v", err)
 		}
-		if err := CheckReady(ctx, conn, migrationfiles.Files); !errors.Is(err, ErrSchemaNotReady) || !strings.Contains(err.Error(), "reconcile-conversations") {
+		if err := CheckReady(ctx, conn, migrationfiles.Files); !errors.Is(err, ErrSchemaNotReady) || !strings.Contains(err.Error(), "requires 016") {
 			t.Fatalf("unreconciled readiness error = %v", err)
 		}
-		if _, err := (&Runner{Conn: conn, Files: migrationfiles.Files}).ReconcileConversations(ctx); !errors.Is(err, ErrMaintenanceRequired) {
+		if err := (&Runner{Conn: conn, Files: migrationfiles.Files}).Up(ctx); !errors.Is(err, ErrMaintenanceRequired) {
 			t.Fatalf("reconcile without maintenance error = %v", err)
 		}
 
 		runner := &Runner{Conn: conn, Files: migrationfiles.Files, AllowMaintenance: true}
-		repaired, err := runner.ReconcileConversations(ctx)
-		if err != nil || repaired != 1 {
-			t.Fatalf("reconcile repaired %d messages, err %v", repaired, err)
+		if err := runner.Up(ctx); err != nil {
+			t.Fatalf("contract migration: %v", err)
 		}
+		assertHistoryCount(t, ctx, conn, 16)
 		var conversationID, conversationSeq int64
 		var payloadConversationID, payloadConversationSeq int64
 		if err := conn.QueryRow(ctx, `
@@ -206,9 +206,8 @@ WHERE message.client_message_id = 'rollback-msg-001'`).Scan(
 				payloadConversationSeq,
 			)
 		}
-		repaired, err = runner.ReconcileConversations(ctx)
-		if err != nil || repaired != 0 {
-			t.Fatalf("idempotent reconcile repaired %d messages, err %v", repaired, err)
+		if err := runner.Up(ctx); err != nil {
+			t.Fatalf("repeat contract migration: %v", err)
 		}
 		if err := CheckReady(ctx, conn, migrationfiles.Files); err != nil {
 			t.Fatalf("reconciled roll-forward schema is not ready: %v", err)

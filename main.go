@@ -200,56 +200,15 @@ func main() {
 	workerConfig := defaultOutboxWorkerConfig()
 	workerConfig.BatchSize = environmentInt("OUTBOX_BATCH_SIZE", workerConfig.BatchSize)
 	workerConfig.Concurrency = environmentInt("OUTBOX_CONCURRENCY", workerConfig.Concurrency)
-	workerConfig.ExecutionMode = outboxExecutionMode(environmentString("OUTBOX_EXECUTION_MODE", string(workerConfig.ExecutionMode)))
-	workerConfig.PrepareMode = outboxPrepareMode(environmentString("OUTBOX_PREPARE_MODE", string(workerConfig.PrepareMode)))
-	workerConfig.PrepareWorkers = environmentInt("OUTBOX_PREPARE_WORKERS", workerConfig.PrepareWorkers)
-	workerConfig.ProjectionMode = syncProjectionMode(environmentString("OUTBOX_PROJECTION_MODE", string(workerConfig.ProjectionMode)))
-	workerConfig.ProjectionStorage = syncProjectionStorage(environmentString("OUTBOX_PROJECTION_STORAGE", string(workerConfig.ProjectionStorage)))
-	batchPresence := environmentBool("OUTBOX_BATCH_PRESENCE_LOOKUP", true)
-	worker, err := newMessageOutboxWorker(outboxDB, &webSocketOutboxPublisher{
-		router:        router,
-		batchPresence: batchPresence,
-	}, workerConfig, app.metrics)
+	worker, err := newOutboxWorker(outboxDB, &webSocketOutboxPublisher{router: router}, workerConfig, app.metrics)
 	if err != nil {
 		cancelRouter()
 		cancelHub()
 		log.Fatalf("configure outbox worker: %v", err)
 	}
-	workerConfig = worker.config
-	var projectionPool *messageProjectionPool
-	if workerConfig.PrepareMode == outboxPrepareModeUserSharded {
-		projectionPool, err = newMessageProjectionPool(outboxDB, workerConfig, app.metrics)
-		if err != nil {
-			cancelRouter()
-			cancelHub()
-			log.Fatalf("configure message projection workers: %v", err)
-		}
-	}
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
-	app.metrics.SetOutboxBatchPresenceEnabled(batchPresence)
-	log.Printf(
-		"outbox worker batch size %d concurrency %d execution mode %s prepare mode %s prepare workers %d projection mode %s storage %s batch presence %t",
-		workerConfig.BatchSize,
-		workerConfig.Concurrency,
-		workerConfig.ExecutionMode,
-		workerConfig.PrepareMode,
-		workerConfig.PrepareWorkers,
-		workerConfig.ProjectionMode,
-		workerConfig.ProjectionStorage,
-		batchPresence,
-	)
+	log.Printf("outbox worker batch size %d concurrency %d", workerConfig.BatchSize, workerConfig.Concurrency)
 	workerContext, cancelWorker := context.WithCancel(context.Background())
-	projectionDone := make(chan struct{})
-	if projectionPool == nil {
-		close(projectionDone)
-	} else {
-		go func() {
-			defer close(projectionDone)
-			if err := projectionPool.Run(workerContext); err != nil {
-				log.Printf("message projection workers stopped: %v", err)
-			}
-		}()
-	}
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
@@ -300,11 +259,6 @@ func main() {
 		log.Printf("metrics shutdown: %v", err)
 	}
 	cancelWorker()
-	select {
-	case <-projectionDone:
-	case <-shutdownContext.Done():
-		log.Printf("message projection workers shutdown timed out")
-	}
 	select {
 	case <-workerDone:
 	case <-shutdownContext.Done():

@@ -1,6 +1,21 @@
 # TODO
 
-## Conversation-scoped Sync 主链路
+## 当前维护状态（016 contract，尚未部署到现有数据库）
+
+- [x] 认证限流改为所有维度检查通过后原子计数；真实 Redis 回归覆盖局部洪泛不耗尽全局额度、全局拒绝不扣局部额度、并发上限及窗口过期。
+- [x] 发送事务直接提交 ready v4 Outbox；删除运行时用户级 Sync 投影、分片 Dispatcher/Worker、三种投影存储模式与串行/Presence 回退开关。
+- [x] 新增 016 停写迁移：补齐回滚期间缺失的会话 cursor，转换 pending v1/v2/v3 并保留事件身份和退避状态，收紧约束，删除五张旧表与旧索引。001～015 不改 checksum。
+- [x] 隔离 PostgreSQL 已验证旧积压转换、自发消息、终态记录保留、异常数据整体回滚、重复迁移，以及迁移链与 schema.sql 的结构一致；保留 015 基线接管仅用于升级，不支持旧二进制运行。
+- [x] 用原 015 schema 创建独立升级副本，写入 v1/v2/v3 混合 pending 积压，执行 016 后启动真实服务：3/3 事件均以 v4 ready/published 完成，dead=0，会话序号为 1～3。此项验证无在线接收者时的 Worker 发布完成；在线实时与会话补拉由下项 smoke 覆盖。
+- [x] 本轮隔离 PostgreSQL / Redis 的全仓 `go test -race -count=1 ./...`、`go vet ./...`、`go build ./...` 和格式检查通过。真实服务进程 smoke：HTTP 100/100、Realtime 400/400、会话 Sync 200/200，missing/duplicate/unexpected/pending/dead 均为 0；数据库核对 100 条消息对应 100 条 ready/published v4 事件。这是功能验收，不是容量结论。
+- [ ] 现有环境的备份、停服、执行 016、部署新二进制：本轮未执行，需要单独安排；迁移后不支持直接回退旧二进制。
+- [ ] 纯 v4 当前实现的容量阶梯需要重测，历史报告不能替代。
+
+旧 /messages/sync 和 /messages/ack 仅保留 410 提示，不读写旧同步数据。
+
+> 以下是改造前的历史实验记录，不代表当前生产入口、容量结论或待办；重现实验请使用对应 Git 历史版本。
+
+## 历史记录：Conversation-scoped Sync 实验
 
 - [x] 增加 `conversations`、`conversation_members`、`messages.conversation_id` 与会话内连续 `conversation_seq`；单聊使用规范化用户对保证双向消息落在同一会话。
 - [x] `POST /messages` 在一个事务内完成会话解析、序号分配、消息写入和 ready 的 v4 Outbox；并发幂等冲突回滚临时序号，不留下 cursor 空洞。
@@ -18,7 +33,7 @@
 - [ ] 生产数据量较大时，把当前停写、单事务回填的 `015` 拆成 expand → 在线分批 backfill → 校验 → enforce constraints；当前迁移只适合可接受维护窗口的规模。
 - [ ] 确认所有 v1～v3 Outbox 已 published/dead、没有旧 Worker 且回退窗口结束后，再用独立 contract migration 删除用户级 Sync/projector 表、旧路由和 014 方向索引。
 
-> 下列 projection、recipient 与容量实验记录属于 v3 用户级 cursor 架构。代码仍保留它们用于旧事件排空，但它们不再描述 v4 正常消息路径。
+> 下列 projection、recipient 与容量实验记录属于 v3 用户级 cursor 架构。实现和开关现已删除；以下勾选项与未完成实验均归档，不再是当前维护清单。
 
 ## Prepare Worker 按用户分片候选
 

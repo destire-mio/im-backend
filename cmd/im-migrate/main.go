@@ -22,7 +22,7 @@ func main() {
 }
 
 func run(arguments []string, stdout io.Writer, stderr io.Writer) int {
-	if len(arguments) == 0 || (arguments[0] != "up" && arguments[0] != "baseline" && arguments[0] != "reconcile-conversations") {
+	if len(arguments) == 0 || (arguments[0] != "up" && arguments[0] != "baseline") {
 		printUsage(stderr)
 		return 2
 	}
@@ -33,7 +33,7 @@ func run(arguments []string, stdout io.Writer, stderr io.Writer) int {
 	databaseURL := flags.String("database-url", migrationDatabaseURL(), "PostgreSQL connection URL")
 	var allowMaintenance *bool
 	var baselineTarget *int
-	if command == "up" || command == "reconcile-conversations" {
+	if command == "up" {
 		allowMaintenance = flags.Bool("allow-maintenance", false, "allow migrations that rewrite historical data")
 	} else {
 		baselineTarget = flags.Int("to", 0, "verified existing schema version to record")
@@ -81,20 +81,6 @@ func run(arguments []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "recorded verified baseline through %03d\n", *baselineTarget)
 		return 0
 	}
-	if command == "reconcile-conversations" {
-		runner.AllowMaintenance = *allowMaintenance
-		repaired, err := runner.ReconcileConversations(ctx)
-		if err != nil {
-			if errors.Is(err, migrate.ErrMaintenanceRequired) {
-				fmt.Fprintln(stderr, "reconciliation refused: stop message writers and rerun with -allow-maintenance")
-			} else {
-				fmt.Fprintf(stderr, "reconciliation failed: %v\n", err)
-			}
-			return 1
-		}
-		fmt.Fprintf(stdout, "reconciled %d messages into conversation cursors\n", repaired)
-		return 0
-	}
 
 	runner.AllowMaintenance = *allowMaintenance
 	if err := runner.Up(ctx); err != nil {
@@ -115,8 +101,7 @@ func run(arguments []string, stdout io.Writer, stderr io.Writer) int {
 func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "usage:")
 	fmt.Fprintln(output, "  im-migrate up [-database-url URL] [-allow-maintenance]")
-	fmt.Fprintln(output, "  im-migrate baseline -to 15 [-database-url URL]")
-	fmt.Fprintln(output, "  im-migrate reconcile-conversations -allow-maintenance [-database-url URL]")
+	fmt.Fprintln(output, "  im-migrate baseline -to VERSION [-database-url URL] (reviewed: 15, 16)")
 }
 
 func migrationDatabaseURL() string {

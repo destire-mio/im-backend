@@ -137,16 +137,14 @@ func TestOutboxWorkerPreparesPublisherOncePerBatch(t *testing.T) {
 	}
 }
 
-func TestOutboxPipelinePreparesNextBatchWhileDeliveringCurrent(t *testing.T) {
+func TestOutboxPipelineClaimsNextBatchWhileDeliveringCurrent(t *testing.T) {
 	db := openTestDatabase(t)
 	eventIDs := []string{
 		createPendingOutboxEvent(t, db),
 		createPendingOutboxEvent(t, db),
 	}
 	firstPublishStarted := make(chan struct{})
-	secondBatchPrepared := make(chan struct{})
 	releaseFirstPublish := make(chan struct{})
-	var prepareCalls atomic.Int32
 	var publishCalls atomic.Int32
 	publisher := &testPublisher{publish: func(ctx context.Context, _ outboxEvent) error {
 		if publishCalls.Add(1) != 1 {
@@ -162,14 +160,7 @@ func TestOutboxPipelinePreparesNextBatchWhileDeliveringCurrent(t *testing.T) {
 	}}
 	config := testWorkerConfig()
 	config.BatchSize = 1
-	config.ExecutionMode = outboxExecutionModePipeline
 	worker := mustTestWorker(t, db, publisher, config)
-	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
-		if prepareCalls.Add(1) == 2 {
-			close(secondBatchPrepared)
-		}
-		return events, nil
-	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -188,13 +179,7 @@ func TestOutboxPipelinePreparesNextBatchWhileDeliveringCurrent(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first batch did not reach delivery")
 	}
-	select {
-	case <-secondBatchPrepared:
-		// The first publish is still blocked, so this can happen only if the
-		// preparation and delivery stages overlap.
-	case <-time.After(2 * time.Second):
-		t.Fatal("second batch was not prepared while first delivery was blocked")
-	}
+	waitForOutboxClaims(t, db, eventIDs, 2)
 	close(releaseFirstPublish)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -220,77 +205,13 @@ func TestOutboxPipelinePreparesNextBatchWhileDeliveringCurrent(t *testing.T) {
 	}
 }
 
-func TestOutboxSerialRunWaitsForCurrentDeliveryBeforePreparingNextBatch(t *testing.T) {
-	db := openTestDatabase(t)
-	createPendingOutboxEvent(t, db)
-	createPendingOutboxEvent(t, db)
-	firstPublishStarted := make(chan struct{})
-	secondBatchPrepared := make(chan struct{})
-	releaseFirstPublish := make(chan struct{})
-	var prepareCalls atomic.Int32
-	var publishCalls atomic.Int32
-	publisher := &testPublisher{publish: func(ctx context.Context, _ outboxEvent) error {
-		if publishCalls.Add(1) != 1 {
-			return nil
-		}
-		close(firstPublishStarted)
-		select {
-		case <-releaseFirstPublish:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}}
-	config := testWorkerConfig()
-	config.BatchSize = 1
-	config.ExecutionMode = outboxExecutionModeSerial
-	worker := mustTestWorker(t, db, publisher, config)
-	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
-		if prepareCalls.Add(1) == 2 {
-			close(secondBatchPrepared)
-		}
-		return events, nil
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- worker.Run(ctx) }()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Error("serial worker did not stop")
-		}
-	}()
-
-	select {
-	case <-firstPublishStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first serial batch did not reach delivery")
-	}
-	select {
-	case <-secondBatchPrepared:
-		t.Fatal("serial mode prepared the next batch before current delivery completed")
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(releaseFirstPublish)
-	select {
-	case <-secondBatchPrepared:
-	case <-time.After(2 * time.Second):
-		t.Fatal("serial mode did not prepare the next batch after delivery completed")
-	}
-}
-
-func TestOutboxPipelineShutdownReleasesPreparedBatchLeases(t *testing.T) {
+func TestOutboxPipelineShutdownReleasesClaimedBatchLeases(t *testing.T) {
 	db := openTestDatabase(t)
 	eventIDs := []string{
 		createPendingOutboxEvent(t, db),
 		createPendingOutboxEvent(t, db),
 	}
 	firstPublishStarted := make(chan struct{})
-	secondBatchPrepared := make(chan struct{})
-	var prepareCalls atomic.Int32
 	var publishCalls atomic.Int32
 	publisher := &testPublisher{publish: func(ctx context.Context, _ outboxEvent) error {
 		if publishCalls.Add(1) == 1 {
@@ -301,14 +222,7 @@ func TestOutboxPipelineShutdownReleasesPreparedBatchLeases(t *testing.T) {
 	}}
 	config := testWorkerConfig()
 	config.BatchSize = 1
-	config.ExecutionMode = outboxExecutionModePipeline
 	worker := mustTestWorker(t, db, publisher, config)
-	worker.preparer = testBatchPreparerFunc(func(_ context.Context, events []outboxEvent) ([]outboxEvent, error) {
-		if prepareCalls.Add(1) == 2 {
-			close(secondBatchPrepared)
-		}
-		return events, nil
-	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -319,12 +233,7 @@ func TestOutboxPipelineShutdownReleasesPreparedBatchLeases(t *testing.T) {
 		cancel()
 		t.Fatal("first batch did not reach delivery")
 	}
-	select {
-	case <-secondBatchPrepared:
-	case <-time.After(2 * time.Second):
-		cancel()
-		t.Fatal("second batch was not prepared before shutdown")
-	}
+	waitForOutboxClaims(t, db, eventIDs, 2)
 	cancel()
 	select {
 	case err := <-done:
@@ -511,104 +420,6 @@ func mustTestWorker(t *testing.T, db *pgxpool.Pool, publisher outboxPublisher, c
 	return worker
 }
 
-func mustMessageTestWorker(t *testing.T, db *pgxpool.Pool, publisher outboxPublisher, config outboxWorkerConfig) *outboxWorker {
-	t.Helper()
-	worker, err := newMessageOutboxWorker(db, publisher, config)
-	if err != nil {
-		t.Fatalf("create message worker: %v", err)
-	}
-	return worker
-}
-
-func TestMessageOutboxWorkerRejectsUnsupportedProjectionMode(t *testing.T) {
-	config := defaultOutboxWorkerConfig()
-	config.ProjectionMode = "unsupported"
-	if _, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
-		t.Fatal("unsupported projection mode was accepted")
-	}
-}
-
-func TestOutboxWorkerRejectsUnsupportedExecutionMode(t *testing.T) {
-	config := defaultOutboxWorkerConfig()
-	config.ExecutionMode = "unsupported"
-	if _, err := newOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
-		t.Fatal("unsupported execution mode was accepted")
-	}
-}
-
-func TestMessageOutboxWorkerRejectsUnsupportedProjectionStorage(t *testing.T) {
-	config := defaultOutboxWorkerConfig()
-	config.ProjectionStorage = "unsupported"
-	if _, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
-		t.Fatal("unsupported projection storage was accepted")
-	}
-}
-
-func TestMessageOutboxWorkerDefaultsEmptyProjectionStorageToSyncEvents(t *testing.T) {
-	config := defaultOutboxWorkerConfig()
-	config.ProjectionStorage = ""
-	worker, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config)
-	if err != nil {
-		t.Fatalf("create worker with empty projection storage: %v", err)
-	}
-	if worker.config.ProjectionStorage != syncProjectionStorageSyncEvents {
-		t.Fatalf("projection storage = %q, want %q", worker.config.ProjectionStorage, syncProjectionStorageSyncEvents)
-	}
-}
-
-func TestMessageOutboxWorkerConfiguresUserShardedPreparation(t *testing.T) {
-	config := defaultOutboxWorkerConfig()
-	config.PrepareMode = outboxPrepareModeUserSharded
-	config.PrepareWorkers = 4
-	worker, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config)
-	if err != nil {
-		t.Fatalf("create user-sharded message worker: %v", err)
-	}
-	if !worker.config.claimReadyOnly || worker.config.PrepareWorkers != 4 {
-		t.Fatalf("user-sharded config = %+v", worker.config)
-	}
-}
-
-func TestMessageOutboxWorkerRejectsInvalidPreparationConfig(t *testing.T) {
-	tests := []outboxWorkerConfig{
-		func() outboxWorkerConfig {
-			config := defaultOutboxWorkerConfig()
-			config.PrepareMode = "unsupported"
-			return config
-		}(),
-		func() outboxWorkerConfig {
-			config := defaultOutboxWorkerConfig()
-			config.PrepareWorkers = 4
-			return config
-		}(),
-		func() outboxWorkerConfig {
-			config := defaultOutboxWorkerConfig()
-			config.PrepareMode = outboxPrepareModeUserSharded
-			config.PrepareWorkers = messageProjectionVirtualShards + 1
-			return config
-		}(),
-		func() outboxWorkerConfig {
-			config := defaultOutboxWorkerConfig()
-			config.PrepareMode = outboxPrepareModeUserSharded
-			config.PrepareWorkers = 4
-			config.ProjectionMode = syncProjectionModePerUser
-			return config
-		}(),
-		func() outboxWorkerConfig {
-			config := defaultOutboxWorkerConfig()
-			config.PrepareMode = outboxPrepareModeUserSharded
-			config.PrepareWorkers = 4
-			config.ProjectionStorage = syncProjectionStorageJSONB
-			return config
-		}(),
-	}
-	for index, config := range tests {
-		if _, err := newMessageOutboxWorker(&pgxpool.Pool{}, &testPublisher{}, config); err == nil {
-			t.Fatalf("invalid preparation config %d was accepted", index)
-		}
-	}
-}
-
 func createPendingOutboxEvent(t *testing.T, db *pgxpool.Pool) string {
 	t.Helper()
 	server := httptest.NewServer(newTestApplication(t, db).routes())
@@ -630,4 +441,26 @@ func createPendingOutboxEvent(t *testing.T, db *pgxpool.Pool) string {
 		t.Fatalf("isolate test outbox event: %v", err)
 	}
 	return eventID
+}
+
+func waitForOutboxClaims(t *testing.T, db *pgxpool.Pool, eventIDs []string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		var claimed int
+		if err := db.QueryRow(t.Context(),
+			`SELECT count(*) FROM outbox_events
+			 WHERE event_id::text = ANY($1::text[]) AND lock_token IS NOT NULL`,
+			eventIDs,
+		).Scan(&claimed); err != nil {
+			t.Fatal(err)
+		}
+		if claimed == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("claimed %d events while publisher blocked, want %d", claimed, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

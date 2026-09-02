@@ -28,23 +28,30 @@ type redisRateLimiter struct {
 	client *redis.Client
 }
 
+// Check every dimension before charging any of them. The script is atomic, so
+// a locally rejected request cannot spend another user's global admission quota
+// and concurrent requests cannot over-admit between the check and increment.
 var incrementWindows = redis.NewScript(`
 local allowed = 1
 local retry_after_ms = 0
 for index, key in ipairs(KEYS) do
-  local window_ms = tonumber(ARGV[(index - 1) * 2 + 1])
   local limit = tonumber(ARGV[(index - 1) * 2 + 2])
-  local count = redis.call('INCR', key)
-  if count == 1 then
-    redis.call('PEXPIRE', key, window_ms)
-  end
-  if count > limit then
+  local count = tonumber(redis.call('GET', key) or '0')
+  if count >= limit then
     allowed = 0
     local ttl = redis.call('PTTL', key)
     if ttl > retry_after_ms then retry_after_ms = ttl end
   end
 end
-return {allowed, retry_after_ms}
+if allowed == 0 then return {0, retry_after_ms} end
+for index, key in ipairs(KEYS) do
+  local count = redis.call('INCR', key)
+  if count == 1 then
+    local window_ms = tonumber(ARGV[(index - 1) * 2 + 1])
+    redis.call('PEXPIRE', key, window_ms)
+  end
+end
+return {1, 0}
 `)
 
 func (limiter *redisRateLimiter) Allow(ctx context.Context, rules []rateLimitRule) (bool, time.Duration, error) {

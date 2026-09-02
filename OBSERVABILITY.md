@@ -28,19 +28,9 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 | `im_backend_outbox_dead_events` | 已进入 dead 的事件数 | Outbox、人工处理 |
 | `im_backend_outbox_publish_total` | published、retry、dead、lease_lost、state_error 等结果 | Outbox Publisher |
 | `im_backend_outbox_publish_duration_seconds` | 单事件 Publisher 耗时，不含批内 Presence 预取和数据库状态收尾 | Hub / Redis Publisher |
-| `im_backend_outbox_stage_duration_seconds` | 非空批次的 claim、prepare、publish、mark_published 关键路径耗时；inline prepare 另分 decode、begin、project_users、encode、store、commit；用户分片模式另分 projection_dispatch、projection_begin、projection_claim、projection_project_users、projection_store、projection_commit、projection_batch | Outbox Worker |
+| `im_backend_outbox_stage_duration_seconds` | 非空批次的 claim、publish_prepare（批内 Presence）、publish、mark_published 耗时；publish 包含 publish_prepare，不能简单相加 | Outbox Worker |
 | `im_backend_outbox_worker_concurrency` / `batch_size` | 当前 Worker 并发槽位与单次 claim 批量 | Outbox 配置 |
-| `im_backend_outbox_prepare_workers` / `user_sharded_prepare_enabled` | 迁移前 v3 Sync 投影的物理 Worker 数，以及是否启用按用户分片模式；v4 不使用 | Outbox 兼容配置 |
-| `im_backend_outbox_projection_pending_jobs` | 尚未完成的 v3 用户投影临时任务数；v4 正常路径应保持为 0 | 旧事件排空 |
-| `im_backend_outbox_projection_oldest_pending_job_age_seconds` | 最老未完成 v3 用户投影任务的年龄 | 旧事件排空 |
-| `im_backend_outbox_pipeline_enabled` | `0` 为整批串行执行，`1` 为 prepare 与上一批 deliver 重叠 | Outbox 配置 |
-| `im_backend_outbox_batch_presence_enabled` | `0` 为每 recipient 独立查 Presence，`1` 为同批用户去重并批量预取 | Outbox 配置 |
 | `im_backend_outbox_batch_presence_batches_total` / `users_total` | Presence 快照批次与其唯一用户总数；二者相除得到平均唯一用户数/批 | Redis Presence |
-| `im_backend_outbox_projection_bulk_enabled` | v3 兼容投影使用逐用户或批量 SQL；不描述 v4 正常写入 | Outbox 兼容配置 |
-| `im_backend_outbox_projection_recipients_enabled` | v3 回退到结构化 `outbox_recipients` + ready | Outbox 兼容配置 |
-| `im_backend_outbox_projection_sync_events_enabled` | v3 复用 `user_message_events` 恢复投递对象 | Outbox 兼容配置 |
-| `im_backend_outbox_projection_batches_total` / `users_total` | v3 投影批次数与唯一用户总数；v4 正常路径不应增长 | 旧 Sync 投影 |
-| `im_backend_outbox_projection_query_duration_seconds` | v3 `project_users` SQL 的客户端观测耗时 | 旧 Sync 投影 |
 | `im_backend_realtime_routing_total` | 本地 Hub、Presence、Redis 发布/订阅各阶段结果 | Redis/跨实例路由 |
 | `im_backend_websocket_connections` | 当前实例 Hub 中的连接数 | Hub |
 | `im_backend_websocket_deliveries_total` | queued、no_connection、slow_client | Channel/慢连接 |
@@ -60,16 +50,15 @@ HTTP → PostgreSQL/message+outbox → Outbox Worker → Redis 路由
 1. 用 HTTP 状态码和耗时确认请求是否进入并完成服务端持久化。
 2. 对比 `database_pool_acquire_duration_seconds` 的 API 与 Outbox P95。默认共享 Pool 时，两者同时升高且 Pool 空池等待增长说明正在争用；启用独立 Outbox Pool 时，再分别对照 `database_pool_*` 与 `outbox_database_pool_*`。这个 Histogram 测的是调用方取得连接前的总等待，不是 SQL 执行时间。
 3. 检查 Outbox 待处理数和最老事件年龄；持续增长说明异步发布跟不上。
-4. 先确认待处理事件版本。v4 在发送事务内已经 ready，inline `prepare` 只做兼容分流且不写用户投影；若 v4 的 prepare 明显变慢，应先查 claim/调度而不是 `user_sync_counters`。只有 v1～v3 旧事件才继续看 `user_sharded_prepare_enabled` 与 `projection_*`。
-5. 排空 v3 时，同时比较 Outbox pending 与 projection pending：两者一起增长且 projection oldest 增长，说明旧消息卡在用户 Sync 投影；projection 已清零而 Outbox 仍增长，才继续看 ready 之后的 claim/publish/mark。正常全 v4 稳态下 projection pending 应为 0。
-6. 若 `prepare_project_users` 或 `projection_project_users` 最大，用 projection 的 batches、users 和 query count 判断 SQL 次数与用户数；该 Histogram 包含服务端执行、锁等待、数据库往返和结果读取，不能单独解释为纯网络 RTT。
-7. 排空 v3 时，若 `prepare_store` 或 `projection_store` 最大，先看 projection storage gauge；`sync_events=1` 时旧 user/cursor 只在 `user_message_events`，用户分片的 store 还包括任务完成、Outbox ready 门控和临时任务清理。这一判断不适用于 v4 正常写入。
-8. 检查 `outbox_publish_total` 的 retry、dead、lease_lost 和 state_error。
-9. 检查 `batch_presence_enabled`、`publish_prepare` 和平均唯一用户数/批，再检查 Presence 查询与 Redis publish/receive 的 error、no_subscriber。
-10. 检查 Hub 是否没有连接，以及 slow_client 是否增加。
-11. 检查 WebSocket write/ping 错误；实时链路允许失败，客户端随后应走 Sync。
-12. 检查逐会话 Sync 返回量和 ACK lag；实时层正常但某个会话 ACK 落后通常表示客户端没有完成该会话的落盘或补拉。
-13. 单条事件使用日志中的 `message_id`、`event_id` 查询对应 Outbox 状态和失败记录。
+4. 对比 claim、publish_prepare、publish 和 mark_published。新消息已经在发送事务中 ready，不再有 SQL 投影阶段；批内 Presence 预取计入 publish_prepare，也包含在 publish 总耗时里。
+5. 检查 outbox_publish_total 的 retry_scheduled、dead、lease_lost 和 state_error。
+6. 检查平均唯一用户数/批，再检查 Presence 查询与 Redis publish/receive 的 error、no_subscriber。
+7. 检查 Hub 是否没有连接，以及 slow_client 是否增加。
+8. 检查 WebSocket write/ping 错误；实时链路允许失败，客户端随后应走 Sync。
+9. 检查逐会话 Sync 返回量和 ACK lag；实时层正常但某个会话 ACK 落后通常表示客户端没有完成该会话的落盘或补拉。
+10. 单条事件使用日志中的 message_id、event_id 查询对应 Outbox 状态和失败记录。
+
+迁移 016 后不再暴露投影模式、投影任务或算法开关指标；历史 Dashboard 若使用这些指标，需要删除对应查询。旧 v1/v2/v3 的 pending 事件由迁移一次性转换，published/dead 旧事件只是归档记录，不是另一个运行时模式。
 
 ## PromQL 示例
 
@@ -80,7 +69,7 @@ im_backend_outbox_oldest_pending_age_seconds > 30
 # 五分钟内 Outbox 重试速率
 sum(rate(im_backend_outbox_publish_total{result="retry_scheduled"}[5m])) by (event_type)
 
-# Outbox 关键阶段和 prepare 子阶段的 P95
+# Outbox 关键阶段的 P95
 histogram_quantile(
   0.95,
   sum(rate(im_backend_outbox_stage_duration_seconds_bucket[5m])) by (le, stage)
