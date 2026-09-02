@@ -1,0 +1,101 @@
+/var/run/postgresql:5432 - accepting connections
+Redis server v=7.4.11 sha=00000000:1 malloc=libc bits=64 build=fbbd11317783b72f
+postgres (PostgreSQL) 17.11
+=== RUN   TestPacketConcurrentClaims
+    packet_test.go:85: 400 concurrent HTTP calls / 200 authenticated fixture users / 100 shares: 100 unique receipts, 200 successful original+retry responses, 200 exhausted; SQL sum=10003; outbox=100
+--- PASS: TestPacketConcurrentClaims (0.64s)
+=== RUN   TestPacketSQLFailureAndConstraints
+    packet_test.go:134: real ledger trigger exception rolled back slot+credit+outbox; retry succeeds; deferred sum constraint and unique recipient rejected invalid SQL
+--- PASS: TestPacketSQLFailureAndConstraints (0.05s)
+=== RUN   TestPacketProcessCrashRecovery
+=== RUN   TestPacketProcessCrashRecovery/after_slot
+    packet_test.go:177: SIGKILL at after_slot; restarted process returns original receipt; one SQL credit + one downstream effect; outbox drained
+=== RUN   TestPacketProcessCrashRecovery/before_commit
+    packet_test.go:177: SIGKILL at before_commit; restarted process returns original receipt; one SQL credit + one downstream effect; outbox drained
+=== RUN   TestPacketProcessCrashRecovery/after_commit
+    packet_test.go:177: SIGKILL at after_commit; restarted process returns original receipt; one SQL credit + one downstream effect; outbox drained
+=== RUN   TestPacketProcessCrashRecovery/after_delivery
+    packet_test.go:177: SIGKILL at after_delivery; restarted process returns original receipt; one SQL credit + one downstream effect; outbox drained
+--- PASS: TestPacketProcessCrashRecovery (4.34s)
+    --- PASS: TestPacketProcessCrashRecovery/after_slot (1.07s)
+    --- PASS: TestPacketProcessCrashRecovery/before_commit (1.07s)
+    --- PASS: TestPacketProcessCrashRecovery/after_commit (1.07s)
+    --- PASS: TestPacketProcessCrashRecovery/after_delivery (1.09s)
+=== RUN   TestLabProcessHelper
+    packet_test.go:186: subprocess entry point
+--- SKIP: TestLabProcessHelper (0.00s)
+=== RUN   TestPacketHTTPResponseLostAfterCommit
+    packet_test.go:287: real HTTP request -> SQL COMMIT -> SIGKILL before response; client gets transport error; new server process returns identical durable receipt on retries
+--- PASS: TestPacketHTTPResponseLostAfterCommit (0.08s)
+=== RUN   TestLeaseExpiredOwnerRevives
+=== RUN   TestLeaseExpiredOwnerRevives/fenced_false
+    packet_test.go:389: A SET NX PX -> SIGSTOP -> real TTL expiration -> B acquires/writes -> SIGCONT A; fenced=false final value=A, B lock preserved
+=== RUN   TestLeaseExpiredOwnerRevives/fenced_true
+    packet_test.go:389: A SET NX PX -> SIGSTOP -> real TTL expiration -> B acquires/writes -> SIGCONT A; fenced=true final value=B, B lock preserved
+--- PASS: TestLeaseExpiredOwnerRevives (5.53s)
+    --- PASS: TestLeaseExpiredOwnerRevives/fenced_false (2.68s)
+    --- PASS: TestLeaseExpiredOwnerRevives/fenced_true (2.71s)
+=== RUN   TestCacheSQLStaleRefillAfterBothDeletes
+    redis_test.go:69: real SQL old read -> SQL commit new -> DEL -> second DEL -> delayed old refill; stale value reproduced; TTL expires and SQL read repairs it
+--- PASS: TestCacheSQLStaleRefillAfterBothDeletes (0.57s)
+=== RUN   TestCacheInvalidationSurvivesProcessAndRedisFailure
+redis: 2026/09/02 17:43:26 pool.go:762: redis: connection pool: failed to dial after 5 attempts: dial tcp 127.0.0.1:56609: connect: connection refused
+redis: 2026/09/02 17:43:27 pool.go:762: redis: connection pool: failed to dial after 5 attempts: dial tcp 127.0.0.1:56609: connect: connection refused
+redis: 2026/09/02 17:43:27 pool.go:762: redis: connection pool: failed to dial after 5 attempts: dial tcp 127.0.0.1:56609: connect: connection refused
+    redis_test.go:118: writer SIGKILL after SQL value+invalidation commit; Redis SIGKILL causes DEL error, intent retained and SQL fallback succeeds; AOF restores stale cache; retry DEL+ACK+refill repairs it
+--- PASS: TestCacheInvalidationSurvivesProcessAndRedisFailure (1.53s)
+=== RUN   TestRedisExpirationAndEviction
+=== RUN   TestRedisExpirationAndEviction/expiration
+    redis_test.go:150: PTTL positive -> GET nil -> expired_keys increases
+=== RUN   TestRedisExpirationAndEviction/noeviction
+    redis_test.go:187: policy=noeviction OOM=true evicted_keys=0
+=== RUN   TestRedisExpirationAndEviction/allkeys-lru
+    redis_test.go:187: policy=allkeys-lru OOM=false evicted_keys=111
+=== RUN   TestRedisExpirationAndEviction/volatile-lru
+    redis_test.go:187: policy=volatile-lru OOM=false evicted_keys=110
+--- PASS: TestRedisExpirationAndEviction (0.66s)
+    --- PASS: TestRedisExpirationAndEviction/expiration (0.29s)
+    --- PASS: TestRedisExpirationAndEviction/noeviction (0.12s)
+    --- PASS: TestRedisExpirationAndEviction/allkeys-lru (0.13s)
+    --- PASS: TestRedisExpirationAndEviction/volatile-lru (0.12s)
+=== RUN   TestRedisPersistenceAfterSIGKILL
+=== RUN   TestRedisPersistenceAfterSIGKILL/rdb
+    redis_test.go:229: rdb SIGKILL/restart: pre-checkpoint recovered; post-checkpoint recovered=false; downtime-expired key absent
+=== RUN   TestRedisPersistenceAfterSIGKILL/aof-always
+    redis_test.go:229: aof-always SIGKILL/restart: pre-checkpoint recovered; post-checkpoint recovered=true; downtime-expired key absent
+--- PASS: TestRedisPersistenceAfterSIGKILL (1.58s)
+    --- PASS: TestRedisPersistenceAfterSIGKILL/rdb (0.79s)
+    --- PASS: TestRedisPersistenceAfterSIGKILL/aof-always (0.80s)
+=== RUN   TestRedisSentinelFailoverAndAcknowledgedLoss
+redis: 2026/09/02 17:43:32 sentinel.go:1032: sentinel: selected addr=127.0.0.1:56675 masterAddr=127.0.0.1:56663
+redis: 2026/09/02 17:43:32 sentinel.go:1194: sentinel: new master="lab-primary" addr="127.0.0.1:56663"
+redis: 2026/09/02 17:43:34 sentinel.go:1194: sentinel: new master="lab-primary" addr="127.0.0.1:56666"
+    redis_test.go:338: three Sentinels / quorum 2: synchronized key survives; replica SIGSTOP + replication socket disconnect + acknowledged write + primary SIGKILL loses unsynced key; automatic promotion and existing client rediscovery pass; old primary rejoins READONLY and resyncs
+--- PASS: TestRedisSentinelFailoverAndAcknowledgedLoss (14.64s)
+PASS
+ok  	github.com/destire-mio/im-backend/internal/reliabilitylab	31.078s
+applied 001_create_messages
+applied 002_add_users
+applied 003_add_users_name_check
+applied 004_add_messages_content_check
+applied 005_require_nonempty_message_content
+applied 006_add_auth_sessions
+applied 007_split_access_refresh_tokens
+applied 008_add_message_idempotency_outbox
+applied 009_add_outbox_worker_state
+applied 010_add_user_message_sync
+applied 011_add_device_sync_ack
+applied 012_split_outbox_recipients
+applied 013_add_message_projection_jobs
+applied 014_add_message_history_pagination
+applied 015_add_conversation_sync_model
+database schema is current
+=== RUN   TestOutboxRealProcessExpiredOwner
+    outbox_process_lab_test.go:82: real app Worker A claim -> SIGSTOP -> lease expires -> Worker B claim; A SIGCONT: single/batch publish, retry and dead-state writes all rejected; B completes
+--- PASS: TestOutboxRealProcessExpiredOwner (3.19s)
+=== RUN   TestTwoOutboxWorkersClaimDisjointBatches
+--- PASS: TestTwoOutboxWorkersClaimDisjointBatches (1.61s)
+=== RUN   TestExpiredLeaseCanBeReclaimedAndOldOwnerCannotComplete
+--- PASS: TestExpiredLeaseCanBeReclaimedAndOldOwnerCannotComplete (0.42s)
+PASS
+ok  	github.com/destire-mio/im-backend	7.021s

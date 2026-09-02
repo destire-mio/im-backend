@@ -1,0 +1,16 @@
+Run date: 2026-09-02 Asia/Shanghai
+Worktree: /Users/destire/.codex/worktrees/1da6/后端
+Base commit: 2165d27015d120f1fa7b37b059ebeb01b96e6080
+Go: go version go1.26.3 darwin/arm64
+Host: macOS arm64; native Redis processes
+PostgreSQL: postgres:17-alpine container reported 17.11; disposable loopback port
+Redis 8: /opt/homebrew/bin/redis-server, 8.6.1, libc
+Redis 7: source-built 7.4.11, libc, no TLS
+Redis 7 source: https://download.redis.io/releases/redis-7.4.11.tar.gz
+Redis 7 source SHA256: 3c266ece0abd54ed3b1c912c6eb86b7508cf382cb690ee6649d3843f018f6357
+Redis 7 build: make -j4 MALLOC=libc BUILD_TLS=no redis-server
+Evidence: scripts/reliability-lab.sh (all lab cases) with each Redis binary
+Race: enabled for internal/reliabilitylab and three selected real Outbox tests
+Other gates: go test -count=1 ./...; go vet ./...; go build ./...; gofmt; bash -n
+Ordinary integration tests without their environment variables were skipped in the all-package unit run.
+No tracked pre-existing file changed; no commit, push, or main-directory synchronization.
