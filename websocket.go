@@ -11,13 +11,16 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
-	defaultWebSocketSendBuffer = 256
-	defaultWebSocketReadLimit  = 1024
-	defaultWebSocketWriteWait  = 10 * time.Second
-	defaultWebSocketPingPeriod = 25 * time.Second
+	defaultWebSocketSendBuffer    = 256
+	defaultWebSocketReadLimit     = 1024
+	defaultWebSocketWriteWait     = 10 * time.Second
+	defaultWebSocketPingPeriod    = 25 * time.Second
+	webSocketSessionCheckInterval = 5 * time.Second
+	webSocketSessionCheckTimeout  = 2 * time.Second
 )
 
 var errWebSocketHubStopped = errors.New("websocket hub is stopped")
@@ -620,12 +623,42 @@ func (app *application) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	connectionContext, cancel := context.WithDeadline(context.Background(), authenticatedAccessTokenExpiry(r.Context()))
 	defer cancel()
 	client.cancel = cancel
-	if err := app.webSocketHub.Register(connectionContext, client); err != nil {
+	// Register while holding the session row against revocation. Logout either
+	// wins this lock and rejects the handshake, or sees the registered connection
+	// after committing its UPDATE. The lock is released before the socket runs.
+	registrationContext, cancelRegistration := context.WithTimeout(connectionContext, 5*time.Second)
+	defer cancelRegistration()
+	tx, err := app.db.Begin(registrationContext)
+	if err != nil {
+		client.shutdown(websocket.StatusTryAgainLater, "session validation unavailable")
+		return
+	}
+	defer func() {
+		rollbackContext, rollbackCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer rollbackCancel()
+		_ = tx.Rollback(rollbackContext)
+	}()
+	var sessionID int64
+	err = tx.QueryRow(registrationContext,
+		`SELECT id FROM sessions
+		 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+		   AND idle_expires_at > CURRENT_TIMESTAMP AND created_at > $3
+		 FOR SHARE`,
+		client.sessionID, client.userID, app.currentTime().Add(-sessionAbsoluteLifetime),
+	).Scan(&sessionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			client.shutdown(websocket.StatusPolicyViolation, "session revoked")
+		} else {
+			client.shutdown(websocket.StatusTryAgainLater, "session validation unavailable")
+		}
+		return
+	}
+	if err := app.webSocketHub.Register(registrationContext, client); err != nil {
 		_ = connection.Close(websocket.StatusTryAgainLater, "realtime messaging is unavailable")
 		return
 	}
 
-	var presenceRecord *webSocketPresenceRecord
 	if app.webSocketPresence != nil && app.realtimeRouter != nil {
 		record := webSocketPresenceRecord{
 			UserID:       client.userID,
@@ -633,14 +666,20 @@ func (app *application) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			ConnectionID: client.connectionID,
 			InstanceID:   app.realtimeRouter.instanceID,
 		}
-		presenceRecord = &record
-		registerContext, registerCancel := context.WithTimeout(connectionContext, 2*time.Second)
+		defer func() {
+			unregisterContext, unregisterCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer unregisterCancel()
+			if _, err := app.webSocketPresence.Unregister(unregisterContext, record); err != nil {
+				log.Printf("unregister websocket presence for session %d: %v", client.sessionID, err)
+			}
+		}()
+		registerContext, registerCancel := context.WithTimeout(registrationContext, 2*time.Second)
 		old, err := app.webSocketPresence.Register(registerContext, record)
 		registerCancel()
 		if err != nil {
 			log.Printf("register websocket presence for session %d: %v", client.sessionID, err)
 		} else if old != nil && old.ConnectionID != client.connectionID {
-			disconnectContext, disconnectCancel := context.WithTimeout(connectionContext, 2*time.Second)
+			disconnectContext, disconnectCancel := context.WithTimeout(registrationContext, 2*time.Second)
 			if err := app.realtimeRouter.DisconnectReplaced(disconnectContext, *old); err != nil {
 				log.Printf("disconnect replaced websocket %s: %v", old.ConnectionID, err)
 			}
@@ -648,13 +687,46 @@ func (app *application) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		go app.maintainWebSocketPresence(connectionContext, client, record)
 	}
+	if err := tx.Commit(registrationContext); err != nil {
+		client.shutdown(websocket.StatusTryAgainLater, "session validation unavailable")
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cleanupCancel()
+		_ = app.webSocketHub.Unregister(cleanupContext, client, websocket.StatusTryAgainLater, "session validation unavailable")
+		return
+	}
+	cancelRegistration()
+	go app.maintainWebSocketSession(connectionContext, client)
 	client.run(connectionContext, app.webSocketHub)
-	if presenceRecord != nil {
-		unregisterContext, unregisterCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if _, err := app.webSocketPresence.Unregister(unregisterContext, *presenceRecord); err != nil {
-			log.Printf("unregister websocket presence for session %d: %v", client.sessionID, err)
+}
+
+func (app *application) maintainWebSocketSession(ctx context.Context, client *webSocketClient) {
+	// Redis disconnect commands can be lost. SQL remains the authority and a
+	// failed validation closes the connection rather than extending access.
+	ticker := time.NewTicker(webSocketSessionCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkContext, cancel := context.WithTimeout(ctx, webSocketSessionCheckTimeout)
+			var active bool
+			err := app.db.QueryRow(checkContext,
+				`SELECT EXISTS (SELECT 1 FROM sessions
+				 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+				   AND idle_expires_at > CURRENT_TIMESTAMP AND created_at > $3)`,
+				client.sessionID, client.userID, app.currentTime().Add(-sessionAbsoluteLifetime),
+			).Scan(&active)
+			cancel()
+			if err != nil {
+				client.shutdown(websocket.StatusTryAgainLater, "session validation unavailable")
+				return
+			}
+			if !active {
+				client.shutdown(websocket.StatusPolicyViolation, "session revoked")
+				return
+			}
 		}
-		unregisterCancel()
 	}
 }
 

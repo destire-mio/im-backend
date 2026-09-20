@@ -9,13 +9,14 @@
 
 - 用户注册、Argon2id 密码哈希、短期 Access Token、Refresh Token 轮换及多设备 Session 管理；Session 同时受 90 天空闲期和自登录起 365 天绝对期限约束。
 - 消息和 Outbox 事件在同一 PostgreSQL 事务中提交，避免“消息写入成功但通知事件丢失”。
-- Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；连续运行时以有界两段流水线重叠下一批 claim 与当前批 publish，网络发布不占用数据库行锁。
+- Outbox Worker 使用短事务 claim、租约、重试、dead 状态和 `FOR UPDATE SKIP LOCKED`；每批最多领取 `min(OUTBOX_BATCH_SIZE, OUTBOX_CONCURRENCY)` 条，完成当前批后领取下一批。领取、Presence 查询和发布共享一次超时预算，网络发布不占用数据库行锁。
 - 单聊双方规范化为一个 `conversation_id`；消息只写一份，并在会话内分配连续 `conversation_seq`。
 - 新消息只写 ready v4 Outbox：会话序号、消息、投递对象和 ready 状态在同一事务中提交，不再生成旧用户级 Sync 记录。
 - 重连时先分页扫描 `GET /conversations`，再按每个会话的 cursor 调用 `GET /conversations/{id}/messages`；设备 ACK 也按会话保存。WebSocket 只负责实时通知，SQL 仍是恢复权威。
 - `016` 迁移结束旧二进制回滚窗口：一次性转换待投递旧事件、收紧会话字段约束并删除旧投影表。Worker 只处理 v4 消息事件。
 - 普通单聊历史使用绑定 `conversation_id + conversation_seq` 的 `before` / `after` opaque cursor 和单个会话索引，不通过 `OFFSET` 扫描深页。
 - Redis 保存跨实例 WebSocket presence 并承载实时路由，本地 Hub 管理连接、背压和慢客户端断开。
+- 登录在事务内复核密码哈希并持有用户行共享锁，和改密码撤销 Session 建立提交顺序。WebSocket 在 Session 行共享锁内验证会话并注册连接，提交后启动读写；每 5 秒查询 SQL 复核 Session，查询超时为 2 秒，撤销或依赖故障会关闭连接，覆盖断开通知丢失的情况。复核成本约为每条在线连接每 5 秒一次 SQL 查询。
 - Outbox 投递前对同批 recipient 去重，用两段 Redis pipeline 生成仅在本批存活的 Presence 快照，避免热点用户被重复查询。
 - 认证限流在一个 Redis 脚本内先检查所有维度，再统一计数；被局部规则拒绝的流量不消耗全局准入额度。
 - Prometheus 指标覆盖 HTTP、连接池、Outbox 各阶段、Redis 路由、WebSocket、Sync 和 ACK。
@@ -27,7 +28,7 @@
 POST /messages
   -> PostgreSQL: resolve/create conversation（既有会话只读快路径）
      + allocate conversation_seq + message + ready v4 outbox（同一 SQL、同一事务）
-  -> Outbox claim（与上一批投递重叠）
+  -> Outbox claim（领取量不超过发布并发，不预取下一批）
   -> 批内 Presence 快照 + Redis / 本地 Hub + mark published
   -> WebSocket 携带 conversationId + conversationSeq 实时通知
 
@@ -38,6 +39,8 @@ POST /messages
 ```
 
 运行时只保留这一条链路。`OUTBOX_EXECUTION_MODE`、`OUTBOX_PREPARE_MODE`、`OUTBOX_PREPARE_WORKERS`、`OUTBOX_PROJECTION_MODE`、`OUTBOX_PROJECTION_STORAGE` 和 `OUTBOX_BATCH_PRESENCE_LOOKUP` 已移除，请从部署配置中删除；不再提供旧算法回退。保留 `OUTBOX_BATCH_SIZE` / `OUTBOX_CONCURRENCY` 这类资源参数。
+
+Worker 默认配置为 Batch 64、Concurrency 16，因此实际每批最多领取 16 条；`im_backend_outbox_worker_batch_size` 暴露实际领取上限。取消预取和限制领取量解决排队期间租约过期的问题，但改变了吞吐特征，需要重新压测。`lock_token` 保护数据库状态写回，无法撤回已经发出的网络操作，客户端去重与 SQL Sync 仍是必要的恢复机制。
 
 该模型把热点从“同一用户的全局 counter”缩小到“同一会话的 counter”：不同会话可以并行写，同一会话为保证严格顺序仍会串行更新一行。超热点群聊未来仍需单独评估序号分段或其他排序方案，当前单聊实现没有宣称消除所有热点。
 
@@ -121,6 +124,8 @@ POST /messages
 
 默认 API 地址为 `:8080`，Prometheus 指标只监听 `127.0.0.1:9090`。`compose.yaml` 中的账号密码仅用于本地开发。
 
+`TRUSTED_PROXY_CIDRS` 仅包含由部署方控制的代理地址。应用从直连代理向左解析 `X-Forwarded-For`，剥离可信代理后以第一个不可信地址作为限流 IP；不信任该地址左侧的客户端自填前缀。可信后缀包含非法地址时退回直连地址。
+
 ## API 概览
 
 | 方法 | 路径 | 作用 |
@@ -169,6 +174,8 @@ POST /messages
 客户端应先建立 WebSocket，再扫描会话列表并逐会话补拉；扫描期间收到的新消息由 WebSocket 覆盖。连接中断时重新开始一轮会话扫描，避免把不完整的一轮当成恢复完成。
 
 `internal/headlessclient` 提供仅用于故障验证的最小 Headless 客户端。它先持久化 Refresh 幂等操作，再发网络请求；消息和会话 cursor 使用加密原子文件一起提交；WebSocket 序号出现缺口时保持原 cursor 并转 SQL Sync；本地提交后才发送累计 ACK。集成测试覆盖 Refresh 与 ACK 成功但响应丢失、进程重建、WebSocket 乱序、Sync 去重和多设备进度隔离。加密密钥由外部注入，磁盘文件不含明文 Token；这验证了状态机和密钥边界，但不冒充 Android Room/Keystore 的平台实现。
+
+Headless 客户端成功响应上限为 8 MiB，覆盖 200 条、每条 4000 字符及 JSON 转义膨胀的合法消息页；超出上限会报错，不提交本地消息进度。
 
 已有数据库必须通过 `im-migrate` 顺序升级到 `016`。历史回填和 contract 都是停写事务，不是面向超大表的在线分批迁移；部署前应在备份副本评估维护窗口。
 

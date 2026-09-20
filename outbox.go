@@ -134,45 +134,24 @@ func newOutboxWorker(
 
 func (worker *outboxWorker) Run(ctx context.Context) error {
 	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
-	// Claim batch N+1 while delivering batch N. The unbuffered handoff
-	// bounds outstanding work to one batch in each stage.
-	claimedBatches := make(chan []outboxEvent)
-	go func() {
-		defer close(claimedBatches)
-		worker.claimBatches(ctx, claimedBatches)
-	}()
-
-	for events := range claimedBatches {
-		if err := worker.deliverBatch(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("outbox worker delivery batch: %v", err)
+	// Do not acquire leases for work waiting behind another batch.
+	for ctx.Err() == nil {
+		processed, err := worker.RunOnce(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("outbox worker batch: %v", err)
+		}
+		if !worker.continueAfterBatch(ctx, processed) {
+			break
 		}
 	}
 	return nil
-}
-
-func (worker *outboxWorker) claimBatches(ctx context.Context, claimedBatches chan<- []outboxEvent) {
-	for {
-		processed, events, err := worker.claimBatch(ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("outbox worker claim batch: %v", err)
-		}
-		if len(events) > 0 {
-			// Always hand an already-claimed batch to the delivery stage. On
-			// shutdown, delivery observes the canceled context and releases each
-			// lease through the normal retry path instead of abandoning it.
-			claimedBatches <- events
-		}
-		if !worker.continueAfterBatch(ctx, processed) {
-			return
-		}
-	}
 }
 
 func (worker *outboxWorker) continueAfterBatch(ctx context.Context, processed int) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	if processed == worker.config.BatchSize {
+	if processed == worker.claimLimit() {
 		return true
 	}
 	timer := time.NewTimer(worker.config.PollInterval)
@@ -188,6 +167,10 @@ func (worker *outboxWorker) continueAfterBatch(ctx context.Context, processed in
 // RunOnce executes one claim -> publish -> mark cycle using the same stages as Run.
 func (worker *outboxWorker) RunOnce(ctx context.Context) (int, error) {
 	ctx = withDatabaseWorkload(ctx, databaseWorkloadOutbox)
+	// One deadline covers pool acquisition, claim, presence preparation and
+	// publication. State completion has its own bounded context below.
+	ctx, cancel := context.WithTimeout(ctx, worker.config.AttemptTimeout)
+	defer cancel()
 	processed, events, err := worker.claimBatch(ctx)
 	if err != nil || len(events) == 0 {
 		return processed, err
@@ -239,19 +222,20 @@ func (worker *outboxWorker) deliverBatch(ctx context.Context, events []outboxEve
 		publisher = preparedPublisher
 	}
 
-	semaphore := make(chan struct{}, worker.config.Concurrency)
 	outcomes := make(chan outboxPublishOutcome, len(events))
 	var wait sync.WaitGroup
 	for _, event := range events {
-		semaphore <- struct{}{}
 		wait.Add(1)
 		go func(current outboxEvent) {
 			defer wait.Done()
-			defer func() { <-semaphore }()
 			started := time.Now()
-			attemptContext, cancelAttempt := context.WithTimeout(ctx, worker.config.AttemptTimeout)
-			publishErr := publisher.Publish(attemptContext, current)
-			cancelAttempt()
+			publishErr := ctx.Err()
+			if deadline, ok := ctx.Deadline(); ok && !started.Before(deadline) {
+				publishErr = context.DeadlineExceeded
+			}
+			if publishErr == nil {
+				publishErr = publisher.Publish(ctx, current)
+			}
 			if worker.metrics != nil {
 				worker.metrics.outboxPublishDuration.WithLabelValues(current.EventType).Observe(time.Since(started).Seconds())
 			}
@@ -331,6 +315,10 @@ func (worker *outboxWorker) completeDeliveryBatch(
 	return errors.Join(processingErrors...)
 }
 
+func (worker *outboxWorker) claimLimit() int {
+	return min(worker.config.BatchSize, worker.config.Concurrency)
+}
+
 func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 	rows, err := worker.db.Query(
 		ctx,
@@ -360,7 +348,7 @@ func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 		           event.attempt_count,
 		           event.lock_token::text,
 		           event.ready_at`,
-		worker.config.BatchSize,
+		worker.claimLimit(),
 		worker.config.LeaseDuration.Milliseconds(),
 		worker.config.EventTypes,
 	)
@@ -369,7 +357,7 @@ func (worker *outboxWorker) claim(ctx context.Context) ([]outboxEvent, error) {
 	}
 	defer rows.Close()
 
-	events := make([]outboxEvent, 0, worker.config.BatchSize)
+	events := make([]outboxEvent, 0, worker.claimLimit())
 	for rows.Next() {
 		var event outboxEvent
 		if err := rows.Scan(

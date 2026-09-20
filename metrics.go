@@ -143,7 +143,7 @@ func newApplicationMetrics(db *pgxpool.Pool) *applicationMetrics {
 		outboxWorkerBatchSize: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "im_backend",
 			Name:      "outbox_worker_batch_size",
-			Help:      "Configured maximum number of Outbox events claimed per batch.",
+			Help:      "Effective Outbox claim limit: minimum of configured batch size and concurrency.",
 		}),
 		outboxBatchPresenceBatches: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "im_backend",
@@ -262,7 +262,7 @@ func (metrics *applicationMetrics) SetOutboxWorkerConfig(config outboxWorkerConf
 		return
 	}
 	metrics.outboxWorkerConcurrency.Set(float64(config.Concurrency))
-	metrics.outboxWorkerBatchSize.Set(float64(config.BatchSize))
+	metrics.outboxWorkerBatchSize.Set(float64(min(config.BatchSize, config.Concurrency)))
 }
 
 func (metrics *applicationMetrics) Handler() http.Handler {

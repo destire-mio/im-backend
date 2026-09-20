@@ -207,7 +207,7 @@ func main() {
 		log.Fatalf("configure outbox worker: %v", err)
 	}
 	app.metrics.SetOutboxWorkerConfig(workerConfig)
-	log.Printf("outbox worker batch size %d concurrency %d", workerConfig.BatchSize, workerConfig.Concurrency)
+	log.Printf("outbox worker claim limit %d concurrency %d", worker.claimLimit(), workerConfig.Concurrency)
 	workerContext, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan struct{})
 	go func() {
