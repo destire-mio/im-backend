@@ -149,13 +149,19 @@ func (app *application) clientIP(r *http.Request) string {
 	if peerIP == nil || !ipInNetworks(peerIP, app.trustedProxyNetworks) {
 		return host
 	}
-	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	if len(forwarded) == 0 {
-		return host
-	}
-	clientIP := net.ParseIP(strings.TrimSpace(forwarded[0]))
-	if clientIP == nil {
-		return host
+	forwarded := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	clientIP := peerIP
+	// Only trusted proxies can vouch for the address immediately to their
+	// left. Stop before reaching any prefix supplied by an untrusted client.
+	for index := len(forwarded) - 1; index >= 0; index-- {
+		address := net.ParseIP(strings.TrimSpace(forwarded[index]))
+		if address == nil {
+			return host
+		}
+		clientIP = address
+		if !ipInNetworks(clientIP, app.trustedProxyNetworks) {
+			break
+		}
 	}
 	return clientIP.String()
 }

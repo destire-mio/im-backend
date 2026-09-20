@@ -137,7 +137,7 @@ func TestOutboxWorkerPreparesPublisherOncePerBatch(t *testing.T) {
 	}
 }
 
-func TestOutboxPipelineClaimsNextBatchWhileDeliveringCurrent(t *testing.T) {
+func TestOutboxWorkerLeavesQueuedWorkAvailableToOtherWorkers(t *testing.T) {
 	db := openTestDatabase(t)
 	eventIDs := []string{
 		createPendingOutboxEvent(t, db),
@@ -170,7 +170,7 @@ func TestOutboxPipelineClaimsNextBatchWhileDeliveringCurrent(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			t.Error("pipeline worker did not stop")
+			t.Error("worker did not stop")
 		}
 	}()
 
@@ -179,7 +179,12 @@ func TestOutboxPipelineClaimsNextBatchWhileDeliveringCurrent(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first batch did not reach delivery")
 	}
-	waitForOutboxClaims(t, db, eventIDs, 2)
+	waitForOutboxClaims(t, db, eventIDs, 1)
+	otherPublisher := &testPublisher{}
+	other := mustTestWorker(t, db, otherPublisher, config)
+	if processed, err := other.RunOnce(context.Background()); err != nil || processed != 1 {
+		t.Fatalf("other worker could not deliver the queued message: processed=%d err=%v", processed, err)
+	}
 	close(releaseFirstPublish)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -205,7 +210,7 @@ func TestOutboxPipelineClaimsNextBatchWhileDeliveringCurrent(t *testing.T) {
 	}
 }
 
-func TestOutboxPipelineShutdownReleasesClaimedBatchLeases(t *testing.T) {
+func TestOutboxWorkerShutdownReleasesOnlyItsActiveLeases(t *testing.T) {
 	db := openTestDatabase(t)
 	eventIDs := []string{
 		createPendingOutboxEvent(t, db),
@@ -233,7 +238,7 @@ func TestOutboxPipelineShutdownReleasesClaimedBatchLeases(t *testing.T) {
 		cancel()
 		t.Fatal("first batch did not reach delivery")
 	}
-	waitForOutboxClaims(t, db, eventIDs, 2)
+	waitForOutboxClaims(t, db, eventIDs, 1)
 	cancel()
 	select {
 	case err := <-done:
@@ -259,8 +264,17 @@ func TestOutboxPipelineShutdownReleasesClaimedBatchLeases(t *testing.T) {
 	).Scan(&released); err != nil {
 		t.Fatalf("count released pipeline leases: %v", err)
 	}
-	if released != len(eventIDs) {
-		t.Fatalf("released %d pipeline leases, want %d", released, len(eventIDs))
+	if released != 1 {
+		t.Fatalf("released %d leases, want 1", released)
+	}
+	var untouched int
+	if err := db.QueryRow(context.Background(),
+		`SELECT count(*) FROM outbox_events
+		 WHERE event_id::text = ANY($1::text[]) AND attempt_count = 0
+		 AND locked_until IS NULL AND lock_token IS NULL AND last_error IS NULL`,
+		eventIDs,
+	).Scan(&untouched); err != nil || untouched != 1 {
+		t.Fatalf("untouched queued events=%d err=%v, want 1", untouched, err)
 	}
 }
 

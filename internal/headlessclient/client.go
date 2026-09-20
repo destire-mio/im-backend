@@ -15,6 +15,10 @@ import (
 
 var ErrMessageGap = errors.New("realtime message has a cursor gap")
 
+// A Sync page can hold 200 messages of 4000 characters each. JSON can
+// expand a character to six bytes; leave room for identifiers and metadata.
+const maxResponseBodyBytes = 8 << 20
+
 type APIError struct {
 	Status int
 	Code   string
@@ -299,7 +303,14 @@ func (client *Client) doJSON(
 	if output == nil || response.StatusCode == http.StatusNoContent {
 		return nil
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(output); err != nil {
+	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("read IM response: %w", err)
+	}
+	if len(bodyBytes) > maxResponseBodyBytes {
+		return errors.New("IM response exceeds the size limit")
+	}
+	if err := json.Unmarshal(bodyBytes, output); err != nil {
 		return fmt.Errorf("decode IM response: %w", err)
 	}
 	return nil

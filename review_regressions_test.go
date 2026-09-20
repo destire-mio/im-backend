@@ -200,6 +200,149 @@ func TestReviewLogoutMustRejectInFlightWebSocketHandshake(t *testing.T) {
 	}
 }
 
+func TestReviewPasswordChangeRevokesLoginAlreadyCreatingSession(t *testing.T) {
+	db, g := reviewPool(t, "INSERT INTO sessions")
+	server := httptest.NewServer(newTestApplication(t, db).routes())
+	t.Cleanup(server.Close)
+	t.Cleanup(g.resume)
+	account := registerTestAccount(t, db, server.URL, uniqueUsername("rev_order"), "Login ordering")
+	g.armed.Store(true)
+	loginDone := make(chan reviewHTTPResult, 1)
+	go func() {
+		loginDone <- reviewPost(server.URL+"/auth/login", "", loginRequest{Username: account.Username, Password: account.Password, LoginRequestID: uniqueOpaqueID("login-first")})
+	}()
+	reviewWaitGate(t, g)
+	changeDone := make(chan reviewHTTPResult, 1)
+	go func() {
+		changeDone <- reviewPost(server.URL+"/auth/password", account.Auth.AccessToken, changePasswordRequest{CurrentPassword: account.Password, NewPassword: "replacement password 5678"})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case result := <-changeDone:
+			t.Fatalf("password change bypassed the in-flight session transaction: status=%d err=%v", result.status, result.err)
+		default:
+		}
+		var waiting bool
+		if err := db.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%UPDATE users SET password_hash%')`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("password change did not reach the credential lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	g.resume()
+	login := <-loginDone
+	if login.err != nil || login.status != 200 {
+		t.Fatalf("login: status=%d err=%v", login.status, login.err)
+	}
+	changed := <-changeDone
+	if changed.err != nil || changed.status != 204 {
+		t.Fatalf("password change: status=%d err=%v", changed.status, changed.err)
+	}
+	var auth authResponse
+	if err := json.Unmarshal(login.body, &auth); err != nil {
+		t.Fatal(err)
+	}
+	assertTokenStatus(t, server.URL, auth.AccessToken, http.StatusUnauthorized)
+}
+
+func TestReviewWebSocketRechecksRevocationWhenDisconnectNotificationIsLost(t *testing.T) {
+	db := openTestDatabase(t)
+	app, stop := newWebSocketTestApplication(t, db)
+	t.Cleanup(stop)
+	server := httptest.NewServer(app.routes())
+	t.Cleanup(server.Close)
+	account := registerTestAccount(t, db, server.URL, uniqueUsername("rev_lost"), "Revocation")
+	other := loginTestAccount(t, server.URL, account.Username, account.Password, uniqueOpaqueID("unrevoked-control"))
+	revoked := dialAuthenticatedWebSocket(t, server.URL, account.Auth.AccessToken)
+	t.Cleanup(func() { revoked.CloseNow() })
+	control := dialAuthenticatedWebSocket(t, server.URL, other.AccessToken)
+	t.Cleanup(func() { control.CloseNow() })
+	// Persist the same change as logout, but omit its best-effort notification.
+	if _, err := db.Exec(t.Context(), "UPDATE sessions SET revoked_at=CURRENT_TIMESTAMP WHERE id=$1", account.Auth.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), webSocketSessionCheckInterval+webSocketSessionCheckTimeout+time.Second)
+	defer cancel()
+	_, _, err := revoked.Read(ctx)
+	if err == nil || ctx.Err() != nil {
+		t.Fatalf("revoked socket survived SQL reconciliation: %v", err)
+	}
+	message := createMessageThroughAPI(t, server.URL, other.AccessToken, account.User.ID, "unrevoked device still works")
+	publisher := &webSocketOutboxPublisher{router: app.webSocketHub}
+	if err := publisher.Publish(t.Context(), loadOutboxEventForMessage(t, db, message.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if envelope := readWebSocketEnvelope(t, control); envelope.Message.ID != message.ID {
+		t.Fatal("unrevoked control lost its message")
+	}
+}
+
+func TestReviewLogoutWaitsForWebSocketRegistration(t *testing.T) {
+	db, g := reviewPool(t, "SELECT id FROM sessions")
+	app, stop := newWebSocketTestApplication(t, db)
+	t.Cleanup(stop)
+	server := httptest.NewServer(app.routes())
+	t.Cleanup(server.Close)
+	t.Cleanup(g.resume)
+	account := registerTestAccount(t, db, server.URL, uniqueUsername("rev_ws_lock"), "Handshake ordering")
+	g.armed.Store(true)
+	type dialResult struct {
+		conn *websocket.Conn
+		err  error
+	}
+	dialDone := make(chan dialResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, _, err := websocket.Dial(ctx, webSocketURL(server.URL), &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": []string{"Bearer " + account.Auth.AccessToken}}})
+		dialDone <- dialResult{conn, err}
+	}()
+	reviewWaitGate(t, g)
+	logoutDone := make(chan reviewHTTPResult, 1)
+	go func() { logoutDone <- reviewPost(server.URL+"/auth/logout", account.Auth.AccessToken, nil) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		select {
+		case result := <-logoutDone:
+			t.Fatalf("logout passed registration before its connection was visible: status=%d err=%v", result.status, result.err)
+		default:
+		}
+		var waiting bool
+		if err := db.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%UPDATE sessions%')`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("logout did not wait for registration")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	g.resume()
+	dial := <-dialDone
+	if dial.err != nil {
+		t.Fatal(dial.err)
+	}
+	t.Cleanup(func() { dial.conn.CloseNow() })
+	logout := <-logoutDone
+	if logout.err != nil || logout.status != 204 {
+		t.Fatalf("logout status=%d err=%v", logout.status, logout.err)
+	}
+	assertTokenStatus(t, server.URL, account.Auth.AccessToken, http.StatusUnauthorized)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, _, err := dial.conn.Read(ctx); err == nil || ctx.Err() != nil {
+		t.Fatalf("registered socket survived logout: %v", err)
+	}
+}
+
 type reviewNamespacedLimiter struct {
 	limiter   authRateLimiter
 	namespace string

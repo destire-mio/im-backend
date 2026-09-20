@@ -41,6 +41,7 @@ const (
 var usernamePattern = regexp.MustCompile(`^[a-z0-9_]{3,32}$`)
 
 var errIdempotencyConflict = errors.New("idempotency key belongs to another request")
+var errLoginCredentialsChanged = errors.New("login credentials changed before session creation")
 
 type registerRequest struct {
 	Username    string `json:"username"`
@@ -231,7 +232,11 @@ func (app *application) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := app.createIdempotentLogin(r.Context(), authenticated, input.DeviceID, requestHash[:])
+	response, err := app.createIdempotentLogin(r.Context(), authenticated, passwordHash, input.DeviceID, requestHash[:])
+	if errors.Is(err, errLoginCredentialsChanged) {
+		writeAPIError(w, r, http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid username or password", nil)
+		return
+	}
 	if errors.Is(err, errIdempotencyConflict) {
 		writeAPIError(w, r, http.StatusConflict, "LOGIN_REQUEST_ID_CONFLICT", "loginRequestId was already used", nil)
 		return
@@ -577,12 +582,23 @@ func (app *application) createSessionResponse(ctx context.Context, tx pgx.Tx, ac
 	}, nil
 }
 
-func (app *application) createIdempotentLogin(ctx context.Context, account user, deviceID string, requestHash []byte) (authResponse, error) {
+func (app *application) createIdempotentLogin(ctx context.Context, account user, verifiedHash, deviceID string, requestHash []byte) (authResponse, error) {
 	tx, err := app.db.Begin(ctx)
 	if err != nil {
 		return authResponse{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	// Password changes lock this row before revoking sessions. Hold a share
+	// lock through session creation so a login either precedes that revocation
+	// or observes the changed credentials and cannot create a new session.
+	var currentHash string
+	if err := tx.QueryRow(ctx, `SELECT password_hash FROM users WHERE id = $1 FOR SHARE`, account.ID).Scan(&currentHash); err != nil {
+		return authResponse{}, err
+	}
+	if currentHash != verifiedHash {
+		return authResponse{}, errLoginCredentialsChanged
+	}
 
 	response, err := app.createSessionResponse(ctx, tx, account, deviceID)
 	if err != nil {

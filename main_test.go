@@ -1015,7 +1015,7 @@ func publishPendingMessageEvents(t *testing.T, db *pgxpool.Pool, metricObservers
 		if err != nil {
 			t.Fatalf("publish pending message events: %v", err)
 		}
-		if processed < config.BatchSize {
+		if processed == 0 {
 			return
 		}
 	}

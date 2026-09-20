@@ -122,6 +122,38 @@ func TestClientIPTrustsForwardedHeaderOnlyFromConfiguredProxy(t *testing.T) {
 	}
 }
 
+func TestClientIPStopsAtFirstUntrustedHop(t *testing.T) {
+	networks, err := parseTrustedProxyNetworks("10.0.0.0/8,fd00::/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &application{trustedProxyNetworks: networks}
+	tests := []struct {
+		name, remote string
+		forwarded    []string
+		want         string
+	}{
+		{"multiple trusted proxies", "10.0.0.8:1234", []string{"203.0.113.77, 198.51.100.42, 10.0.0.9"}, "198.51.100.42"},
+		{"multiple header fields", "10.0.0.8:1234", []string{"203.0.113.77", "198.51.100.42"}, "198.51.100.42"},
+		{"untrusted direct peer", "198.51.100.42:1234", []string{"203.0.113.77"}, "198.51.100.42"},
+		{"malformed trusted suffix", "10.0.0.8:1234", []string{"203.0.113.77, invalid"}, "10.0.0.8"},
+		{"missing header", "10.0.0.8:1234", nil, "10.0.0.8"},
+		{"ipv6", "[fd00::1]:1234", []string{"203.0.113.77, 2001:db8::1, fd00::2"}, "2001:db8::1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = tt.remote
+			for _, value := range tt.forwarded {
+				r.Header.Add("X-Forwarded-For", value)
+			}
+			if got := app.clientIP(r); got != tt.want {
+				t.Fatalf("client IP=%s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoginRateLimitUsesIndependentGlobalIPAccountAndDeviceKeys(t *testing.T) {
 	rules := rulesForAuthRequest("login", "203.0.113.9", "xiaozhu", "phone-installation")
 	if len(rules) != 4 {

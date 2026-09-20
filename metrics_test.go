@@ -118,7 +118,7 @@ func TestMetricsExposeHTTPOutboxSyncAndACKBoundaries(t *testing.T) {
 		"im_backend_database_pool_empty_acquire_wait_seconds_total",
 		"im_backend_outbox_pending_events",
 		"im_backend_outbox_worker_concurrency 16",
-		"im_backend_outbox_worker_batch_size 64",
+		"im_backend_outbox_worker_batch_size 16",
 		`im_backend_outbox_batch_presence_batches_total{result="success"} 1`,
 		"im_backend_outbox_batch_presence_users_total 2",
 		"im_backend_http_requests_total",
